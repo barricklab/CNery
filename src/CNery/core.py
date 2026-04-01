@@ -18,33 +18,66 @@ from scipy.special import  gammaln
 from scipy.optimize import minimize
 from itertools import cycle, islice
 
-def bam2cov_to_df(
-    bamfile,          # path to BAM
-    fastafile,        # path to FASTA
-    output_prefix,    # output tab file: e.g. "coverage.tab", recommended with .tab extension
-    extra_args=None   # optional, list for any extra CLI args
-):
-    # The tab output file name (may be output_prefix or output_prefix.tab)
-    tab_file = output_prefix
+
+def parse_fasta_records(fastafile):
+    """
+    Parse a (multi-)FASTA file and return a list of (header, seq_len)
+    for each reference sequence.
+    """
+    records = []
     header = None
     seq_len = 0
+
     with open(fastafile) as fh:
         for line in fh:
             line = line.rstrip()
             if line.startswith(">"):
-                if header is None:
-                    header = line[1:]      # drop leading ">"
-                else:
-                    break                  # stop after first record
+                # Finish previous record
+                if header is not None:
+                    records.append((header, seq_len))
+                header = line[1:]  # drop ">"
+                seq_len = 0
             else:
-                seq_len += len(line)       # add length of sequence line
+                seq_len += len(line)
 
-    region = header+":1-"+str(seq_len)
+    # Last record
+    if header is not None:
+        records.append((header, seq_len))
+
+    return records
+
+
+def bam2cov_to_df(
+    bamfile,          # path to BAM
+    fastafile,        # path to FASTA
+    output_prefix,    # output tab file: e.g. "coverage.tab"
+    extra_args=None,  # optional, list for any extra CLI args
+    region=None       # optional, "REF:1-12345" to avoid re-parsing FASTA
+):
+    # The tab output file name (may be output_prefix or output_prefix.tab)
+    tab_file = output_prefix
+
+    # If no region provided, fall back to original single-genome behavior
+    if region is None:
+        header = None
+        seq_len = 0
+        with open(fastafile) as fh:
+            for line in fh:
+                line = line.rstrip()
+                if line.startswith(">"):
+                    if header is None:
+                        header = line[1:]      # drop leading ">"
+                    else:
+                        break                  # stop after first record
+                else:
+                    seq_len += len(line)       # add length of sequence line
+        region = header + ":1-" + str(seq_len)
+
     # Construct command
     cmd = [
         "breseq", "bam2cov",
         "-t",  # request tab format
-        "--region", region, # "REL606:1-4629812",
+        "--region", region,
         "--resolution", "0",  # single-base resolution
         "--output", tab_file,
         "-b", bamfile,
@@ -73,33 +106,48 @@ def bam2cov_to_df(
 
     # Load coverage as DataFrame
     try:
-        df = pd.read_csv(tab_file, sep="\t", engine='python', header = 0, index_col = 0, skipfooter = 4, comment="#")
+        df = pd.read_csv(
+            tab_file,
+            sep="\t",
+            engine='python',
+            header=0,
+            index_col=0,
+            skipfooter=4,
+            comment="#"
+        )
     finally:
         # Always remove the temp file, even if there was an error
         if os.path.exists(tab_file):
             os.remove(tab_file)
+
     return df
 
 
-#Process the coverage per nucleotide pileup detected across the genome into normalized coverage across summary "windows" tiled across the genome
+# Process the coverage per nucleotide pileup detected across the genome
+# into normalized coverage across summary "windows" tiled across the genome
 def preprocess(df, win=200, step=100, frag=350):
 
-    if (step > win) :
-        return print(f'window size: {win} is smaller than step size: {step}. Excluding segments of the genome for analysis.')
+    if (step > win):
+        return print(
+            f'window size: {win} is smaller than step size: {step}. '
+            f'Excluding segments of the genome for analysis.'
+        )
 
-    # df_b2c = pd.read_csv(filepath ,delimiter = '\t',engine='python', header = 0, index_col = 0, skipfooter = 4 )
-    df_b2c = df
-    df_b2c["unique_cov"] = df_b2c["unique_top_cov"]+df_b2c["unique_bot_cov"]
-    df_b2c["redundant"] = df_b2c['redundant_top_cov']+df_b2c['redundant_bot_cov']
-    
+    df_b2c = df.copy()
+    df_b2c["unique_cov"] = df_b2c["unique_top_cov"] + df_b2c["unique_bot_cov"]
+    df_b2c["redundant"] = df_b2c['redundant_top_cov'] + df_b2c['redundant_bot_cov']
+
     start_coord = int(df_b2c.index[0])
     genome = df_b2c['ref_base']
     genome_len = len(genome)
-    genome_cyc = list(islice(cycle(genome), int(genome_len*0.75), genome_len+int(genome_len*1.25)))
-    # g_num = np.count_nonzero(genome == 'G')
-    # c_num = np.count_nonzero(genome == 'C')
-    # gen_gcp = (g_num + c_num)*100/genome_len
-    
+    genome_cyc = list(
+        islice(
+            cycle(genome),
+            int(genome_len * 0.75),
+            genome_len + int(genome_len * 1.25)
+        )
+    )
+
     fragseq = []
     fragment = []
     winseq = []
@@ -108,131 +156,447 @@ def preprocess(df, win=200, step=100, frag=350):
     window = []
     win_end = []
     window_med_cov = []
-    
-    # med_gen_cov = df_b2c["unique_cov"].median()
-    # cov = df_b2c["unique_cov"]
-    # cov_dict = {}
-    # win_cov_type = []
 
     df_b2c["cov_type"] = df_b2c["redundant"].apply(lambda x: 'R' if x > 0 else 'U')
     df_gc = pd.DataFrame(columns=["window_num"])
-    
-    i=0
+
+    i = 0
     lst_win = 0
 
-    #sliding window = win and increment size = step summarizes GC% and median coverage
-    while (i <= (genome_len-1)) and (lst_win < genome_len):
-        
-        win_full_cov = df_b2c["unique_cov"].iloc[i : (i+win)].to_numpy()
-        cov_type = df_b2c["cov_type"].iloc[i : (i+win)].to_numpy()
+    # sliding window = win and increment size = step
+    # summarizes GC% and median coverage
+    while (i <= (genome_len - 1)) and (lst_win < genome_len):
+
+        win_full_cov = df_b2c["unique_cov"].iloc[i:(i + win)].to_numpy()
+        cov_type = df_b2c["cov_type"].iloc[i:(i + win)].to_numpy()
         win_cov = []
 
-        # Filter the windows overlapping redundant coverage regions. Ignores any coverage in and adjacent to repititive/transposable changes
-        
+        # Filter the windows overlapping redundant coverage regions.
+        # Ignores any coverage in and adjacent to repetitive/transposable changes
         winu = 0
         for j in range(len(cov_type)):
             if (cov_type[j] == 'U'):
                 win_cov.insert(j, float(win_full_cov[j]))
-                winu+=1
+                winu += 1
             else:
                 break
-        #If stretches of unique window exceeds set window size move to the next step
+
+        # If stretches of unique window does not exceed set window size,
+        # move to the next step
         if (winu < win):
-
             i = i + step
-        #Summarize the window coverage statistics
         else:
-            window_med_cov.insert(i,float(np.nanmedian(win_cov)))
-            winseq = genome[i:i+winu]
-            seq.insert(i,str(''.join(str(element) for element in winseq)))
+            # Summarize the window coverage statistics
+            window_med_cov.insert(i, float(np.nanmedian(win_cov)))
+            winseq = genome[i:i + winu]
+            seq.insert(i, ''.join(str(element) for element in winseq))
             window.insert(i, i)
-            win_end.insert(i,i+winu)
-            lst_win = win_end[(len(win_end)-1)]
-            i_off = i+int(genome_len*0.25)
-            #If fragment size is greater than the window size calculate the GC% of the entire fragment covering the coverage window 
+            win_end.insert(i, i + winu)
+            lst_win = win_end[(len(win_end) - 1)]
+            i_off = i + int(genome_len * 0.25)
+
+            # If fragment size is greater than the window size calculate the
+            # GC% of the entire fragment covering the coverage window
             if (frag > win):
-                diff = int((frag-win)/2)
-                fragseq = genome_cyc[(i_off-diff):((i_off + win)+diff)]
-                fragment.insert(i,str(''.join(str(element) for element in fragseq)))
-                gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
-                gccp = (len(gcc)/len(fragseq))
-                gcp_s.insert(i,gccp)
-            #Otherwise use the legth of the window to calculate the GC% across coverage window
+                diff = int((frag - win) / 2)
+                fragseq = genome_cyc[(i_off - diff):((i_off + win) + diff)]
+                fragment.insert(i, ''.join(str(element) for element in fragseq))
+                gcc = ''.join([nucleotide for nucleotide in fragseq
+                               if nucleotide in ['C', 'G']])
+                gccp = (len(gcc) / len(fragseq))
+                gcp_s.insert(i, gccp)
+            # Otherwise use the length of the window to calculate the GC%
             else:
-                diff = int((win-frag)/2)
-                fragseq = list(genome_cyc[i_off-diff:(i_off + win)+diff])
-                fragment.insert(i,str(''.join(str(element) for element in fragseq)))
-                gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
-                gccp = (len(gcc)/len(fragseq))
-                gcp_s.insert(i,gccp)
+                diff = int((win - frag) / 2)
+                fragseq = list(
+                    genome_cyc[i_off - diff:(i_off + win) + diff]
+                )
+                fragment.insert(i, ''.join(str(element) for element in fragseq))
+                gcc = ''.join([nucleotide for nucleotide in fragseq
+                               if nucleotide in ['C', 'G']])
+                gccp = (len(gcc) / len(fragseq))
+                gcp_s.insert(i, gccp)
 
             i = i + step
 
-    #Save the window median and GC% per fragment overlapping a window to the dataframe
-    # window += start_coord
-    # win_end += start_coord
+    # Save the window median and GC% per fragment overlapping a window
+    # to the dataframe
     df_gc["win_st"] = [x + start_coord for x in window]
     df_gc["win_end"] = [x + start_coord for x in win_end]
     df_gc["win_len"] = df_gc["win_end"] - df_gc["win_st"]
     df_gc["gc_percent"] = gcp_s
     df_gc["read_count_cov"] = window_med_cov
-    df_gc["window_num"] = np.arange(0,len(window_med_cov),1)
-    df_gc["norm_raw_cov"] = df_gc["read_count_cov"]/df_gc["read_count_cov"].median()
-    
+    df_gc["window_num"] = np.arange(0, len(window_med_cov), 1)
+    df_gc["norm_raw_cov"] = (
+        df_gc["read_count_cov"] / df_gc["read_count_cov"].median()
+    )
+
     return df_gc
 
 
 def gc_cor_plots(df, output):
-    
-    samplename = output.strip().split('/')[-1]
-    # samplename = sample.strip().split('.')[0]
-    
-    saveplt = str(output+"/GC_bias/")
-    
+    genome_ids = sorted(df["genome_id"].unique())
+    if len(genome_ids) > 1:
+        label = "_and_".join(str(g) for g in genome_ids)
+    else:
+        label = str(genome_ids[0])
+    samplename = f"{label}_GC_vs_NormRds"
+    saveplt = str(output + "/GC_bias/")
+
+    os.makedirs(saveplt, exist_ok=True)
+
     plt.figure(figsize=(10, 8))
-    
-    gc_fit = np.poly1d(np.polyfit(df['gc_percent'].unique(), df['gc_corr_fact'].unique(), 2))
 
-    plt.scatter(df['gc_percent'], df['norm_raw_cov'], color='brown', label='Raw normalized reads vs GC', s=5)
-    plt.scatter(df['gc_percent'], df['gc_corr_norm_cov'], color="green", label='Corrected normalized reads', s=10, alpha = 0.3)
-    plt.plot(np.sort(df['gc_percent'].unique()), gc_fit(np.sort(df['gc_percent'].unique())), color = 'black', linewidth = 3, label = 'LOWESS fit')
+    gc_fit = np.poly1d(
+        np.polyfit(df['gc_percent'].unique(),
+                   df['gc_corr_fact'].unique(), 2)
+    )
 
-    # Adding labels and title
+    plt.scatter(
+        df['gc_percent'],
+        df['norm_raw_cov'],
+        color='brown',
+        label='Raw normalized reads vs GC',
+        s=5
+    )
+    plt.scatter(
+        df['gc_percent'],
+        df['gc_corr_norm_cov'],
+        color="green",
+        label='Corrected normalized reads',
+        s=10,
+        alpha=0.3
+    )
+    plt.plot(
+        np.sort(df['gc_percent'].unique()),
+        gc_fit(np.sort(df['gc_percent'].unique())),
+        color='black',
+        linewidth=3,
+        label='LOWESS fit'
+    )
+
     plt.ylabel('Normalized read coverage')
     plt.xlabel('GC% per window')
-    
     plt.title(f'{samplename}_GCvsNormalizedReads')
-    plt.legend(loc = 'upper right')
+    plt.legend(loc='upper right')
 
-    plt_full_path =os.path.join(saveplt,'%s_GC_vs_NormRds.pdf' % samplename.replace(' ', '_'))
-    plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
-
-    
+    plt_full_path = os.path.join(
+        saveplt,
+        '%s_GC_vs_NormRds.pdf' % samplename.replace(' ', '_')
+    )
+    plt.savefig(plt_full_path, format='pdf', bbox_inches='tight')
     plt.close()
 
-#GC-bias correction
+
+# GC-bias correction
 def gc_correction(df):
-    # Corrects trends between GC% and coverage in windows using locally weighted regression model
+    # Corrects trends between GC% and coverage in windows
+    # using locally weighted regression model
 
     cov = df["norm_raw_cov"]
     gc = df["gc_percent"]
-    med = df["norm_raw_cov"].median()
 
-    loess = sm.nonparametric.lowess
-    gc_out = loess(cov, gc, frac=0.05, it=1, delta=0.0, is_sorted=False, missing='none', return_sorted=False)    
+    loess = sm.nonparametric.lowess  # [web:6]
+    gc_out = loess(
+        cov, gc,
+        frac=0.05,
+        it=1,
+        delta=0.0,
+        is_sorted=False,
+        missing='none',
+        return_sorted=False
+    )
 
-    gc_corr = cov/gc_out
+    gc_corr = cov / gc_out
 
+    df = df.copy()
     df["gc_corr_norm_cov"] = gc_corr
     df["gc_corr_fact"] = gc_out
-    df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], size = int(len(df)/10), mode = "reflect")
-    
+    # df["gc_cor_med_fil"] = ndimage.median_filter(
+    #     df["gc_corr_norm_cov"],
+    #     size=int(len(df) / 10),
+    #     mode="reflect"
+    # )
+
     return df
+
+
+def process_multi_genome(
+    bamfile,
+    fastafile,
+    output_prefix,
+    win=200,
+    step=100,
+    frag=350,
+    extra_args=None
+):
+    """
+    Run bam2cov + preprocess per genome (FASTA header),
+    pool for GC correction, plot pooled bias,
+    then return per-genome GC-corrected DataFrames keyed by FASTA header.
+    """
+
+    # Discover all genomes in the FASTA [web:7]
+    records = parse_fasta_records(fastafile)  # [(header, seq_len), ...]
+
+    preprocessed = {}
+    for (header, seq_len) in records:
+        region = f"{header}:1-{seq_len}"
+        tab_prefix = f"{output_prefix}_{header}"
+
+        # per-genome bam2cov
+        df_raw = bam2cov_to_df(
+            bamfile,
+            fastafile,
+            tab_prefix,
+            extra_args=extra_args,
+            region=region
+        )
+
+        # per-genome preprocessing
+        df_pre = preprocess(df_raw, win=win, step=step, frag=frag)
+        df_pre["genome_id"] = header
+        preprocessed[header] = df_pre
+
+    # Pool all genomes for a shared LOWESS GC correction
+    df_pooled = pd.concat(preprocessed.values(), ignore_index=True)
+
+    # Global renormalization before LOWESS
+    global_median = df_pooled["read_count_cov"].median()
+    df_pooled["norm_raw_cov"] = df_pooled["read_count_cov"] / global_median
+
+    # Pooled GC correction
+    df_pooled = gc_correction(df_pooled)
+
+    # Pooled GC-bias plot
+    gc_cor_plots(df_pooled, output_prefix)
+
+    # Re-separate corrected data by genome_id
+    per_genome_corrected = {}
+    for header, _ in records:
+        df_g = df_pooled[df_pooled["genome_id"] == header].copy()
+        df_g.reset_index(drop=True, inplace=True)   # <─ important
+        per_genome_corrected[header] = df_g
+
+
+
+    return per_genome_corrected
+
+# def bam2cov_to_df(
+#     bamfile,          # path to BAM
+#     fastafile,        # path to FASTA
+#     output_prefix,    # output tab file: e.g. "coverage.tab", recommended with .tab extension
+#     extra_args=None   # optional, list for any extra CLI args
+# ):
+#     # The tab output file name (may be output_prefix or output_prefix.tab)
+#     tab_file = output_prefix
+#     header = None
+#     seq_len = 0
+#     with open(fastafile) as fh:
+#         for line in fh:
+#             line = line.rstrip()
+#             if line.startswith(">"):
+#                 if header is None:
+#                     header = line[1:]      # drop leading ">"
+#                 else:
+#                     break                  # stop after first record
+#             else:
+#                 seq_len += len(line)       # add length of sequence line
+
+#     region = header+":1-"+str(seq_len)
+#     # Construct command
+#     cmd = [
+#         "breseq", "bam2cov",
+#         "-t",  # request tab format
+#         "--region", region, # "REL606:1-4629812",
+#         "--resolution", "0",  # single-base resolution
+#         "--output", tab_file,
+#         "-b", bamfile,
+#         "-f", fastafile,
+#     ]
+#     if extra_args:
+#         cmd += extra_args
+
+#     # Run the command
+#     try:
+#         result = subprocess.run(
+#             cmd, check=True,
+#             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+#         )
+#         print(result.stdout)
+#         print(result.stderr)
+#     except subprocess.CalledProcessError as e:
+#         print(f"breseq bam2cov failed: {e.stderr}")
+#         raise
+
+#     # breseq appends ".tab" extension if not present; handle accordingly
+#     if not tab_file.endswith(".tab"):
+#         tab_file += ".tab"
+#     if not os.path.isfile(tab_file):
+#         raise FileNotFoundError(f"Coverage output file {tab_file} was not created.")
+
+#     # Load coverage as DataFrame
+#     try:
+#         df = pd.read_csv(tab_file, sep="\t", engine='python', header = 0, index_col = 0, skipfooter = 4, comment="#")
+#     finally:
+#         # Always remove the temp file, even if there was an error
+#         if os.path.exists(tab_file):
+#             os.remove(tab_file)
+#     return df
+
+
+# #Process the coverage per nucleotide pileup detected across the genome into normalized coverage across summary "windows" tiled across the genome
+# def preprocess(df, win=200, step=100, frag=350):
+
+#     if (step > win) :
+#         return print(f'window size: {win} is smaller than step size: {step}. Excluding segments of the genome for analysis.')
+
+#     # df_b2c = pd.read_csv(filepath ,delimiter = '\t',engine='python', header = 0, index_col = 0, skipfooter = 4 )
+#     df_b2c = df
+#     df_b2c["unique_cov"] = df_b2c["unique_top_cov"]+df_b2c["unique_bot_cov"]
+#     df_b2c["redundant"] = df_b2c['redundant_top_cov']+df_b2c['redundant_bot_cov']
+    
+#     start_coord = int(df_b2c.index[0])
+#     genome = df_b2c['ref_base']
+#     genome_len = len(genome)
+#     genome_cyc = list(islice(cycle(genome), int(genome_len*0.75), genome_len+int(genome_len*1.25)))
+#     # g_num = np.count_nonzero(genome == 'G')
+#     # c_num = np.count_nonzero(genome == 'C')
+#     # gen_gcp = (g_num + c_num)*100/genome_len
+    
+#     fragseq = []
+#     fragment = []
+#     winseq = []
+#     seq = []
+#     gcp_s = []
+#     window = []
+#     win_end = []
+#     window_med_cov = []
+    
+#     # med_gen_cov = df_b2c["unique_cov"].median()
+#     # cov = df_b2c["unique_cov"]
+#     # cov_dict = {}
+#     # win_cov_type = []
+
+#     df_b2c["cov_type"] = df_b2c["redundant"].apply(lambda x: 'R' if x > 0 else 'U')
+#     df_gc = pd.DataFrame(columns=["window_num"])
+    
+#     i=0
+#     lst_win = 0
+
+#     #sliding window = win and increment size = step summarizes GC% and median coverage
+#     while (i <= (genome_len-1)) and (lst_win < genome_len):
+        
+#         win_full_cov = df_b2c["unique_cov"].iloc[i : (i+win)].to_numpy()
+#         cov_type = df_b2c["cov_type"].iloc[i : (i+win)].to_numpy()
+#         win_cov = []
+
+#         # Filter the windows overlapping redundant coverage regions. Ignores any coverage in and adjacent to repititive/transposable changes
+        
+#         winu = 0
+#         for j in range(len(cov_type)):
+#             if (cov_type[j] == 'U'):
+#                 win_cov.insert(j, float(win_full_cov[j]))
+#                 winu+=1
+#             else:
+#                 break
+#         #If stretches of unique window exceeds set window size move to the next step
+#         if (winu < win):
+
+#             i = i + step
+#         #Summarize the window coverage statistics
+#         else:
+#             window_med_cov.insert(i,float(np.nanmedian(win_cov)))
+#             winseq = genome[i:i+winu]
+#             seq.insert(i,str(''.join(str(element) for element in winseq)))
+#             window.insert(i, i)
+#             win_end.insert(i,i+winu)
+#             lst_win = win_end[(len(win_end)-1)]
+#             i_off = i+int(genome_len*0.25)
+#             #If fragment size is greater than the window size calculate the GC% of the entire fragment covering the coverage window 
+#             if (frag > win):
+#                 diff = int((frag-win)/2)
+#                 fragseq = genome_cyc[(i_off-diff):((i_off + win)+diff)]
+#                 fragment.insert(i,str(''.join(str(element) for element in fragseq)))
+#                 gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
+#                 gccp = (len(gcc)/len(fragseq))
+#                 gcp_s.insert(i,gccp)
+#             #Otherwise use the legth of the window to calculate the GC% across coverage window
+#             else:
+#                 diff = int((win-frag)/2)
+#                 fragseq = list(genome_cyc[i_off-diff:(i_off + win)+diff])
+#                 fragment.insert(i,str(''.join(str(element) for element in fragseq)))
+#                 gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
+#                 gccp = (len(gcc)/len(fragseq))
+#                 gcp_s.insert(i,gccp)
+
+#             i = i + step
+
+#     #Save the window median and GC% per fragment overlapping a window to the dataframe
+#     # window += start_coord
+#     # win_end += start_coord
+#     df_gc["win_st"] = [x + start_coord for x in window]
+#     df_gc["win_end"] = [x + start_coord for x in win_end]
+#     df_gc["win_len"] = df_gc["win_end"] - df_gc["win_st"]
+#     df_gc["gc_percent"] = gcp_s
+#     df_gc["read_count_cov"] = window_med_cov
+#     df_gc["window_num"] = np.arange(0,len(window_med_cov),1)
+#     df_gc["norm_raw_cov"] = df_gc["read_count_cov"]/df_gc["read_count_cov"].median()
+    
+#     return df_gc
+
+
+# def gc_cor_plots(df, output):
+    
+#     samplename = output.strip().split('/')[-1]
+#     # samplename = sample.strip().split('.')[0]
+    
+#     saveplt = str(output+"/GC_bias/")
+    
+#     plt.figure(figsize=(10, 8))
+    
+#     gc_fit = np.poly1d(np.polyfit(df['gc_percent'].unique(), df['gc_corr_fact'].unique(), 2))
+
+#     plt.scatter(df['gc_percent'], df['norm_raw_cov'], color='brown', label='Raw normalized reads vs GC', s=5)
+#     plt.scatter(df['gc_percent'], df['gc_corr_norm_cov'], color="green", label='Corrected normalized reads', s=10, alpha = 0.3)
+#     plt.plot(np.sort(df['gc_percent'].unique()), gc_fit(np.sort(df['gc_percent'].unique())), color = 'black', linewidth = 3, label = 'LOWESS fit')
+
+#     # Adding labels and title
+#     plt.ylabel('Normalized read coverage')
+#     plt.xlabel('GC% per window')
+    
+#     plt.title(f'{samplename}_GCvsNormalizedReads')
+#     plt.legend(loc = 'upper right')
+
+#     plt_full_path =os.path.join(saveplt,'%s_GC_vs_NormRds.pdf' % samplename.replace(' ', '_'))
+#     plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
+
+    
+#     plt.close()
+
+# #GC-bias correction
+# def gc_correction(df):
+#     # Corrects trends between GC% and coverage in windows using locally weighted regression model
+
+#     cov = df["norm_raw_cov"]
+#     gc = df["gc_percent"]
+#     med = df["norm_raw_cov"].median()
+
+#     loess = sm.nonparametric.lowess
+#     gc_out = loess(cov, gc, frac=0.05, it=1, delta=0.0, is_sorted=False, missing='none', return_sorted=False)    
+
+#     gc_corr = cov/gc_out
+
+#     df["gc_corr_norm_cov"] = gc_corr
+#     df["gc_corr_fact"] = gc_out
+#     df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], size = int(len(df)/10), mode = "reflect")
+    
+#     return df
 
 def plot_otr_corr(df, output, ori, ter):
 
-    samplename = output.strip().split('/')[-1]
-    # samplename = sample.strip().split('.')[0]
+    genome_id = str(df["genome_id"][0])
+    samplename = output.strip().split('/')[-1] + genome_id
     saveplt = str(output+"/OTR_corr/")
   
     plt.figure(figsize=(10, 8))
@@ -286,8 +650,12 @@ def otr_set(df, ter_idx, ori_idx):
     
     xori_guess = ori_idx
     xter_guess = ter_idx
-    yori_guess = y[y_med_fil.argmax()]
-    yter_guess = y[y_med_fil.argmin()] 
+    o_idx = int(y_med_fil.to_numpy().argmax())
+    t_idx = int(y_med_fil.to_numpy().argmin())
+    yori_guess = y.iloc[o_idx]
+    yter_guess = y.iloc[t_idx]
+    # yori_guess = y[y_med_fil.argmax()]
+    # yter_guess = y[y_med_fil.argmin()] 
     
     if (abs(xori_guess-xter_guess) > len_init * 0.3 ):
         if (xori_guess < len_init*0.1) or (xori_guess > len_init * 0.9):
@@ -428,8 +796,10 @@ def otr_fit(df):
     
     xori_guess = y_med_fil.argmax()
     xter_guess = y_med_fil.argmin()
-    yori_guess = y[y_med_fil.argmax()]
-    yter_guess = y[y_med_fil.argmin()]
+    o_idx = int(y_med_fil.to_numpy().argmax())
+    t_idx = int(y_med_fil.to_numpy().argmin())
+    yori_guess = y.iloc[o_idx]
+    yter_guess = y.iloc[t_idx]
 
     print(f'xori_guess:{xori_guess} and xter_guess: {xter_guess}')
 
@@ -584,11 +954,29 @@ def find_nearest(array, value):
 def otr_correction(df, output, ori, ter, enforce):
 
     windows = df["win_end"]
+    # if "gc_cor_med_fil" not in df.columns:
+    #     df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], 
+    #                                                  size = int(len(df)/10), 
+    #                                                  mode = "reflect")
     if "gc_cor_med_fil" not in df.columns:
-        df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], 
-                                                     size = int(len(df)/10), 
-                                                     mode = "reflect")
-    samplename = output.strip().split('/')[-1]
+        n = len(df)
+        # choose a safe window: at least 3, at most n, and odd
+        win = max(3, int(n / 10))
+        win = min(win, n)
+        if win % 2 == 0:
+            win -= 1
+        if win < 1:
+            # degenerate case: just copy the original series
+            df["gc_cor_med_fil"] = df["gc_corr_norm_cov"].copy()
+        else:
+            df["gc_cor_med_fil"] = ndimage.median_filter(
+                df["gc_corr_norm_cov"],
+                size=win,
+                mode="reflect",
+            )
+        
+    genome_id = str(df["genome_id"][0])
+    samplename = output.strip().split('/')[-1] + genome_id
     saveplt = str(output+"/OTR_corr/")
 
     # enforces user set genomic co-ordinates of ori/ter to check and fit the bias curve.
@@ -617,8 +1005,9 @@ def otr_correction(df, output, ori, ter, enforce):
     # fits the bias curve to the most probable location of ori/ter based on coverage peak and troughs respectively
         h1, f1 , ori_idx, ter_idx, bias = otr_fit(df)
         if bias:
+            
             xori = df["win_st"].iloc[ori_idx]
-            xter = df["win_end"].iloc[ter_idx]
+            xter = df["win_st"].iloc[ter_idx]
             yori = f1[ori_idx]
             yter = f1[ter_idx]
             OTR = yori / (yter + 0.001)
@@ -641,7 +1030,8 @@ def otr_correction(df, output, ori, ter, enforce):
 
 def plot_copy(df_cnv, pltstart, pltend, output):
     
-    samplename = output.strip().split('/')[-1]
+    genome_id = str(df_cnv["genome_id"][0])
+    samplename = output.strip().split('/')[-1] + genome_id
     # samplename = sample.strip().split('.')[0]
     saveplt = str(output+"/CNV_plt/")
     
@@ -832,7 +1222,8 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
 def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10)):
     
     saveloc = str(output+"/CNV_csv/")
-    samplename = output.strip().split('/')[-1]
+    genome_id = str(df["genome_id"][0])
+    samplename = output.strip().split('/')[-1] + genome_id
     # samplename = sample.strip().split('.')[0]
     
     df["otr_gc_corr_norm_cov"] = np.nan_to_num(df["otr_gc_corr_norm_cov"])
@@ -906,31 +1297,3 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10)):
     print(f"{samplename}: Copy number prediction complete. .csv files saved.")
     
     return new_exp
-
-# def bias_correction(input, reference, output, ori, ter, enforce, win, step, frag):
-#     # Function handles the bias correction functions and outputs to be fed into the HMM
-
-#     samplename = output.strip().split('/')[-1]
-#     # samplename = sample.strip().split('.')[0]
-#     saveplt = str(output+"/OTR_corr/")
-    
-#     print("Calculating coverage pileup at each nucleotide base across the reference genome")
-    
-#     df_tab = bam2cov_to_df(input, reference, samplename)
-    
-#     print('Calculating coverage and GC% across sliding window over the genome.')
-    
-#     df = preprocess(df_tab, win, step, frag)
-#     gc_corr = gc_correction(df)
-    
-#     print('Corrected GC bias in coverage.')
-    
-#     otr_corr, otr_res, ori_win, ter_win = otr_correction(gc_corr, ori, ter, enforce)
-
-#     with open(saveplt+str(samplename)+'_otr_results.json', 'w') as f:
-#     # with open('Detected_otr-bias_results.json', 'w') as f:
-#         json.dump(otr_res, f, indent = 4)
-    
-#     print('Corrected origin/terminus of replication(OTR) bias in coverage.')
-    
-#     return otr_corr, ori_win, ter_win
