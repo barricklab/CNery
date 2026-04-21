@@ -8,8 +8,6 @@ Recent updates (latest commits):
 - **Input/output flexibility** — inputs default to `<input>/data/reference.bam` and `<input>/data/reference.fasta`; output prefix defaults to `<input>/CNV_out/`. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
-- **Origin/terminus coordinates are always inferred** — the previous `--ori` / `--ter` options have been removed. `CNery` now fits the OTR bias curve to the coverage profile automatically in every run.
-
 ---
 
 ## Installation
@@ -141,9 +139,3 @@ folders.
 ```
 
 ---
-
-## Notes
-
-- The origin/terminus of replication are inferred from the coverage profile using a two-slope fit around the genome-wide coverage peak (origin) and trough (terminus). Inferred coordinates and the fitted origin-to-terminus coverage ratio are written to `OTR_corr/*_otr_results.json` for every reference sequence.
-- GC-bias correction uses a LOWESS fit pooled across *all* reference sequences in the BAM, so smaller replicons (e.g. plasmids) borrow strength from the main chromosome.
-- CN calls are made by a hidden Markov model on the bias-corrected, normalized coverage.

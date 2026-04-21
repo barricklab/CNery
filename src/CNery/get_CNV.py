@@ -180,16 +180,13 @@ def main():
     else:
         pltstart, pltend = 0, 0
 
-    # Origin and terminus of replication are always inferred from the
-    # coverage profile (user-defined coordinates are no longer supported).
-    print(
-        "Origin/terminus of replication will be inferred from the "
-        "coverage profile."
-    )
+    # Origin and terminus of replication are always inferred from the coverage profile 
+    # print(
+    #     "Origin/terminus of replication will be inferred from the "
+    #     "coverage profile."
+    # )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # New: process single or multiple genomes in a unified way
-    # ─────────────────────────────────────────────────────────────────────
+    # process single or multiple genomes in a unified way
     per_genome = process_multi_genome(
         bamfile=bam_in,
         fastafile=ref_in,
@@ -210,9 +207,7 @@ def main():
         "Calculating coverage and GC% across sliding windows for each "
         "reference sequence"
     )
-    # ─────────────────────────────────────────────────────────────────────
     # Bias-correction and CNV calling per genome
-    # ─────────────────────────────────────────────────────────────────────
     for genome_id, df_b2c in per_genome.items():
         print(f"Processing genome: {genome_id}")
 

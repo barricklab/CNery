@@ -382,217 +382,6 @@ def process_multi_genome(
 
     return per_genome_corrected
 
-# def bam2cov_to_df(
-#     bamfile,          # path to BAM
-#     fastafile,        # path to FASTA
-#     output_prefix,    # output tab file: e.g. "coverage.tab", recommended with .tab extension
-#     extra_args=None   # optional, list for any extra CLI args
-# ):
-#     # The tab output file name (may be output_prefix or output_prefix.tab)
-#     tab_file = output_prefix
-#     header = None
-#     seq_len = 0
-#     with open(fastafile) as fh:
-#         for line in fh:
-#             line = line.rstrip()
-#             if line.startswith(">"):
-#                 if header is None:
-#                     header = line[1:]      # drop leading ">"
-#                 else:
-#                     break                  # stop after first record
-#             else:
-#                 seq_len += len(line)       # add length of sequence line
-
-#     region = header+":1-"+str(seq_len)
-#     # Construct command
-#     cmd = [
-#         "breseq", "bam2cov",
-#         "-t",  # request tab format
-#         "--region", region, # "REL606:1-4629812",
-#         "--resolution", "0",  # single-base resolution
-#         "--output", tab_file,
-#         "-b", bamfile,
-#         "-f", fastafile,
-#     ]
-#     if extra_args:
-#         cmd += extra_args
-
-#     # Run the command
-#     try:
-#         result = subprocess.run(
-#             cmd, check=True,
-#             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-#         )
-#         print(result.stdout)
-#         print(result.stderr)
-#     except subprocess.CalledProcessError as e:
-#         print(f"breseq bam2cov failed: {e.stderr}")
-#         raise
-
-#     # breseq appends ".tab" extension if not present; handle accordingly
-#     if not tab_file.endswith(".tab"):
-#         tab_file += ".tab"
-#     if not os.path.isfile(tab_file):
-#         raise FileNotFoundError(f"Coverage output file {tab_file} was not created.")
-
-#     # Load coverage as DataFrame
-#     try:
-#         df = pd.read_csv(tab_file, sep="\t", engine='python', header = 0, index_col = 0, skipfooter = 4, comment="#")
-#     finally:
-#         # Always remove the temp file, even if there was an error
-#         if os.path.exists(tab_file):
-#             os.remove(tab_file)
-#     return df
-
-
-# #Process the coverage per nucleotide pileup detected across the genome into normalized coverage across summary "windows" tiled across the genome
-# def preprocess(df, win=200, step=100, frag=350):
-
-#     if (step > win) :
-#         return print(f'window size: {win} is smaller than step size: {step}. Excluding segments of the genome for analysis.')
-
-#     # df_b2c = pd.read_csv(filepath ,delimiter = '\t',engine='python', header = 0, index_col = 0, skipfooter = 4 )
-#     df_b2c = df
-#     df_b2c["unique_cov"] = df_b2c["unique_top_cov"]+df_b2c["unique_bot_cov"]
-#     df_b2c["redundant"] = df_b2c['redundant_top_cov']+df_b2c['redundant_bot_cov']
-    
-#     start_coord = int(df_b2c.index[0])
-#     genome = df_b2c['ref_base']
-#     genome_len = len(genome)
-#     genome_cyc = list(islice(cycle(genome), int(genome_len*0.75), genome_len+int(genome_len*1.25)))
-#     # g_num = np.count_nonzero(genome == 'G')
-#     # c_num = np.count_nonzero(genome == 'C')
-#     # gen_gcp = (g_num + c_num)*100/genome_len
-    
-#     fragseq = []
-#     fragment = []
-#     winseq = []
-#     seq = []
-#     gcp_s = []
-#     window = []
-#     win_end = []
-#     window_med_cov = []
-    
-#     # med_gen_cov = df_b2c["unique_cov"].median()
-#     # cov = df_b2c["unique_cov"]
-#     # cov_dict = {}
-#     # win_cov_type = []
-
-#     df_b2c["cov_type"] = df_b2c["redundant"].apply(lambda x: 'R' if x > 0 else 'U')
-#     df_gc = pd.DataFrame(columns=["window_num"])
-    
-#     i=0
-#     lst_win = 0
-
-#     #sliding window = win and increment size = step summarizes GC% and median coverage
-#     while (i <= (genome_len-1)) and (lst_win < genome_len):
-        
-#         win_full_cov = df_b2c["unique_cov"].iloc[i : (i+win)].to_numpy()
-#         cov_type = df_b2c["cov_type"].iloc[i : (i+win)].to_numpy()
-#         win_cov = []
-
-#         # Filter the windows overlapping redundant coverage regions. Ignores any coverage in and adjacent to repititive/transposable changes
-        
-#         winu = 0
-#         for j in range(len(cov_type)):
-#             if (cov_type[j] == 'U'):
-#                 win_cov.insert(j, float(win_full_cov[j]))
-#                 winu+=1
-#             else:
-#                 break
-#         #If stretches of unique window exceeds set window size move to the next step
-#         if (winu < win):
-
-#             i = i + step
-#         #Summarize the window coverage statistics
-#         else:
-#             window_med_cov.insert(i,float(np.nanmedian(win_cov)))
-#             winseq = genome[i:i+winu]
-#             seq.insert(i,str(''.join(str(element) for element in winseq)))
-#             window.insert(i, i)
-#             win_end.insert(i,i+winu)
-#             lst_win = win_end[(len(win_end)-1)]
-#             i_off = i+int(genome_len*0.25)
-#             #If fragment size is greater than the window size calculate the GC% of the entire fragment covering the coverage window 
-#             if (frag > win):
-#                 diff = int((frag-win)/2)
-#                 fragseq = genome_cyc[(i_off-diff):((i_off + win)+diff)]
-#                 fragment.insert(i,str(''.join(str(element) for element in fragseq)))
-#                 gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
-#                 gccp = (len(gcc)/len(fragseq))
-#                 gcp_s.insert(i,gccp)
-#             #Otherwise use the legth of the window to calculate the GC% across coverage window
-#             else:
-#                 diff = int((win-frag)/2)
-#                 fragseq = list(genome_cyc[i_off-diff:(i_off + win)+diff])
-#                 fragment.insert(i,str(''.join(str(element) for element in fragseq)))
-#                 gcc = ''.join([nucleotide for nucleotide in fragseq if nucleotide in ['C', 'G']])
-#                 gccp = (len(gcc)/len(fragseq))
-#                 gcp_s.insert(i,gccp)
-
-#             i = i + step
-
-#     #Save the window median and GC% per fragment overlapping a window to the dataframe
-#     # window += start_coord
-#     # win_end += start_coord
-#     df_gc["win_st"] = [x + start_coord for x in window]
-#     df_gc["win_end"] = [x + start_coord for x in win_end]
-#     df_gc["win_len"] = df_gc["win_end"] - df_gc["win_st"]
-#     df_gc["gc_percent"] = gcp_s
-#     df_gc["read_count_cov"] = window_med_cov
-#     df_gc["window_num"] = np.arange(0,len(window_med_cov),1)
-#     df_gc["norm_raw_cov"] = df_gc["read_count_cov"]/df_gc["read_count_cov"].median()
-    
-#     return df_gc
-
-
-# def gc_cor_plots(df, output):
-    
-#     samplename = output.strip().split('/')[-1]
-#     # samplename = sample.strip().split('.')[0]
-    
-#     saveplt = str(output+"/GC_bias/")
-    
-#     plt.figure(figsize=(10, 8))
-    
-#     gc_fit = np.poly1d(np.polyfit(df['gc_percent'].unique(), df['gc_corr_fact'].unique(), 2))
-
-#     plt.scatter(df['gc_percent'], df['norm_raw_cov'], color='brown', label='Raw normalized reads vs GC', s=5)
-#     plt.scatter(df['gc_percent'], df['gc_corr_norm_cov'], color="green", label='Corrected normalized reads', s=10, alpha = 0.3)
-#     plt.plot(np.sort(df['gc_percent'].unique()), gc_fit(np.sort(df['gc_percent'].unique())), color = 'black', linewidth = 3, label = 'LOWESS fit')
-
-#     # Adding labels and title
-#     plt.ylabel('Normalized read coverage')
-#     plt.xlabel('GC% per window')
-    
-#     plt.title(f'{samplename}_GCvsNormalizedReads')
-#     plt.legend(loc = 'upper right')
-
-#     plt_full_path =os.path.join(saveplt,'%s_GC_vs_NormRds.pdf' % samplename.replace(' ', '_'))
-#     plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
-
-    
-#     plt.close()
-
-# #GC-bias correction
-# def gc_correction(df):
-#     # Corrects trends between GC% and coverage in windows using locally weighted regression model
-
-#     cov = df["norm_raw_cov"]
-#     gc = df["gc_percent"]
-#     med = df["norm_raw_cov"].median()
-
-#     loess = sm.nonparametric.lowess
-#     gc_out = loess(cov, gc, frac=0.05, it=1, delta=0.0, is_sorted=False, missing='none', return_sorted=False)    
-
-#     gc_corr = cov/gc_out
-
-#     df["gc_corr_norm_cov"] = gc_corr
-#     df["gc_corr_fact"] = gc_out
-#     df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], size = int(len(df)/10), mode = "reflect")
-    
-#     return df
-
 def plot_otr_corr(df, output, ori, ter):
 
     genome_id = str(df["genome_id"][0])
@@ -634,150 +423,150 @@ def fit_func(params, x, y):
     return error
 
 #Fit the coverage between the origin and terminus coordinates set by user to detect the presence and the degree of bias observed
-def otr_set(df, ter_idx, ori_idx):
+# def otr_set(df, ter_idx, ori_idx):
     
-    cyc = False
-    bias = False
-    pt = "trough"
-    x = df.index
-    y = df["gc_corr_norm_cov"]
-    y_med_fil = df["gc_cor_med_fil"]
+#     cyc = False
+#     bias = False
+#     pt = "trough"
+#     x = df.index
+#     y = df["gc_corr_norm_cov"]
+#     y_med_fil = df["gc_cor_med_fil"]
     
-    len_init = len(x)
+#     len_init = len(x)
     
-    x_cyc = list(islice(cycle(x), 0, len_init*3))
-    y_cyc = list(islice(cycle(y), 0, len_init*3))
+#     x_cyc = list(islice(cycle(x), 0, len_init*3))
+#     y_cyc = list(islice(cycle(y), 0, len_init*3))
     
-    xori_guess = ori_idx
-    xter_guess = ter_idx
-    o_idx = int(y_med_fil.to_numpy().argmax())
-    t_idx = int(y_med_fil.to_numpy().argmin())
-    yori_guess = y.iloc[o_idx]
-    yter_guess = y.iloc[t_idx]
-    # yori_guess = y[y_med_fil.argmax()]
-    # yter_guess = y[y_med_fil.argmin()] 
+#     xori_guess = ori_idx
+#     xter_guess = ter_idx
+#     o_idx = int(y_med_fil.to_numpy().argmax())
+#     t_idx = int(y_med_fil.to_numpy().argmin())
+#     yori_guess = y.iloc[o_idx]
+#     yter_guess = y.iloc[t_idx]
+#     # yori_guess = y[y_med_fil.argmax()]
+#     # yter_guess = y[y_med_fil.argmin()] 
     
-    if (abs(xori_guess-xter_guess) > len_init * 0.3 ):
-        if (xori_guess < len_init*0.1) or (xori_guess > len_init * 0.9):
-            xori_guess = 0
-            y1 = y_cyc[:xter_guess]
-            y2 = y_cyc[xter_guess:len_init]
-            x1 = x_cyc[:xter_guess]
-            x2 = x_cyc[xter_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
-        elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
-            xter_guess = 0
-            y1 = y_cyc[:xori_guess]
-            y2 = y_cyc[xori_guess:len_init]
-            x1 = x_cyc[:xori_guess]
-            x2 = x_cyc[xori_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
-            pt = "peak"
-        else:
-            xi = xori_guess if (xori_guess < xter_guess) else xter_guess
-            xj = xori_guess if (xori_guess > xter_guess) else xter_guess
-            y1 = y_cyc[xi:xj]
-            y2 = y_cyc[xj:(xi+len_init)]
-            x1 = x_cyc[xi:xj]
-            x2 = x_cyc[xj:(xi+len_init)]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
-            cyc = True
-        bias = True
-    else:
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
-        print("Specified ori and ter too close to each other. No correction applied.")
-        return y_corr, y_fit, bias
+#     if (abs(xori_guess-xter_guess) > len_init * 0.3 ):
+#         if (xori_guess < len_init*0.1) or (xori_guess > len_init * 0.9):
+#             xori_guess = 0
+#             y1 = y_cyc[:xter_guess]
+#             y2 = y_cyc[xter_guess:len_init]
+#             x1 = x_cyc[:xter_guess]
+#             x2 = x_cyc[xter_guess:len_init]
+#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+#             initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
+#         elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
+#             xter_guess = 0
+#             y1 = y_cyc[:xori_guess]
+#             y2 = y_cyc[xori_guess:len_init]
+#             x1 = x_cyc[:xori_guess]
+#             x2 = x_cyc[xori_guess:len_init]
+#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+#             initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
+#             pt = "peak"
+#         else:
+#             xi = xori_guess if (xori_guess < xter_guess) else xter_guess
+#             xj = xori_guess if (xori_guess > xter_guess) else xter_guess
+#             y1 = y_cyc[xi:xj]
+#             y2 = y_cyc[xj:(xi+len_init)]
+#             x1 = x_cyc[xi:xj]
+#             x2 = x_cyc[xj:(xi+len_init)]
+#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+#             initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
+#             cyc = True
+#         bias = True
+#     else:
+#         y_corr = y
+#         y_fit = np.repeat(np.mean(y), len_init)
+#         print("Specified ori and ter too close to each other. No correction applied.")
+#         return y_corr, y_fit, bias
     
-    result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
-    result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
+#     result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
+#     result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
     
-    xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
-    xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
+#     xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
+#     xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
     
-    xori_opt = np.mean([xori_opt1, xori_opt2])
-    xter_opt = np.mean([xter_opt1, xter_opt2])
-    yori_opt = np.mean([yori_opt1, yori_opt2])
-    yter_opt = np.mean([yter_opt1, yter_opt2])
+#     xori_opt = np.mean([xori_opt1, xori_opt2])
+#     xter_opt = np.mean([xter_opt1, xter_opt2])
+#     yori_opt = np.mean([yori_opt1, yori_opt2])
+#     yter_opt = np.mean([yter_opt1, yter_opt2])
     
-    y1_fit=[]
-    y2_fit=[]
+#     y1_fit=[]
+#     y2_fit=[]
     
-    if (yori_opt / yter_opt) > 1:
-        bias = True
-    else:
-        bias = False
+#     if (yori_opt / yter_opt) > 1:
+#         bias = True
+#     else:
+#         bias = False
 
-    if bias and cyc:
+#     if bias and cyc:
         
-        if (xori_opt > xter_opt):
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
+#         if (xori_opt > xter_opt):
+#             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
+#             c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+#             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
+#             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
             
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
+#             c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
+#             c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
             
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
-        else:
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
+#             y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
+#             y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
+#             y_fit = y1_fit + y2_fit
+#             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
+#         else:
+#             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
+#             c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+#             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
+#             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
             
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
+#             c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
+#             c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
             
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
-        y_corr = y / y_fit
+#             y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
+#             y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
+#             y_fit = y1_fit + y2_fit
+#             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
+#         y_corr = y / y_fit
         
-    elif bias and not cyc:
-        if pt == "peak":
-            xter_opt = 0
+#     elif bias and not cyc:
+#         if pt == "peak":
+#             xter_opt = 0
             
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
+#             m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
+#             m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
 
-            c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
-            c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
+#             c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
+#             c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
             
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            y_fit = y1_fit + y2_fit
+#             y1_fit = [m_opt1 * x + c_opt1 for x in x1]
+#             y2_fit = [m_opt2 * x + c_opt2 for x in x2]
+#             y_fit = y1_fit + y2_fit
             
-        else:
-            xori_opt = 0
+#         else:
+#             xori_opt = 0
             
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
+#             m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
+#             m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
             
-            c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
-            c_opt2 = yter_opt1 - m_opt2 * (int(xori_opt2))
+#             c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
+#             c_opt2 = yter_opt1 - m_opt2 * (int(xori_opt2))
             
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
+#             y1_fit = [m_opt1 * x + c_opt1 for x in x1]
+#             y2_fit = [m_opt2 * x + c_opt2 for x in x2]
             
-            y_fit = y1_fit + y2_fit
+#             y_fit = y1_fit + y2_fit
             
-        y_corr = y / y_fit
-    else:
-        # y_corr = np.repeat(np.mean(y), len_init)
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
-        print("OTR bias not detected")
-        return y_corr, y_fit, xori_guess, xter_guess, bias
+#         y_corr = y / y_fit
+#     else:
+#         # y_corr = np.repeat(np.mean(y), len_init)
+#         y_corr = y
+#         y_fit = np.repeat(np.mean(y), len_init)
+#         print("OTR bias not detected")
+#         return y_corr, y_fit, xori_guess, xter_guess, bias
 
-    return y_corr, y_fit, bias
+#     return y_corr, y_fit, bias
 
 #Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
 def otr_fit(df):
