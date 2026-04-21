@@ -107,24 +107,6 @@ def main():
     )
 
     parser.add_argument(
-        "-ori",
-        "--origin",
-        action="store",
-        dest="ori",
-        required=False,
-        type=int,
-        help="Genomic coordinate for origin of replication.",
-    )
-    parser.add_argument(
-        "-ter",
-        "--terminus",
-        action="store",
-        dest="ter",
-        required=False,
-        type=int,
-        help="Genomic coordinate for terminus of replication.",
-    )
-    parser.add_argument(
         "-f",
         "--frag_size",
         action="store",
@@ -198,22 +180,12 @@ def main():
     else:
         pltstart, pltend = 0, 0
 
-    # Select the method to determine origin and terminus of the genome
-    enforce = False
-
-    if options.ori and options.ter is not None:
-        print("Ori has been set (value is %s)" % options.ori)
-        print("Ter has been set (value is %s)" % options.ter)
-        ori = options.ori
-        ter = options.ter
-        enforce = True
-    else:
-        options.ori = None
-        options.ter = None
-        print("Ori has not been set (default value is %s)" % options.ori)
-        print("Ter has not been set (default value is %s)" % options.ter)
-        ori = options.ori
-        ter = options.ter
+    # Origin and terminus of replication are always inferred from the
+    # coverage profile (user-defined coordinates are no longer supported).
+    print(
+        "Origin/terminus of replication will be inferred from the "
+        "coverage profile."
+    )
 
     # ─────────────────────────────────────────────────────────────────────
     # New: process single or multiple genomes in a unified way
@@ -260,9 +232,7 @@ def main():
             # Use raw norm_raw_cov as baseline for OTR-only correction
             df_otr_in = df_b2c.copy()
             df_otr_in["gc_corr_norm_cov"] = df_otr_in["norm_raw_cov"]
-            df_otr, ori_win, ter_win = otr_correction(
-                df_otr_in, out_dir, ori, ter, enforce
-            )
+            df_otr, ori_win, ter_win = otr_correction(df_otr_in, out_dir)
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'
@@ -287,9 +257,7 @@ def main():
                 f'{smpl} ({genome_id}): GC bias vs coverage handled '
                 f'(pooled fit).'
             )
-            df_otr, ori_win, ter_win = otr_correction(
-                df_gc, out_dir, ori, ter, enforce
-            )
+            df_otr, ori_win, ter_win = otr_correction(df_gc, out_dir)
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'

@@ -1,2 +1,0 @@
-[console_scripts]
-breseq-ext-cnv = breseq_ext_cnv.get_CNV:main

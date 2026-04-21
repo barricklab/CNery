@@ -950,14 +950,10 @@ def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
     return idx
 
-#Correction of the normalized coverage based on the bias detected
-def otr_correction(df, output, ori, ter, enforce):
+#Correction of the normalized coverage based on the bias detected.
+#Origin and terminus are always inferred from the coverage profile.
+def otr_correction(df, output):
 
-    windows = df["win_end"]
-    # if "gc_cor_med_fil" not in df.columns:
-    #     df["gc_cor_med_fil"] = ndimage.median_filter(df["gc_corr_norm_cov"], 
-    #                                                  size = int(len(df)/10), 
-    #                                                  mode = "reflect")
     if "gc_cor_med_fil" not in df.columns:
         n = len(df)
         # choose a safe window: at least 3, at most n, and odd
@@ -974,59 +970,42 @@ def otr_correction(df, output, ori, ter, enforce):
                 size=win,
                 mode="reflect",
             )
-        
+
     genome_id = str(df["genome_id"][0])
     samplename = output.strip().split('/')[-1] + genome_id
     saveplt = str(output+"/OTR_corr/")
 
-    # enforces user set genomic co-ordinates of ori/ter to check and fit the bias curve.
-    if (enforce == True):
-        x1, x2 = find_nearest(windows,ter) , find_nearest(windows,ori)
-        h1, f1, bias = otr_set(df, x1, x2)
-        if bias:
-            yori = f1[x2]
-            yter = f1[x1]
-            OTR = yori / (yter + 0.001)
-        else:
-            yori = np.nan
-            yter = np.nan
-            OTR = "Not detected"
-
-        results = {"Origin location":ori, "Origin coverage (normalized)":yori,"Terminus window":ter, 
-        "Terminus coverage (normalized)":yter, "Origin-to-Termius/Bias Ratio":OTR, "Correction type" : "Ori-ter defined by user" }
-        df["otr_gc_corr_norm_cov"] = h1
-        df["otr_gc_corr_fact"] = f1
-        
-        with open(saveplt+str(samplename)+'_otr_results.json', 'w') as f:
-            json.dump(results, f, indent = 4)
-        return df, ori, ter 
-    
+    # Fit the bias curve to the most probable location of ori/ter based on
+    # coverage peaks and troughs respectively.
+    h1, f1, ori_idx, ter_idx, bias = otr_fit(df)
+    if bias:
+        xori = df["win_st"].iloc[ori_idx]
+        xter = df["win_st"].iloc[ter_idx]
+        yori = f1[ori_idx]
+        yter = f1[ter_idx]
+        OTR = yori / (yter + 0.001)
     else:
-    # fits the bias curve to the most probable location of ori/ter based on coverage peak and troughs respectively
-        h1, f1 , ori_idx, ter_idx, bias = otr_fit(df)
-        if bias:
-            
-            xori = df["win_st"].iloc[ori_idx]
-            xter = df["win_st"].iloc[ter_idx]
-            yori = f1[ori_idx]
-            yter = f1[ter_idx]
-            OTR = yori / (yter + 0.001)
-        else:
-            xori = df["win_st"].iloc[0]
-            xter = df["win_end"].iloc[len(df)-1]
-            yori = np.nan
-            yter = np.nan
-            OTR = "Not detected"
+        xori = df["win_st"].iloc[0]
+        xter = df["win_end"].iloc[len(df)-1]
+        yori = np.nan
+        yter = np.nan
+        OTR = "Not detected"
 
-        results = {"Origin window":int(xori), "Origin coverage (normalized)":yori, "Terminus window":int(xter), 
-        "Terminus coverage (normalized)":yter, "Origin-to-Termius/Bias Ratio":OTR, "Correction type" : "Ori-ter coordinates fit by coverage" }
-        df["otr_gc_corr_norm_cov"] = h1
-        df["otr_gc_corr_fact"] = f1 
-        
-        with open(saveplt+str(samplename)+'_otr_results.json', 'w') as f:
-            json.dump(results, f, indent = 4)
+    results = {
+        "Origin window": int(xori),
+        "Origin coverage (normalized)": yori,
+        "Terminus window": int(xter),
+        "Terminus coverage (normalized)": yter,
+        "Origin-to-Termius/Bias Ratio": OTR,
+        "Correction type": "Ori-ter coordinates fit by coverage",
+    }
+    df["otr_gc_corr_norm_cov"] = h1
+    df["otr_gc_corr_fact"] = f1
 
-        return df, xori, xter
+    with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
+        json.dump(results, f, indent=4)
+
+    return df, xori, xter
 
 def plot_copy(df_cnv, pltstart, pltend, output):
     
