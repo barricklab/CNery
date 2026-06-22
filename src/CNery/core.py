@@ -790,7 +790,11 @@ def otr_correction(df, output):
         "Origin-to-Termius/Bias Ratio": OTR,
         "Correction type": "Ori-ter coordinates fit by coverage",
     }
-    df["otr_gc_corr_norm_cov"] = h1
+    # df["otr_gc_corr_norm_cov"] = h1
+    # df["otr_gc_corr_fact"] = f1
+    df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"].copy()
+    low = df["read_count_cov"] <= df["read_count_cov"].median() * 0.1
+    df.loc[~low, "otr_gc_corr_norm_cov"] = h1[~low]  # only apply scaling where coverage is non‑trivially positive
     df["otr_gc_corr_fact"] = f1
 
     with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
