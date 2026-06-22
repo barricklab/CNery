@@ -289,14 +289,20 @@ def gc_cor_plots(df, output):
 
 
 # GC-bias correction
-def gc_correction(df):
+def gc_correction(df, zero_frac=0.1):
     # Corrects trends between GC% and coverage in windows
     # using locally weighted regression model
 
-    cov = df["norm_raw_cov"]
-    gc = df["gc_percent"]
+    df = df.copy()
 
-    loess = sm.nonparametric.lowess  # [web:6]
+    #Freeze genuinely low-coverage windows at zero
+    zero_mask = df["read_count_cov"] <= (df["read_count_cov"].median()*zero_frac)
+    df.loc[zero_mask, "norm_raw_cov"] = 0.0
+
+    cov = df["norm_raw_cov"].values
+    gc  = df["gc_percent"].values
+
+    loess = sm.nonparametric.lowess
     gc_out = loess(
         cov, gc,
         frac=0.05,
@@ -307,16 +313,12 @@ def gc_correction(df):
         return_sorted=False
     )
 
-    gc_corr = cov / gc_out
+    gc_corr = np.zeros_like(cov)
+    nonzero = cov > 0
+    gc_corr[nonzero] = cov[nonzero] / gc_out[nonzero]
 
-    df = df.copy()
     df["gc_corr_norm_cov"] = gc_corr
-    df["gc_corr_fact"] = gc_out
-    # df["gc_cor_med_fil"] = ndimage.median_filter(
-    #     df["gc_corr_norm_cov"],
-    #     size=int(len(df) / 10),
-    #     mode="reflect"
-    # )
+    df["gc_corr_fact"]     = gc_out
 
     return df
 
