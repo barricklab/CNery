@@ -295,27 +295,38 @@ def gc_correction(df, zero_frac=0.1):
 
     df = df.copy()
 
-    #Freeze genuinely low-coverage windows at zero
-    zero_mask = df["read_count_cov"] <= (df["read_count_cov"].median()*zero_frac)
-    df.loc[zero_mask, "norm_raw_cov"] = 0.0
+    # Identify genuinely low-coverage windows (deletions). These are excluded
+    # from the LOWESS fit so they cannot pull the bias curve down, and are
+    # frozen at zero in the corrected output.
+    med = df["read_count_cov"].median()
+    zero_mask = df["read_count_cov"] <= (med * zero_frac)
 
-    cov = df["norm_raw_cov"].values
-    gc  = df["gc_percent"].values
+    cov = df["norm_raw_cov"].to_numpy(dtype=float)
+    gc  = df["gc_percent"].to_numpy(dtype=float)
+
+    # Fit the GC trend ONLY on trusted windows (exclude low/zero + non-finite)
+    fit_mask = (~zero_mask) & np.isfinite(cov) & np.isfinite(gc)
 
     loess = sm.nonparametric.lowess
-    gc_out = loess(
-        cov, gc,
-        frac=0.05,
+    sm_out = loess(
+        cov[fit_mask], gc[fit_mask],
+        frac=0.3,
         it=1,
         delta=0.0,
         is_sorted=False,
         missing='none',
-        return_sorted=False
+        return_sorted=True
     )
+    gc_sorted, fit_sorted = sm_out[:, 0], sm_out[:, 1]
+
+    # Predict the expected coverage at EVERY window's GC by interpolation,
+    # so deletions are corrected without having contaminated the fit.
+    gc_out = np.interp(gc, gc_sorted, fit_sorted)
+    gc_out = np.clip(gc_out, 1e-6, None)
 
     gc_corr = np.zeros_like(cov)
-    nonzero = cov > 0
-    gc_corr[nonzero] = cov[nonzero] / gc_out[nonzero]
+    valid = ~zero_mask
+    gc_corr[valid] = cov[valid] / gc_out[valid]
 
     df["gc_corr_norm_cov"] = gc_corr
     df["gc_corr_fact"]     = gc_out
@@ -338,8 +349,7 @@ def process_multi_genome(
     then return per-genome GC-corrected DataFrames keyed by FASTA header.
     """
 
-    # Discover all genomes in the FASTA [web:7]
-    records = parse_fasta_records(fastafile)  # [(header, seq_len), ...]
+    records = parse_fasta_records(fastafile)
 
     preprocessed = {}
     for (header, seq_len) in records:
@@ -377,7 +387,7 @@ def process_multi_genome(
     per_genome_corrected = {}
     for header, _ in records:
         df_g = df_pooled[df_pooled["genome_id"] == header].copy()
-        df_g.reset_index(drop=True, inplace=True)   # <─ important
+        df_g.reset_index(drop=True, inplace=True)
         per_genome_corrected[header] = df_g
 
 
@@ -666,7 +676,7 @@ def otr_fit(df):
         
         if (xori_opt > xter_opt):
             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
             
@@ -679,7 +689,7 @@ def otr_fit(df):
             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
         else:
             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
             
@@ -906,9 +916,10 @@ def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
         for obs in range(absmax + 1):
             emission[state, obs] = calculate_prob(p, r, obs)
     
-    # probability mass function determines the lower prbability of predicting zero as the readcounts approach absmax.
-    # error rate offsets the probability threshold of predicting zero at higher readcounts accounting for the erronous read alignments
-    zero_row = np.array([geom.pmf(i - 1, 1 - error_rate) for i in range(absmax + 1)])
+    # error rate offsets the probability threshold of 
+    # predicting zero at erronous read alignments
+    obs_range = np.arange(absmax + 1)
+    zero_row = geom.pmf(obs_range + 1, 1 - error_rate)
     emission = np.vstack((zero_row, emission))
     # np.savetxt("emission.csv", emission, delimiter=",")  
     return emission
