@@ -247,9 +247,16 @@ def gc_cor_plots(df, output):
 
     plt.figure(figsize=(10, 8))
 
+    # Use paired (gc_percent, gc_corr_fact) values so x and y stay aligned.
+    # Independent .unique() calls can return arrays of differing length once
+    # multiple GC values map to the same fit value.
+    uniq = (
+        df[['gc_percent', 'gc_corr_fact']]
+        .drop_duplicates(subset='gc_percent')
+        .sort_values('gc_percent')
+    )
     gc_fit = np.poly1d(
-        np.polyfit(df['gc_percent'].unique(),
-                   df['gc_corr_fact'].unique(), 2)
+        np.polyfit(uniq['gc_percent'], uniq['gc_corr_fact'], 2)
     )
 
     plt.scatter(
