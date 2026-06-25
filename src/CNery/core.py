@@ -777,10 +777,15 @@ def otr_fit(df):
         y_corr = y
         y_fit = np.repeat(np.mean(y), len_init)
         print("OTR bias not detected")
-        return y_corr, y_fit, xori_guess, xter_guess, bias
+        return y_corr, y_fit, o_idx, t_idx, bias
 
-    
-    return y_corr, y_fit, int(xori_opt), int(xter_opt), bias
+    # Report the origin/terminus at the med_fil peak/trough (o_idx/t_idx), NOT
+    # at the optimizer's xori_opt/xter_opt. fit_func over-parameterizes a line
+    # (4 params for a 2-DOF slope+intercept), so its x-coordinates lie in a flat
+    # error valley and drift arbitrarily from the true peak. The optimizer is
+    # used only for the ramp slopes; the breakpoints come from the coverage
+    # profile, which is where the origin (max) and terminus (min) actually are.
+    return y_corr, y_fit, o_idx, t_idx, bias
 
 
 def find_nearest(array, value):
@@ -1056,12 +1061,7 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10),
 
     med = df["read_count_cov"].median()
 
-    # Hard backstop against pathological bias-correction blow-ups. A corrected
-    # read count can never legitimately exceed (max plausible copy number) x
-    # median coverage; likewise the HMM never needs more states than that.
-    # Capping both here bounds rc_max (== absmax) and n_states, so the emission
-    # matrix np.full((n_states, absmax+1)) stays small even if a GC or OTR fit
-    # misbehaves upstream. max_copy_number is generous headroom for real CNVs.
+    # Hard backstop against pathological bias-correction blow-ups.
     rc_cap = int(max(1.0, max_copy_number) * med)
 
     cor_rc = []
@@ -1071,6 +1071,12 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10),
 
     mean = np.mean(cor_rc)
     var = np.var(cor_rc)
+
+    # The negative-binomial emission requires overdispersion (var > mean).
+    # read_count_cov is a per-window MEDIAN coverage, which is frequently
+    # UNDERdispersed (var <= mean).
+    if mean > 0 and var <= mean:
+        var = mean * (1.0 + 1e-3)
 
     df["otr_gc_corr_rdcnt_cov"] = cor_rc
 
