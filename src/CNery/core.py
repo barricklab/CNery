@@ -296,40 +296,61 @@ def gc_cor_plots(df, output):
 
 
 # GC-bias correction
-def gc_correction(df, zero_frac=0.1):
+def gc_correction(df, zero_frac=0.1, n_robust_iter=3, resid_mad=5.0,
+                  fit_floor_frac=0.05):
     # Corrects trends between GC% and coverage in windows
-    # using locally weighted regression model
+    # using locally weighted regression model.
 
     df = df.copy()
 
     # Identify genuinely low-coverage windows (deletions). These are excluded
     # from the LOWESS fit so they cannot pull the bias curve down, and are
-    # frozen at zero in the corrected output.
+    # frozen at zero in the corrected output (so they are still called CN=0).
     med = df["read_count_cov"].median()
     zero_mask = df["read_count_cov"] <= (med * zero_frac)
 
     cov = df["norm_raw_cov"].to_numpy(dtype=float)
     gc  = df["gc_percent"].to_numpy(dtype=float)
 
-    # Fit the GC trend ONLY on trusted windows (exclude low/zero + non-finite)
+    loess = sm.nonparametric.lowess
+
+    # Windows eligible to inform the GC fit: not deletions, finite values.
     fit_mask = (~zero_mask) & np.isfinite(cov) & np.isfinite(gc)
 
-    loess = sm.nonparametric.lowess
-    sm_out = loess(
-        cov[fit_mask], gc[fit_mask],
-        frac=0.3,
-        it=1,
-        delta=0.0,
-        is_sorted=False,
-        missing='none',
-        return_sorted=True
-    )
-    gc_sorted, fit_sorted = sm_out[:, 0], sm_out[:, 1]
+    # Iterative robust fit: fit the GC trend, then drop windows whose coverage
+    # is anomalous *relative to the fit at their own GC*.
+    gc_sorted = fit_sorted = None
+    for _ in range(max(1, n_robust_iter)):
+        sm_out = loess(
+            cov[fit_mask], gc[fit_mask],
+            frac=0.3, it=1, delta=0.0,
+            is_sorted=False, missing='none', return_sorted=True,
+        )
+        gc_sorted, fit_sorted = sm_out[:, 0], sm_out[:, 1]
 
-    # Predict the expected coverage at EVERY window's GC by interpolation,
-    # so deletions are corrected without having contaminated the fit.
+        # Residual of every window from the fit at its GC.
+        expected = np.interp(gc, gc_sorted, fit_sorted)
+        resid = cov - expected
+        med_resid = np.median(resid[fit_mask])
+        mad = np.median(np.abs(resid[fit_mask] - med_resid))
+        if mad <= 0:
+            break
+        sigma = 1.4826 * mad  # MAD -> ~stddev under normality
+        keep = np.abs(resid - med_resid) <= (resid_mad * sigma)
+        new_mask = fit_mask & keep
+
+        # Stop if converged or if we'd prune more than half the windows
+        if new_mask.sum() == fit_mask.sum() or new_mask.sum() < 0.5 * fit_mask.sum():
+            break
+        fit_mask = new_mask
+
+    # Predict the expected coverage at EVERY window's GC by interpolation
     gc_out = np.interp(gc, gc_sorted, fit_sorted)
-    gc_out = np.clip(gc_out, 1e-6, None)
+
+    # Floor the denominator RELATIVE to the median fitted coverage
+    fit_ref = np.median(fit_sorted)
+    floor = fit_floor_frac * fit_ref if np.isfinite(fit_ref) and fit_ref > 0 else 1e-6
+    gc_out = np.clip(gc_out, floor, None)
 
     gc_corr = np.zeros_like(cov)
     valid = ~zero_mask
@@ -596,7 +617,14 @@ def otr_fit(df):
     x = df.index
     y = df["gc_corr_norm_cov"]
     y_med_fil = df["gc_cor_med_fil"]
-    
+
+    # The ori->ter ramp (y_fit) is a straight line between the 
+    # fitted origin and terminus coverages
+    _yv = np.asarray(y, dtype=float)
+    _yfin = _yv[np.isfinite(_yv) & (_yv > 0)]
+    _yref = np.median(_yfin) if _yfin.size else 1.0
+    otr_floor = 0.05 * _yref if _yref > 0 else 1e-6
+
     len_init = len(x)
     
     x_cyc = list(islice(cycle(x), 0, len_init*3))
@@ -707,8 +735,9 @@ def otr_fit(df):
             y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
             y_fit = y1_fit + y2_fit
             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
+        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
         y_corr = y / y_fit
-        
+
     elif bias and not cyc:
         if pt == "peak":
             xter_opt = 0
@@ -740,6 +769,7 @@ def otr_fit(df):
             print(f'c_opt1:{c_opt1} and c_opt2:{c_opt2}')
 
 
+        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
         y_corr = y / y_fit
 
     else:
@@ -1013,33 +1043,45 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
 
     return results
 
-def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10)):
-    
+def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10),
+            max_copy_number=100):
+
     saveloc = str(output+"/CNV_csv/")
     genome_id = str(df["genome_id"][0])
     samplename = output.strip().split('/')[-1] + genome_id
     # samplename = sample.strip().split('.')[0]
-    
+
     df["otr_gc_corr_norm_cov"] = np.nan_to_num(df["otr_gc_corr_norm_cov"])
     # cor_cov = df["otr_gc_corr_norm_cov"]
 
     med = df["read_count_cov"].median()
+
+    # Hard backstop against pathological bias-correction blow-ups. A corrected
+    # read count can never legitimately exceed (max plausible copy number) x
+    # median coverage; likewise the HMM never needs more states than that.
+    # Capping both here bounds rc_max (== absmax) and n_states, so the emission
+    # matrix np.full((n_states, absmax+1)) stays small even if a GC or OTR fit
+    # misbehaves upstream. max_copy_number is generous headroom for real CNVs.
+    rc_cap = int(max(1.0, max_copy_number) * med)
+
     cor_rc = []
-    
     for i in range(len(df)):
-        # cor_rc.insert(i, int(np.nan_to_num(df["otr_gc_corr_norm_cov"].iloc[i]) * med))
-        cor_rc.insert(i, int(df["otr_gc_corr_norm_cov"].iloc[i] * med))
-    
+        rc_i = int(df["otr_gc_corr_norm_cov"].iloc[i] * med)
+        cor_rc.insert(i, min(rc_i, rc_cap))
+
     mean = np.mean(cor_rc)
     var = np.var(cor_rc)
-    
+
     df["otr_gc_corr_rdcnt_cov"] = cor_rc
-    
-    # determines the number of expected states based on the normalized coverage range. Minimum number of expected states = 5
-    n_states = int(df["otr_gc_corr_norm_cov"].max()) if int(df["otr_gc_corr_norm_cov"].max()) > 5 else 5
+
+    # number of expected states from the normalized coverage range (min 5),
+    # bounded by max_copy_number so a runaway value can't create thousands of
+    # HMM states.
+    cov_max = int(np.nan_to_num(df["otr_gc_corr_norm_cov"].max()))
+    n_states = min(max(cov_max, 5), int(max_copy_number))
 
     new_exp = df.copy()
-    
+
     rc_max = np.max(cor_rc)
     
     this_emission = setup_emission_matrix(n_states=n_states, mean=mean, variance=var, absmax=rc_max, error_rate=error_rate)
