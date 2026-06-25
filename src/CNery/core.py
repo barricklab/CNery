@@ -984,31 +984,33 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
             
     # Go through each of the rows of the matrix v and find out which column has the maximum value for that row
     most_probable_state_path = np.argmax(v, axis=1)
-    results = pd.DataFrame(columns=['Startpos', 'Endpos', 'State'])
-    
+    rows = []
+
     prev_obs = obs[0]
     prev_most_probable_state = most_probable_state_path[0]
     prev_most_probable_state_name = states[prev_most_probable_state]  # Adjust for 0-based indexing
     start_pos = 0
 
-    
+
     for i in range(0, len(obs)-1):
 
         observation = obs[i]
         most_probable_state = most_probable_state_path[i]
         most_probable_state_name = states[most_probable_state]  # Adjust for 0-based indexing
-        
+
         if most_probable_state_name != prev_most_probable_state_name:
-            results = results._append({'Startpos': start_pos,'Endpos': win_end[i-1], 
-                                      'State': prev_most_probable_state_name}, ignore_index=True)
+            rows.append({'Startpos': start_pos, 'Endpos': win_end[i-1],
+                         'State': prev_most_probable_state_name})
             start_pos = win_st[i]
-        
+
         prev_obs = observation
         prev_most_probable_state_name = most_probable_state_name
 
-    results = results._append({'Startpos': start_pos, 'Endpos': chr_length, 
-                              'State': prev_most_probable_state_name}, ignore_index=True)
-    
+    rows.append({'Startpos': start_pos, 'Endpos': chr_length,
+                 'State': prev_most_probable_state_name})
+
+    results = pd.DataFrame(rows, columns=['Startpos', 'Endpos', 'State'])
+
     return results
 
 def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10)):
