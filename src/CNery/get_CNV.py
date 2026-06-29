@@ -194,6 +194,7 @@ def main():
         win=options.w,
         step=options.s,
         frag=options.f,
+        breseq_dir=in_dir,
     )
     # process_multi_genome already:
     #   - runs bam2cov per genome

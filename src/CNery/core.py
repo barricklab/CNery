@@ -48,12 +48,25 @@ def parse_fasta_records(fastafile):
 
 
 def bam2cov_to_df(
-    bamfile,          # path to BAM
-    fastafile,        # path to FASTA
-    output_prefix,    # output tab file: e.g. "coverage.tab"
-    extra_args=None,  # optional, list for any extra CLI args
-    region=None       # optional, "REF:1-12345" to avoid re-parsing FASTA
+    bamfile,               # path to BAM
+    fastafile,             # path to FASTA
+    output_prefix,         # output tab file: e.g. "coverage.tab"
+    extra_args=None,       # optional, list for any extra CLI args
+    region=None,           # optional, "REF:1-12345" to avoid re-parsing FASTA
+    preexisting_tab=None,  # optional, path to an existing .tab file to use instead of running breseq
 ):
+    if preexisting_tab is not None and os.path.isfile(preexisting_tab):
+        print(f"Using pre-existing coverage file: {preexisting_tab}")
+        return pd.read_csv(
+            preexisting_tab,
+            sep="\t",
+            engine='python',
+            header=0,
+            index_col=0,
+            skipfooter=4,
+            comment="#",
+        )
+
     # The tab output file name (may be output_prefix or output_prefix.tab)
     tab_file = output_prefix
 
@@ -369,7 +382,8 @@ def process_multi_genome(
     win=200,
     step=100,
     frag=350,
-    extra_args=None
+    extra_args=None,
+    breseq_dir=None,
 ):
     """
     Run bam2cov + preprocess per genome (FASTA header),
@@ -384,13 +398,24 @@ def process_multi_genome(
         region = f"{header}:1-{seq_len}"
         tab_prefix = f"{output_prefix}_{header}"
 
+        # Check for pre-existing coverage tab from breseq 08_mutation_identification
+        preexisting_tab = None
+        if breseq_dir is not None:
+            candidate = os.path.join(
+                breseq_dir, "08_mutation_identification",
+                f"{header}.coverage.tab"
+            )
+            if os.path.isfile(candidate):
+                preexisting_tab = candidate
+
         # per-genome bam2cov
         df_raw = bam2cov_to_df(
             bamfile,
             fastafile,
             tab_prefix,
             extra_args=extra_args,
-            region=region
+            region=region,
+            preexisting_tab=preexisting_tab,
         )
 
         # per-genome preprocessing
