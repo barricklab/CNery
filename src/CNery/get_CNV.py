@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .core import (
-    process_multi_genome,   # NEW orchestrator
+    process_multi_genome,
     otr_correction,
     plot_otr_corr,
     run_HMM,
@@ -111,7 +111,7 @@ def main():
         "--frag_size",
         action="store",
         dest="f",
-        default=500,
+        default=150,
         required=False,
         type=int,
         help="Average fragment size of the sequencing reads.",

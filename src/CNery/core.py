@@ -133,6 +133,7 @@ def bam2cov_to_df(
         if os.path.exists(tab_file):
             os.remove(tab_file)
 
+
     return df
 
 
@@ -455,10 +456,10 @@ def plot_otr_corr(df, output, ori, ter):
   
     plt.figure(figsize=(10, 8))
     plt.scatter(df["win_st"],df["norm_raw_cov"], color="gray", label="Raw reads",s=8, alpha = 0.2)
-    plt.scatter(df["win_st"],df["gc_corr_norm_cov"], color="gray", label="GC corrected", marker = '*', s=15, alpha = 0.5)
+    plt.scatter(df["win_st"],df["gc_corr_norm_cov"], color="black", label="GC corrected", marker = '*', s=15, alpha = 0.5)
     plt.scatter(df["win_st"],df["otr_gc_corr_norm_cov"], color = 'orange', label="Ori/Ter bias corrected", s = 20, alpha = 0.85, 
                 marker = mplt.markers.MarkerStyle(marker = 'o', fillstyle = 'full'))
-    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color = "white", label = "OTR-bias-fit-line")
+    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color = "black", label = "OTR-bias-fit-line")
     plt.plot(df["win_st"],df["gc_cor_med_fil"], color="blue", label="Med-fil")
     
     plt.axvline(x=ter, color='r', linestyle=':', label=f'Terminus: {ter}')
@@ -486,6 +487,179 @@ def fit_func(params, x, y):
         y_pred = m*x[i] + c
         error += (y[i]-y_pred) ** 2
     return error
+
+#Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
+def otr_fit(df):
+    
+    cyc = False
+    bias = False
+    pt = "trough"
+    x = df.index
+    y = df["gc_corr_norm_cov"]
+    y_med_fil = df["gc_cor_med_fil"]
+
+    # The ori->ter ramp (y_fit) is a straight line between the 
+    # fitted origin and terminus coverages
+    _yv = np.asarray(y, dtype=float)
+    _yfin = _yv[np.isfinite(_yv) & (_yv > 0)]
+    _yref = np.median(_yfin) if _yfin.size else 1.0
+    otr_floor = 0.1 * _yref if _yref > 0 else 1e-6
+
+    len_init = len(x)
+    
+    x_cyc = list(islice(cycle(x), 0, len_init*3))
+    y_cyc = list(islice(cycle(y), 0, len_init*3))
+    
+    xori_guess = y_med_fil.argmax()
+    xter_guess = y_med_fil.argmin()
+    o_idx = int(y_med_fil.to_numpy().argmax())
+    t_idx = int(y_med_fil.to_numpy().argmin())
+    yori_guess = y.iloc[o_idx]
+    yter_guess = y.iloc[t_idx]
+
+    print(f'xori_guess:{xori_guess} and xter_guess: {xter_guess}')
+
+
+    if (abs((xori_guess - xter_guess)) >= (len_init * 0.35)):
+
+        bias = True
+        
+        if (xori_guess < len_init * 0.1) or (xori_guess > len_init * 0.9):
+            xori_guess = 0
+            y1 = y_cyc[:xter_guess]
+            y2 = y_cyc[xter_guess:len_init]
+            x1 = x_cyc[:xter_guess]
+            x2 = x_cyc[xter_guess:len_init]
+            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+            initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
+
+        elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
+            xter_guess = 0
+            y1 = y_cyc[:xori_guess]
+            y2 = y_cyc[xori_guess:len_init]
+            x1 = x_cyc[:xori_guess]
+            x2 = x_cyc[xori_guess:len_init]
+            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+            initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
+            pt = "peak"
+        
+        else:
+            xi = xori_guess if (xori_guess < xter_guess) else xter_guess
+            xj = xori_guess if (xori_guess > xter_guess) else xter_guess
+            y1 = y_cyc[xi:xj]
+            y2 = y_cyc[xj:(xi+len_init)]
+            x1 = x_cyc[xi:xj]
+            x2 = x_cyc[xj:(xi+len_init)]
+            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
+            initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
+            cyc = True
+
+    else:
+        y_corr = y
+        y_fit = np.repeat(np.mean(y), len_init)
+        print("OTR bias not detected")
+
+        return y_corr, y_fit, xori_guess, xter_guess, bias
+    
+    result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
+    result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
+    
+    xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
+    xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
+    
+    xori_opt = np.mean([xori_opt1, xori_opt2])
+    xter_opt = np.mean([xter_opt1, xter_opt2])
+    yori_opt = np.mean([yori_opt1, yori_opt2])
+    yter_opt = np.mean([yter_opt1, yter_opt2])
+    
+    print(f'guess1:{initial_guess1}, guess2:{initial_guess2}')
+    # print(f'xori_opt1:{xori_opt1} and xter_opt1: {xter_opt1}')
+    print(f'yori_opt1:{yori_opt1} and yter_opt1: {yter_opt1}')
+    # print(f'xori_opt2:{xori_opt2} and xter_opt2: {xter_opt2}')
+    print(f'yori_opt2:{yori_opt2} and yter_opt2: {yter_opt2}')
+
+
+    y1_fit=[]
+    y2_fit=[]
+
+    if (yori_opt / yter_opt) > 1:
+        bias = True
+    else:
+        bias = False
+    
+    if bias and cyc:
+        
+        if (xori_opt > xter_opt):
+            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
+            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
+            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
+            
+            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
+            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
+            
+            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
+            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
+            y_fit = y1_fit + y2_fit
+            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
+        else:
+            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
+            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
+            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
+            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
+            
+            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
+            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
+            
+            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
+            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
+            y_fit = y1_fit + y2_fit
+            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
+        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
+        y_corr = y / y_fit
+
+    elif bias and not cyc:
+        if pt == "peak":
+            xter_opt = 0
+            
+            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
+            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
+
+            c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
+            c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
+            
+            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
+            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
+            y_fit = y1_fit + y2_fit
+            
+        else:
+            xori_opt = 0
+            
+            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
+            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
+            
+            c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
+            c_opt2 = yter_opt1 - m_opt2 * (int(xter_opt2))
+            
+            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
+            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
+            
+            y_fit = y1_fit + y2_fit
+            print(f'm_opt1:{m_opt1} and m_opt2:{m_opt2}')
+            print(f'c_opt1:{c_opt1} and c_opt2:{c_opt2}')
+
+
+        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
+        y_corr = y / y_fit
+
+    else:
+        # y_corr = np.repeat(np.mean(y), len_init)
+        y_corr = y
+        y_fit = np.repeat(np.mean(y), len_init)
+        print("OTR bias not detected")
+        return y_corr, y_fit, o_idx, t_idx, bias
+
+    return y_corr, y_fit, o_idx, t_idx, bias
 
 #Fit the coverage between the origin and terminus coordinates set by user to detect the presence and the degree of bias observed
 # def otr_set(df, ter_idx, ori_idx):
@@ -633,199 +807,18 @@ def fit_func(params, x, y):
 
 #     return y_corr, y_fit, bias
 
-#Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
-def otr_fit(df):
-    
-    cyc = False
-    bias = False
-    pt = "trough"
-    x = df.index
-    y = df["gc_corr_norm_cov"]
-    y_med_fil = df["gc_cor_med_fil"]
-
-    # The ori->ter ramp (y_fit) is a straight line between the 
-    # fitted origin and terminus coverages
-    _yv = np.asarray(y, dtype=float)
-    _yfin = _yv[np.isfinite(_yv) & (_yv > 0)]
-    _yref = np.median(_yfin) if _yfin.size else 1.0
-    otr_floor = 0.05 * _yref if _yref > 0 else 1e-6
-
-    len_init = len(x)
-    
-    x_cyc = list(islice(cycle(x), 0, len_init*3))
-    y_cyc = list(islice(cycle(y), 0, len_init*3))
-    
-    xori_guess = y_med_fil.argmax()
-    xter_guess = y_med_fil.argmin()
-    o_idx = int(y_med_fil.to_numpy().argmax())
-    t_idx = int(y_med_fil.to_numpy().argmin())
-    yori_guess = y.iloc[o_idx]
-    yter_guess = y.iloc[t_idx]
-
-    print(f'xori_guess:{xori_guess} and xter_guess: {xter_guess}')
-
-
-    if (abs((xori_guess - xter_guess)) >= (len_init * 0.3)):
-
-        bias = True
-        
-        if (xori_guess < len_init * 0.1) or (xori_guess > len_init * 0.9):
-            xori_guess = 0
-            y1 = y_cyc[:xter_guess]
-            y2 = y_cyc[xter_guess:len_init]
-            x1 = x_cyc[:xter_guess]
-            x2 = x_cyc[xter_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
-
-        elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
-            xter_guess = 0
-            y1 = y_cyc[:xori_guess]
-            y2 = y_cyc[xori_guess:len_init]
-            x1 = x_cyc[:xori_guess]
-            x2 = x_cyc[xori_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
-            pt = "peak"
-        
-        else:
-            xi = xori_guess if (xori_guess < xter_guess) else xter_guess
-            xj = xori_guess if (xori_guess > xter_guess) else xter_guess
-            y1 = y_cyc[xi:xj]
-            y2 = y_cyc[xj:(xi+len_init)]
-            x1 = x_cyc[xi:xj]
-            x2 = x_cyc[xj:(xi+len_init)]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
-            cyc = True
-
-    else:
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
-        print("OTR bias not detected")
-
-        return y_corr, y_fit, xori_guess, xter_guess, bias
-    
-    result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
-    result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
-    
-    xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
-    xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
-    
-    xori_opt = np.mean([xori_opt1, xori_opt2])
-    xter_opt = np.mean([xter_opt1, xter_opt2])
-    yori_opt = np.mean([yori_opt1, yori_opt2])
-    yter_opt = np.mean([yter_opt1, yter_opt2])
-    
-    print(f'guess1:{initial_guess1}, guess2:{initial_guess2}')
-    # print(f'xori_opt1:{xori_opt1} and xter_opt1: {xter_opt1}')
-    print(f'yori_opt1:{yori_opt1} and yter_opt1: {yter_opt1}')
-    # print(f'xori_opt2:{xori_opt2} and xter_opt2: {xter_opt2}')
-    print(f'yori_opt2:{yori_opt2} and yter_opt2: {yter_opt2}')
-
-
-    y1_fit=[]
-    y2_fit=[]
-
-    if (yori_opt / yter_opt) > 1:
-        bias = True
-    else:
-        bias = False
-    
-    if bias and cyc:
-        
-        if (xori_opt > xter_opt):
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
-        else:
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
-        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
-        y_corr = y / y_fit
-
-    elif bias and not cyc:
-        if pt == "peak":
-            xter_opt = 0
-            
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
-
-            c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
-            c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            y_fit = y1_fit + y2_fit
-            
-        else:
-            xori_opt = 0
-            
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
-            
-            c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
-            c_opt2 = yter_opt1 - m_opt2 * (int(xter_opt2))
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            
-            y_fit = y1_fit + y2_fit
-            print(f'm_opt1:{m_opt1} and m_opt2:{m_opt2}')
-            print(f'c_opt1:{c_opt1} and c_opt2:{c_opt2}')
-
-
-        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
-        y_corr = y / y_fit
-
-    else:
-        # y_corr = np.repeat(np.mean(y), len_init)
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
-        print("OTR bias not detected")
-        return y_corr, y_fit, o_idx, t_idx, bias
-
-    # Report the origin/terminus at the med_fil peak/trough (o_idx/t_idx), NOT
-    # at the optimizer's xori_opt/xter_opt. fit_func over-parameterizes a line
-    # (4 params for a 2-DOF slope+intercept), so its x-coordinates lie in a flat
-    # error valley and drift arbitrarily from the true peak. The optimizer is
-    # used only for the ramp slopes; the breakpoints come from the coverage
-    # profile, which is where the origin (max) and terminus (min) actually are.
-    return y_corr, y_fit, o_idx, t_idx, bias
-
-
 def find_nearest(array, value):
     array = np.asarray(array)
     idx = (np.abs(array - value)).argmin()
     return idx
 
 #Correction of the normalized coverage based on the bias detected.
-#Origin and terminus are always inferred from the coverage profile.
 def otr_correction(df, output):
 
     if "gc_cor_med_fil" not in df.columns:
         n = len(df)
         # choose a safe window: at least 3, at most n, and odd
-        win = max(3, int(n / 10))
+        win = max(3, int(n/50))
         win = min(win, n)
         if win % 2 == 0:
             win -= 1
@@ -1038,129 +1031,134 @@ def make_viterbi_mat(obs, transition_matrix, emission_matrix):
 
 
 def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length):
-    states = np.arange(0, emission_matrix.shape[0] + 1)  # Assuming state indices start from 1
-    
+    states = np.arange(emission_matrix.shape[0])
+
     v = make_viterbi_mat(obs, transition_matrix, emission_matrix)
-            
-    # Go through each of the rows of the matrix v and find out which column has the maximum value for that row
+
     most_probable_state_path = np.argmax(v, axis=1)
     rows = []
 
-    prev_obs = obs[0]
     prev_most_probable_state = most_probable_state_path[0]
-    prev_most_probable_state_name = states[prev_most_probable_state]  # Adjust for 0-based indexing
+    prev_most_probable_state_name = states[prev_most_probable_state]
     start_pos = 0
 
-
-    for i in range(0, len(obs)-1):
-
-        observation = obs[i]
+    for i in range(len(obs) - 1):
         most_probable_state = most_probable_state_path[i]
-        most_probable_state_name = states[most_probable_state]  # Adjust for 0-based indexing
+        most_probable_state_name = states[most_probable_state]
 
         if most_probable_state_name != prev_most_probable_state_name:
-            rows.append({'Startpos': start_pos, 'Endpos': win_end[i-1],
-                         'State': prev_most_probable_state_name})
-            start_pos = win_st[i]
+            endpos = win_end.iloc[i - 1] if hasattr(win_end, "iloc") else win_end[i - 1]
+            rows.append({
+                "Startpos": start_pos,
+                "Endpos": endpos,
+                "State": prev_most_probable_state_name,
+            })
+            start_pos = win_st.iloc[i] if hasattr(win_st, "iloc") else win_st[i]
 
-        prev_obs = observation
         prev_most_probable_state_name = most_probable_state_name
 
-    rows.append({'Startpos': start_pos, 'Endpos': chr_length,
-                 'State': prev_most_probable_state_name})
+    rows.append({
+        "Startpos": start_pos,
+        "Endpos": chr_length,
+        "State": prev_most_probable_state_name,
+    })
 
-    results = pd.DataFrame(rows, columns=['Startpos', 'Endpos', 'State'])
-
+    results = pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
     return results
 
-def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=(1e-10),
+
+def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
             max_copy_number=100):
 
-    saveloc = str(output+"/CNV_csv/")
-    genome_id = str(df["genome_id"][0])
-    samplename = output.strip().split('/')[-1] + genome_id
-    # samplename = sample.strip().split('.')[0]
+    saveloc = os.path.join(output, "CNV_csv")
+    genome_id = str(df["genome_id"].iloc[0])
+    samplename = output.rstrip("/").split("/")[-1] + genome_id
 
-    df["otr_gc_corr_norm_cov"] = np.nan_to_num(df["otr_gc_corr_norm_cov"])
-    # cor_cov = df["otr_gc_corr_norm_cov"]
+    new_exp = df.copy()
 
-    med = df["read_count_cov"].median()
+    new_exp.loc[:, "otr_gc_corr_norm_cov"] = np.nan_to_num(new_exp["otr_gc_corr_norm_cov"].to_numpy())
 
-    # Hard backstop against pathological bias-correction blow-ups.
+    med = new_exp["read_count_cov"].median()
+
     rc_cap = int(max(1.0, max_copy_number) * med)
 
-    cor_rc = []
-    for i in range(len(df)):
-        rc_i = int(df["otr_gc_corr_norm_cov"].iloc[i] * med)
-        cor_rc.insert(i, min(rc_i, rc_cap))
+    cor_rc = (
+        (new_exp["otr_gc_corr_norm_cov"] * med)
+        .round()
+        .astype(int)
+        .clip(upper=rc_cap)
+        .tolist()
+    )
 
     mean = np.mean(cor_rc)
     var = np.var(cor_rc)
 
-    # The negative-binomial emission requires overdispersion (var > mean).
-    # read_count_cov is a per-window MEDIAN coverage, which is frequently
-    # UNDERdispersed (var <= mean).
     if mean > 0 and var <= mean:
         var = mean * (1.0 + 1e-3)
 
-    df["otr_gc_corr_rdcnt_cov"] = cor_rc
+    new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = cor_rc
 
-    # number of expected states from the normalized coverage range (min 5),
-    # bounded by max_copy_number so a runaway value can't create thousands of
-    # HMM states.
-    cov_max = int(np.nan_to_num(df["otr_gc_corr_norm_cov"].max()))
+    cov_max = int(np.nan_to_num(new_exp["otr_gc_corr_norm_cov"].max()))
     n_states = min(max(cov_max, 5), int(max_copy_number))
 
-    new_exp = df.copy()
+    rc_max = int(np.max(cor_rc))
 
-    rc_max = np.max(cor_rc)
-    
-    this_emission = setup_emission_matrix(n_states=n_states, mean=mean, variance=var, absmax=rc_max, error_rate=error_rate)
-    this_transition = setup_transition_matrix(n_states, remain_prob=(1 - changeprob))
-    
-    # outputs consequtive segments of the genome where copy number changes based on HMM : Break points
-    copy_numbers = HMM_copy_number(cor_rc, this_transition, this_emission, df["win_st"], df["win_end"], df['win_end'].max())
-    
-    brk_full_path = os.path.join(saveloc,'%s_break_pts.csv' % samplename)
-    cn_brk = pd.DataFrame(copy_numbers,columns=['Startpos','Endpos', 'State'])
-    cn_brk['Segment_Size'] = cn_brk['Endpos'] - cn_brk['Startpos']
-    cn_brk.drop(columns='Endpos', inplace = True)
-    cn_brk.to_csv(brk_full_path, index = False)
-    
+    this_emission = setup_emission_matrix(
+        n_states=n_states,
+        mean=mean,
+        variance=var,
+        absmax=rc_max,
+        error_rate=error_rate,
+    )
+    this_transition = setup_transition_matrix(
+        n_states,
+        remain_prob=(1 - changeprob),
+    )
+
+    copy_numbers = HMM_copy_number(
+        cor_rc,
+        this_transition,
+        this_emission,
+        new_exp["win_st"],
+        new_exp["win_end"],
+        new_exp["win_end"].max(),
+    )
+
+    brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
+    cn_brk = copy_numbers.loc[:, ["Startpos", "Endpos", "State"]].copy()
+    cn_brk.loc[:, "Segment_Size"] = cn_brk["Endpos"] - cn_brk["Startpos"]
+    cn_brk = cn_brk.drop(columns="Endpos")
+    cn_brk.to_csv(brk_full_path, index=False)
+
     CN_HMM = []
-    # output copy number prediction for each instance of genomic sliding window
+
     for cnrow in range(len(copy_numbers)):
+        state = int(copy_numbers["State"].iloc[cnrow])
+        hmmstart = int(copy_numbers["Startpos"].iloc[cnrow])
+        hmmend = int(copy_numbers["Endpos"].iloc[cnrow])
 
-        state = int(copy_numbers['State'][cnrow])
-
-        hmmstart = int(copy_numbers['Startpos'][cnrow])
-        hmmend = int(copy_numbers['Endpos'][cnrow])
-        
-        CN_HMM_row = []
-        # Index lists of windows between the breakpoints
-        idx_list = df[(hmmstart <= df["win_st"]) & (df["win_st"] <= hmmend)].index
-
+        idx_list = new_exp.loc[
+            (hmmstart <= new_exp["win_st"]) & (new_exp["win_st"] <= hmmend)
+        ].index
 
         if len(idx_list) == 0:
-            continue  # skip if no matching start position found
-    
-        #Iterate over the select windows and append the copy number (state) to the window
-        for idx in (idx_list):
+            continue
 
-            if ((df["win_st"].iloc[idx] >= hmmstart) and (df["win_end"].iloc[idx] <= hmmend)):
+        CN_HMM_row = []
+        for idx in idx_list:
+            row = new_exp.loc[idx]
+            if (row["win_st"] >= hmmstart) and (row["win_end"] <= hmmend):
                 CN_HMM_row.append(state)
-            else:
-                continue
-        
+
         CN_HMM.extend(CN_HMM_row)
-    
-    new_exp['prob_copy_number'] = CN_HMM
 
-    csv_full_path = os.path.join(saveloc,'%s_CNV.csv' % samplename)
+    new_exp.loc[:, "prob_copy_number"] = CN_HMM
 
-    new_exp.reset_index(drop = True)
-    new_exp.to_csv(csv_full_path, index = False)
+    csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
+
+    new_exp = new_exp.reset_index(drop=True)
+    new_exp.to_csv(csv_full_path, index=False)
 
     print(f"{samplename}: Copy number prediction complete. .csv files saved.")
-    
+
     return new_exp
