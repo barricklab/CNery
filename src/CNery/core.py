@@ -520,7 +520,7 @@ def otr_fit(df):
     print(f'xori_guess:{xori_guess} and xter_guess: {xter_guess}')
 
 
-    if (abs((xori_guess - xter_guess)) >= (len_init * 0.35)):
+    if (abs((xori_guess - xter_guess)) >= (len_init * 0.35) and abs((xori_guess - xter_guess)) <= (len_init * 0.65)):
 
         bias = True
         
