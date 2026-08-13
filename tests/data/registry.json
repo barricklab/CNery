@@ -12,5 +12,13 @@
     "Generate an entry with:  python tests/data/add_testdata.py <folder> --name <name>",
     "Fetch during tests with: pytest -m authentic"
   ],
-  "datasets": {}
+  "datasets": {
+    "ltee_ara_p1_50k_shift": {
+      "tag": "testdata-ltee_ara_p1_50k_shift-v1",
+      "file": "ltee_ara_p1_50k_shift.tar.gz",
+      "sha256": "b353c01858440a73f8c2867fab8336306a30f4cd8149e15249edc15d9e71353e",
+      "bytes": 24311738,
+      "description": "LTEE Ara+1 50k-generation coverage table against a circularly permuted REL606 reference; no BAM"
+    }
+  }
 }
