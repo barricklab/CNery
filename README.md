@@ -255,3 +255,43 @@ folders.
 ```
 
 ---
+
+## Testing
+
+The test suite has two tiers. Set up the development environment first:
+
+```bash
+conda env create -f dev-environment.yml --prefix=$PWD/env
+```
+
+**Default tier — synthetic, offline, seconds.** Runs against DataFrames constructed in
+`tests/conftest.py`, staged to match the pipeline's column contract at each stage. This is what a
+bare `pytest` runs, and it never touches the network:
+
+```bash
+conda run -p $PWD/env pytest
+```
+
+**Authentic tier — real data, opt-in.** Runs against real `breseq` coverage tables published as
+GitHub Release assets: genuine coordinate gaps, repeat regions, and copy-number variation that
+synthetic frames cannot reproduce. Deselected by default because the datasets are downloaded on
+first use (tens of megabytes), then cached:
+
+```bash
+conda run -p $PWD/env pytest -m authentic
+```
+
+Each dataset is pinned by sha256 in `tests/data/registry.json`, so an asset replaced in place fails
+the hash check rather than silently changing what the tests measure. Downloads are cached by
+[pooch](https://www.fatiando.org/pooch/); set `CNERY_TESTDATA_DIR` to relocate that cache.
+
+Datasets ship coverage tables and the reference FASTA but **no BAM** — `CNery` reads tables directly
+via `--coverage-dir` and never opens the BAM, which keeps them small.
+
+Note that an unavailable dataset causes these tests to *skip* rather than fail, so that offline work
+stays possible. Check that a run reports **passed** and not **skipped**.
+
+Adding tests, publishing datasets, and updating golden files are covered in
+[`DEVELOPER`](DEVELOPER).
+
+---
