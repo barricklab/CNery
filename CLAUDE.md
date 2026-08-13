@@ -17,6 +17,13 @@ conda env create -f dev-environment.yml --prefix=$PWD/env
 conda run -p $PWD/env <command>          # or: conda activate $PWD/env
 ```
 
+**breseq is deliberately not in this environment.** The pre-release builds CNery targets hard-depend
+on `cnery-prerelease`, so installing breseq would place a packaged copy of CNery in site-packages,
+shadowing the working tree anywhere `pythonpath=["src"]` does not reach. Tests therefore run against
+pre-generated coverage tables and never shell out to breseq. To produce such a table, see
+"Generating a coverage table" in `README.md` — it needs
+[pre-release breseq](https://github.com/barricklab/conda), not the bioconda release.
+
 **Tests.** Run from the repo root. `pyproject.toml` supplies `testpaths=["tests"]`,
 `pythonpath=["src"]`, and `addopts="-q --tb=short -m 'not authentic'"`, so tests import `CNery.core`
 with no install step and no `PYTHONPATH` fiddling.
@@ -32,9 +39,14 @@ conda run -p $PWD/env pytest -k gc_correction   # by name
 output folder containing `data/`, or point at one with `CNery -i <breseq_output_dir>`. Full flag list
 is in `README.md` and `CNery -h`.
 
-`breseq` must be on `PATH` — `bam2cov_to_df` shells out to `breseq bam2cov` (`core.py:90`) unless
-`<breseq_dir>/08_mutation_identification/<header>.coverage.tab` already exists, in which case that
-file is read directly and breseq is never invoked.
+`breseq` must be on `PATH` — `bam2cov_to_df` shells out to `breseq bam2cov` — unless coverage tables
+are supplied, in which case breseq is never invoked and no BAM is needed. Two sources, explicit first:
+
+- `--coverage-dir <dir>` → `<dir>/<seq_id>.coverage.**tsv**`. Required for every sequence in the
+  FASTA; missing ones raise before any processing. `coverage_table_path` in `core.py` owns this name.
+- otherwise `<breseq_dir>/08_mutation_identification/<seq_id>.coverage.**tab**` if present. Note the
+  different suffix: these are breseq's own files, in a **different schema** (position last, no
+  `ref_base`), and keep their historical name.
 
 No linter, formatter, or CI is configured.
 
@@ -128,8 +140,11 @@ Because the writers assume their output directories exist, any test that reaches
 `_ensure_dirs` in `tests/test_integration.py` and `tests/test_otr_correction.py`.
 
 For anything touching the breseq subprocess, follow `tests/test_bam2cov_io.py`: patch
-`subprocess.run` with a side effect that writes a fake `.tab` file, including the four trailing `#`
-lines that `bam2cov_to_df` drops via `skipfooter=4`.
+`subprocess.run` with a side effect that writes a fake `.tab` file. Coverage tables are read by
+`_read_coverage_tab` (`core.py`), which strips the trailing summary block by its `#` prefix — the
+block is **variable-length** (four lines by default, +1 under `--show-average`, +3 per read group,
+and none at all in breseq's own `08_mutation_identification/*.coverage.tab`), so never assume a fixed
+count. `TestFooterHandling` in that file covers each of those shapes.
 
 ## Authentic datasets
 
