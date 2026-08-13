@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "Authentic test datasets, published as GitHub Release assets on barricklab/CNery.",
+    "",
+    "One release per dataset version, tagged testdata-<name>-v<N>, carrying a single .tar.gz.",
+    "Adding or revising a dataset touches only its own entry here -- no other dataset is",
+    "regenerated or re-uploaded.",
+    "",
+    "The sha256 -- not the tag -- is what makes a dataset immutable. If an asset is replaced",
+    "in place, the hash check fails loudly rather than silently changing what the tests run on.",
+    "",
+    "Generate an entry with:  python tests/data/add_testdata.py <folder> --name <name>",
+    "Fetch during tests with: pytest -m authentic"
+  ],
+  "datasets": {}
+}

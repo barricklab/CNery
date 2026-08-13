@@ -2,6 +2,33 @@ import pytest
 import numpy as np
 import pandas as pd
 
+from data._fetch import DatasetUnavailable, fetch_dataset, load_registry
+
+
+def _dataset_or_skip(name):
+    """Fetch an authentic dataset, or skip with the reason attached.
+
+    The reason names the dataset, URL, and underlying error so that a run reporting
+    "skipped" is visibly different from one reporting "passed" -- a silent skip would
+    let real-data coverage lapse without anyone noticing.
+    """
+    try:
+        return fetch_dataset(name)
+    except DatasetUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.fixture(scope="session")
+def authentic_registry():
+    """The declared datasets, without fetching anything."""
+    return load_registry()
+
+
+@pytest.fixture(scope="session")
+def lambda_dataset():
+    """breseq lambda output: multiple references, small enough for end-to-end runs."""
+    return _dataset_or_skip("lambda")
+
 
 def _make_windowed_df(n=80, del_start=None, del_end=None,
                       amp_start=None, amp_end=None, median_cov=100.0):
