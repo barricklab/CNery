@@ -1,8 +1,40 @@
+import os
+import shutil
+
 import pytest
 import numpy as np
 import pandas as pd
 
 from data._fetch import DatasetUnavailable, fetch_dataset, load_registry
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--regenerate-goldens",
+        action="store_true",
+        default=False,
+        help=(
+            "Overwrite golden files under tests/data/expected/ with the current output "
+            "instead of comparing against them. Review the resulting diff before committing."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def regenerate_goldens(request):
+    return request.config.getoption("--regenerate-goldens")
+
+
+def golden_compare(produced_path, golden_path, regenerate, compare):
+    """Compare `produced_path` against `golden_path`, or refresh the golden.
+
+    When regenerating, the test is skipped rather than passed: a run that rewrote its own
+    expectations has verified nothing, and reporting it as a pass would hide that.
+    """
+    if regenerate:
+        shutil.copyfile(produced_path, golden_path)
+        pytest.skip(f"regenerated golden {os.path.basename(golden_path)} -- review the diff")
+    compare(produced_path, golden_path)
 
 
 def _dataset_or_skip(name):
