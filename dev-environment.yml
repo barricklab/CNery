@@ -32,8 +32,13 @@ dependencies:
 #     Datasets are pinned by sha256 in tests/data/registry.json, so pooch verifies rather than
 #     trusts what it fetches. See CLAUDE.md for the `pytest -m authentic` workflow.
   - pooch
-# Run as a subprocess by bam2cov_to_df (core.py:90) to generate per-reference coverage tables, and
-# needed to produce authentic coverage inputs for tests.
-#  => Unpinned: CNery shells out to `breseq bam2cov` through a stable CLI surface, and the pinning
-#     that matters for reproducible copy-number calls runs the other way (breseq pins CNery).
-  - breseq
+# breseq is deliberately NOT a dependency of this environment.
+#
+#  => The pre-release builds that CNery targets hard-depend on cnery-prerelease, so installing
+#     breseq here would drop a packaged copy of CNery into our own dev environment's site-packages
+#     -- a circular dependency that shadows the working tree in any context pytest's
+#     pythonpath=["src"] does not cover. That is fragile and confusing to maintain.
+#
+#  => Instead, tests run against coverage tables checked in or fetched as fixtures, generated ahead
+#     of time by a proper breseq install. See the "Generating a coverage table" section of
+#     README.md for the command. Nothing in the test suite shells out to breseq.
