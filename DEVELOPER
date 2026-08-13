@@ -1,0 +1,157 @@
+=== Setting Up a Development Environment ===
+
+Use conda with the included dev-environment.yml file. It builds into an untracked env/
+directory inside the repository, which .gitignore already covers.
+
+$ conda env create -f dev-environment.yml --prefix=$PWD/env
+$ conda activate $PWD/env
+
+Or run individual commands without activating:
+
+$ conda run -p $PWD/env pytest
+
+This environment deliberately does NOT include breseq. The pre-release breseq builds that
+CNery targets declare cnery-prerelease as a hard dependency, so installing breseq here would
+place a packaged copy of CNery into the environment's own site-packages, shadowing your
+working tree anywhere pyproject.toml's pythonpath=["src"] does not reach. Nothing in the test
+suite shells out to breseq; tests read coverage tables that were generated ahead of time.
+
+If you do need breseq for generating new test data, install it separately. See the
+"Generating a coverage table" section of README.md.
+
+=== Running Tests ===
+
+Run pytest from the repository root. pyproject.toml supplies testpaths, pythonpath=["src"],
+and the default marker filter, so no install step or PYTHONPATH fiddling is needed.
+
+Run the default suite. Synthetic data only, never touches the network, a few seconds:
+$ conda run -p $PWD/env pytest
+
+Run one file, one test, or by name:
+$ conda run -p $PWD/env pytest tests/test_hmm.py
+$ conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
+$ conda run -p $PWD/env pytest -k gc_correction
+
+Run the authentic-data tests. These download real datasets from GitHub Releases on first use
+(tens of megabytes), so they are deselected by default:
+$ conda run -p $PWD/env pytest -m authentic
+
+Run everything:
+$ conda run -p $PWD/env pytest -m ""
+
+=== The Two Test Tiers ===
+
+The suite is split into two tiers, and which one a test belongs in is a deliberate choice.
+
+DEFAULT TIER. Synthetic DataFrames built in tests/conftest.py. Fast, hermetic, no network.
+This is what runs on a bare `pytest`, and it must stay that way: a plain test run should never
+download anything or depend on an external service. Most tests belong here.
+
+AUTHENTIC TIER. Real breseq coverage tables fetched from GitHub Releases, marked with
+@pytest.mark.authentic and deselected via addopts in pyproject.toml. Use this tier only when
+synthetic data genuinely cannot exercise what you are testing -- real coordinate gaps, real
+repeat regions, real replication bias, the actual on-disk file schema.
+
+IMPORTANT: because the authentic tier is opt-in, it is easy for it to silently stop running.
+Run `pytest -m authentic` before pushing anything that changes pipeline numerics, and check
+the result says "passed" and not "skipped". An unfetchable dataset skips rather than fails, so
+that offline work stays possible, which means a skipped run can look like success at a glance.
+
+=== Writing Tests in the Default Tier ===
+
+Reuse the fixtures in tests/conftest.py rather than hand-rolling DataFrames. They are staged
+to match the pipeline's column contract at each stage, so a change to that contract surfaces
+in one place instead of in every test:
+
+  windowed_flat, windowed_with_deletion, windowed_with_amplification
+                          -- post-preprocess frames (read_count_cov, norm_raw_cov, gc_percent)
+  gc_corrected_flat       -- adds gc_corr_norm_cov, gc_corr_fact
+  otr_corrected_flat      -- adds otr_gc_corr_norm_cov, otr_gc_corr_fact
+  single_fasta            -- a one-record FASTA on disk
+
+The writer functions assume their output subdirectories already exist. Any test reaching
+otr_correction, run_HMM, or a plot function must create CNV_plt/, CNV_csv/, GC_bias/ and
+OTR_corr/ under tmp_path first -- see _ensure_dirs in tests/test_integration.py.
+
+For anything invoking breseq, patch subprocess.run with a side effect that writes a fake
+table, as tests/test_bam2cov_io.py does. Do not assume a fixed footer length: breseq writes
+four commented summary lines by default, one more under --show-average, three per read group,
+and none at all in its own 08_mutation_identification output. TestFooterHandling covers each
+of those shapes.
+
+Make assertions match the test name. A test called test_deletion_yields_cn0 that only asserts
+the result is not None passes forever and protects nothing.
+
+=== Adding an Authentic Dataset ===
+
+Datasets are published as GitHub Release assets, one release per dataset version, tagged
+testdata-<name>-v<N> and carrying a single <name>.tar.gz. Adding or revising one touches only
+its own entry in tests/data/registry.json; no other dataset is regenerated or re-uploaded.
+
+Stage a folder containing what CNery reads -- the reference FASTA and one coverage table per
+sequence, named <seq_id>.coverage.tsv. Do NOT include the BAM: CNery reads coverage tables
+directly through --coverage-dir and never opens it, so shipping it would multiply the download
+size for nothing.
+
+Build and inspect without uploading:
+$ python tests/data/add_testdata.py <folder> --name <name> --description "..."
+
+The first run drops a dataset.json provenance stub into the folder. FILL IT IN before
+publishing: breseq version and command line, source reads, reference accession, what the
+dataset exercises, and any known limitations. Authentic data without provenance stops being
+reproducible the moment whoever generated it moves on, and the release tag is immutable, so
+correcting provenance afterwards means cutting a new version.
+
+Publish, then paste the printed entry into tests/data/registry.json:
+$ python tests/data/add_testdata.py <folder> --name <name> --publish
+
+--version defaults to one past the highest already published, checking both the GitHub
+releases and the registry, which can disagree. Reusing a published version is refused, and
+that check runs before the archive is built so a clash surfaces on a dry run.
+
+Archives are built reproducibly (gzip and tar mtimes zeroed), so rebuilding the same folder
+gives the same sha256 and a published asset can be independently verified. The sha256 in the
+registry -- not the tag -- is what pins dataset identity: an asset replaced in place fails the
+hash check loudly rather than silently changing what the tests measure. Never overwrite a
+published asset; publish a new version instead.
+
+Downloads are cached in pooch's cache directory. Set CNERY_TESTDATA_DIR to relocate it, for
+example to share one cache between checkouts or to keep large tables off a small disk.
+
+=== Golden Files ===
+
+Expected outputs live in tests/data/expected/ and are compared exactly. Heavy inputs live in
+Releases; expected outputs stay in the repository, because a behavior change should show up as
+a reviewable diff rather than being hidden inside a release asset.
+
+Keep goldens small and structural. The copy-number golden is the ~25-row break-points segment
+table, not the thousands of per-window rows: it is the same information for review purposes
+and it is actually readable in a diff.
+
+Goldens are only meaningful at fixed window parameters. The tests pin -w and -s; changing them
+invalidates the goldens.
+
+After an intended behavior change, refresh and review:
+$ conda run -p $PWD/env pytest -m authentic --regenerate-goldens
+$ git diff tests/data/expected/
+
+Regenerated tests report as SKIPPED, not passed -- a run that rewrote its own expectations has
+verified nothing. Always read the diff before committing it. If a golden changed and you
+cannot explain why, that is a bug, not a golden that needs updating.
+
+Avoid float-exact assertions on corrected coverage. LOWESS and scipy.optimize.minimize drift
+across library versions; prefer structural facts (segment boundaries, copy-number states,
+origin/terminus windows) or numpy.testing.assert_allclose with an explicit tolerance.
+
+=== Recording Known-Bad Behavior ===
+
+Some tests deliberately record what the code currently does rather than what it should do, as
+a tripwire while an area is under development. TestOriginTerminus in
+tests/test_authentic_ltee.py is the current example: the LTEE dataset's rotated reference was
+meant to exercise the otr_fit branch where the origin index is below the terminus index, but
+does not reach it, because the median-filter seed places the two about 6% of the genome apart,
+below the 35% floor in otr_fit.
+
+When you do this, say so explicitly in the test docstring, and write the assertions so they
+fail if the behavior changes in either direction. A test that quietly encodes a bug as correct
+is worse than no test.

@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Authentic test datasets, published as GitHub Release assets on barricklab/CNery.",
+    "",
+    "One release per dataset version, tagged testdata-<name>-v<N>, carrying a single .tar.gz.",
+    "Adding or revising a dataset touches only its own entry here -- no other dataset is",
+    "regenerated or re-uploaded.",
+    "",
+    "The sha256 -- not the tag -- is what makes a dataset immutable. If an asset is replaced",
+    "in place, the hash check fails loudly rather than silently changing what the tests run on.",
+    "",
+    "Generate an entry with:  python tests/data/add_testdata.py <folder> --name <name>",
+    "Fetch during tests with: pytest -m authentic"
+  ],
+  "datasets": {
+    "ltee_ara_p1_50k_shift": {
+      "tag": "testdata-ltee_ara_p1_50k_shift-v1",
+      "file": "ltee_ara_p1_50k_shift.tar.gz",
+      "sha256": "b353c01858440a73f8c2867fab8336306a30f4cd8149e15249edc15d9e71353e",
+      "bytes": 24311738,
+      "description": "LTEE Ara+1 50k-generation coverage table against a circularly permuted REL606 reference; no BAM"
+    }
+  }
+}

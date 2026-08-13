@@ -84,6 +84,122 @@ When OTR correction is applied, the origin and terminus of replication are autom
 
 ---
 
+## Generating a coverage table
+
+`CNery` normally calls `breseq bam2cov` itself. You can also generate the per-reference coverage
+tables ahead of time and point `CNery` at them with `--coverage-dir`, which skips `breseq` entirely
+and needs **no BAM** — only the reference FASTA. Useful for archiving an analysis input, sharing a
+reproducible test case, or running `CNery` where `breseq` is not installed.
+
+```bash
+CNery --coverage-dir coverage -ref reference.fasta -o CNV_out
+```
+
+`CNery` looks for one table per reference sequence, named `<seq_id>.coverage.tsv`, where `<seq_id>`
+is the FASTA header up to its first space. A table must exist for every sequence in the FASTA; a
+missing one is reported by name before any work starts.
+
+```
+coverage/
+├── REL606.coverage.tsv
+└── pPlasmid.coverage.tsv
+```
+
+**Requires [pre-release breseq](https://github.com/barricklab/conda)**, the Barrick lab channel of
+development builds auto-built from `barricklab/breseq` master. Released versions on bioconda do not
+include the current fixes to how coverage tables are written.
+
+```bash
+conda install -c https://barricklab.github.io/conda/ -c conda-forge -c bioconda breseq-prerelease
+```
+
+Omit `--region` and `breseq` writes one table per reference sequence automatically — no need to look
+up sequence IDs or lengths. `--output` is then a directory:
+
+```bash
+mkdir -p coverage
+breseq bam2cov \
+  --format TSV \
+  --resolution 0 \
+  --output coverage \
+  -b data/reference.bam \
+  -f data/reference.fasta
+```
+
+To generate a single table instead, name the region using the sequence ID exactly as it appears in
+the FASTA, and give `--output` the name `CNery` expects:
+
+```bash
+breseq bam2cov \
+  --format TSV \
+  --region REL606:1-4629812 \
+  --resolution 0 \
+  --output coverage/REL606.coverage.tsv \
+  -b data/reference.bam \
+  -f data/reference.fasta
+```
+
+Three options matter:
+
+- **`--resolution 0`** outputs every position. The default is 600, which samples only 600 points
+  across the whole region — far too sparse for windowed coverage, and it fails silently by producing
+  a well-formed but nearly empty table.
+- **`--format TSV`** produces a tab-separated table instead of a plot. (`-t` is accepted as a
+  shorthand for the same thing.)
+- **`--per-read-group`** *(optional)* repeats every coverage column once per read group (`@RG`) in
+  the BAM, prefixed `RG-<n>_` where `<n>` is the read group's index in the BAM header. Requires a
+  table format; it is rejected with `--format PNG`. A BAM with no read groups yields a single `RG-0`
+  set.
+
+```bash
+breseq bam2cov \
+  --format TSV \
+  --per-read-group \
+  --resolution 0 \
+  --output coverage \
+  -b data/reference.bam \
+  -f data/reference.fasta
+```
+
+`CNery` reads such a table without any change. The aggregate columns keep their names and positions
+and the per-read-group repeats are **appended**, so the columns `CNery` needs are still where it
+expects them; it selects by name and ignores the rest. The per-read-group summary lines added to the
+footer are stripped along with the others by their `#` prefix. Nothing in `CNery` consumes the
+per-read-group columns today — they pass through — so the option is safe to enable now if you want
+per-library coverage available in the same file for other tools.
+
+The output carries a header row, one row per reference position, and a trailing `#`-commented summary
+block:
+
+```
+position	ref_base	unique_top_cov	unique_bot_cov	redundant_top_cov	redundant_bot_cov	...
+1	G	14	18	0	0	...
+2	G	14	18	0	0	...
+...
+#	region_unique_average_cov	56.7267
+#	region_repeat_average_cov	0
+#	region_average_cov	56.7267
+#	number_of_positions	4629812
+```
+
+That summary block is variable in length — `--show-average` adds a line, and `--per-read-group` adds
+three per group (`#	RG-0_region_unique_average_cov	…`) — so anything parsing these tables should
+skip lines by their `#` prefix rather than dropping a fixed number from the end.
+
+For the same reason, do not assume a fixed column count: `position` must be the first column and the
+named coverage columns must be present, but extra columns to the right are expected and should be
+ignored rather than treated as an error.
+
+If you do need the sequence IDs and lengths for a `--region` argument, read them from the FASTA
+headers or the `.fai` index:
+
+```bash
+grep '^>' data/reference.fasta
+cut -f1,2 data/reference.fasta.fai
+```
+
+---
+
 ## Outputs
 
 Given an output folder `CNV_out/`, `CNery` writes:
@@ -137,5 +253,45 @@ options:
 Run this script in the breseq output folder that contains 'data' and 'output'
 folders.
 ```
+
+---
+
+## Testing
+
+The test suite has two tiers. Set up the development environment first:
+
+```bash
+conda env create -f dev-environment.yml --prefix=$PWD/env
+```
+
+**Default tier — synthetic, offline, seconds.** Runs against DataFrames constructed in
+`tests/conftest.py`, staged to match the pipeline's column contract at each stage. This is what a
+bare `pytest` runs, and it never touches the network:
+
+```bash
+conda run -p $PWD/env pytest
+```
+
+**Authentic tier — real data, opt-in.** Runs against real `breseq` coverage tables published as
+GitHub Release assets: genuine coordinate gaps, repeat regions, and copy-number variation that
+synthetic frames cannot reproduce. Deselected by default because the datasets are downloaded on
+first use (tens of megabytes), then cached:
+
+```bash
+conda run -p $PWD/env pytest -m authentic
+```
+
+Each dataset is pinned by sha256 in `tests/data/registry.json`, so an asset replaced in place fails
+the hash check rather than silently changing what the tests measure. Downloads are cached by
+[pooch](https://www.fatiando.org/pooch/); set `CNERY_TESTDATA_DIR` to relocate that cache.
+
+Datasets ship coverage tables and the reference FASTA but **no BAM** — `CNery` reads tables directly
+via `--coverage-dir` and never opens the BAM, which keeps them small.
+
+Note that an unavailable dataset causes these tests to *skip* rather than fail, so that offline work
+stays possible. Check that a run reports **passed** and not **skipped**.
+
+Adding tests, publishing datasets, and updating golden files are covered in
+[`DEVELOPER`](DEVELOPER).
 
 ---

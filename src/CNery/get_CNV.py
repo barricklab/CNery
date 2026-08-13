@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
+import os
 from pathlib import Path
 
 from .core import (
@@ -52,6 +53,20 @@ def main():
         help=(
             "select the reference file used for breseq. "
             "Defaults to data/reference.fasta"
+        ),
+    )
+
+    parser.add_argument(
+        "--coverage-dir",
+        action="store",
+        dest="coverage_dir",
+        required=False,
+        type=str,
+        help=(
+            "folder of pre-generated per-reference coverage tables, named "
+            "'<seq_id>.coverage.tsv'. When given, breseq is never run and no BAM is "
+            "needed -- only the reference FASTA. A table must exist for every sequence "
+            "in the FASTA."
         ),
     )
 
@@ -148,7 +163,22 @@ def main():
         in_dir = "."
 
     bam_in = in_dir + "/data/reference.bam"
-    ref_in = in_dir + "/data/reference.fasta"
+    # Honour -ref when given. With --coverage-dir there may be no breseq run to sit inside,
+    # so the reference has to be nameable from anywhere.
+    ref_in = options.ref if options.ref is not None else in_dir + "/data/reference.fasta"
+
+    if not os.path.isfile(ref_in):
+        return (
+            f"Reference FASTA not found: {ref_in}. "
+            f"Pass -ref, or run inside a breseq output folder containing data/reference.fasta."
+        )
+
+    # The BAM is only read when coverage tables have to be generated.
+    if options.coverage_dir is None and not os.path.isfile(bam_in):
+        return (
+            f"BAM not found: {bam_in}. "
+            f"Pass --coverage-dir to use pre-generated coverage tables instead."
+        )
 
     if options.o is not None:
         out_dir = options.o
@@ -195,6 +225,7 @@ def main():
         step=options.s,
         frag=options.f,
         breseq_dir=in_dir,
+        coverage_dir=options.coverage_dir,
     )
     # process_multi_genome already:
     #   - runs bam2cov per genome

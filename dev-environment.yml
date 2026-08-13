@@ -1,0 +1,44 @@
+name: CNery-dev
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+# Python interpreter.
+#  => pyproject.toml allows >=3.9. Pinned to 3.11 here so the solve is fast and reproducible, and
+#     because that is the version the dependency set below is known to resolve cleanly against.
+  - python=3.11
+# CNery runtime dependencies. Mirrors requirements.txt, with two deliberate differences noted below.
+#  => pandas is capped below 3. Commit 473446b already removed the DataFrame._append call that
+#     pandas 3 dropped, but core.py still does positional Series lookups (core.py:453, core.py:835:
+#     `df["genome_id"][0]`) whose meaning pandas 3 changes. breseq's own dev-environment.yml applies
+#     the same cap to the CNery build it packages, for the same reason.
+  - pandas>=2.2.0,<3
+  - numpy>=1.26.0
+  - scipy>=1.12.0
+  - statsmodels>=0.14.0
+  - matplotlib>=3.8.0
+  - seaborn>=0.13.0
+  - setuptools>=68.2.0
+#  => requirements.txt also lists `pathlib>=1.0.0`. That is deliberately NOT reproduced here: it is a
+#     PyPI backport of a module that has been in the standard library since Python 3.4, and
+#     installing it can shadow the real one.
+# Test runner.
+#  => Not a runtime dependency, which is why it is absent from requirements.txt and environment.yml.
+#     The tests/ suite cannot run without it, so it belongs in the contributor environment.
+  - pytest
+# Download + cache manager for the authentic test datasets published as GitHub Release assets.
+#  => Test-only, so deliberately NOT in requirements.txt: CNery itself never downloads anything.
+#     Datasets are pinned by sha256 in tests/data/registry.json, so pooch verifies rather than
+#     trusts what it fetches. See CLAUDE.md for the `pytest -m authentic` workflow.
+  - pooch
+# breseq is deliberately NOT a dependency of this environment.
+#
+#  => The pre-release builds that CNery targets hard-depend on cnery-prerelease, so installing
+#     breseq here would drop a packaged copy of CNery into our own dev environment's site-packages
+#     -- a circular dependency that shadows the working tree in any context pytest's
+#     pythonpath=["src"] does not cover. That is fragile and confusing to maintain.
+#
+#  => Instead, tests run against coverage tables checked in or fetched as fixtures, generated ahead
+#     of time by a proper breseq install. See the "Generating a coverage table" section of
+#     README.md for the command. Nothing in the test suite shells out to breseq.
