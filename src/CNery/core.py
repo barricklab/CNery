@@ -47,6 +47,27 @@ def parse_fasta_records(fastafile):
     return records
 
 
+def _read_coverage_tab(path):
+    """Read a breseq coverage table, dropping its commented summary block.
+
+    The trailing '#' block is variable-length: breseq writes four lines by default, one more
+    under --show-average, and three per read group. Its own
+    08_mutation_identification/*.coverage.tab files carry none at all. Matching on the comment
+    prefix therefore handles every case, whereas the fixed skipfooter=4 this replaces silently
+    deleted four real data rows from any footerless input.
+
+    Dropping skipfooter also lets pandas use the C engine -- it was the only reason the much
+    slower python engine was required here.
+    """
+    return pd.read_csv(
+        path,
+        sep="\t",
+        header=0,
+        index_col=0,
+        comment="#",
+    )
+
+
 def bam2cov_to_df(
     bamfile,               # path to BAM
     fastafile,             # path to FASTA
@@ -57,15 +78,7 @@ def bam2cov_to_df(
 ):
     if preexisting_tab is not None and os.path.isfile(preexisting_tab):
         print(f"Using pre-existing coverage file: {preexisting_tab}")
-        return pd.read_csv(
-            preexisting_tab,
-            sep="\t",
-            engine='python',
-            header=0,
-            index_col=0,
-            skipfooter=4,
-            comment="#",
-        )
+        return _read_coverage_tab(preexisting_tab)
 
     # The tab output file name (may be output_prefix or output_prefix.tab)
     tab_file = output_prefix
@@ -119,15 +132,7 @@ def bam2cov_to_df(
 
     # Load coverage as DataFrame
     try:
-        df = pd.read_csv(
-            tab_file,
-            sep="\t",
-            engine='python',
-            header=0,
-            index_col=0,
-            skipfooter=4,
-            comment="#"
-        )
+        df = _read_coverage_tab(tab_file)
     finally:
         # Always remove the temp file, even if there was an error
         if os.path.exists(tab_file):
