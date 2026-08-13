@@ -26,6 +26,7 @@ provenance stops being reproducible as soon as whoever generated it moves on.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import re
@@ -146,11 +147,33 @@ def ensure_manifest(folder, name):
     return True
 
 
+def _reproducible(info):
+    """Normalise tar member metadata so identical content hashes identically.
+
+    File mtimes, ownership and permissions vary with how the folder was staged and say
+    nothing about the data, so zero them out.
+    """
+    info.mtime = 0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mode = 0o755 if info.isdir() else 0o644
+    return info
+
+
 def build_archive(folder, name, out_dir):
-    """Tar the folder under a top-level directory named for the dataset."""
+    """Tar the folder under a top-level directory named for the dataset.
+
+    Byte-for-byte reproducible: gzip stamps an mtime into its header and tar records one per
+    member, so the default settings give a different sha256 every run for identical content.
+    That would make the printed hash unverifiable -- nobody could rebuild the archive and
+    confirm it matches what was published. mtime=0 on both layers fixes that. (tarfile.add
+    already walks directories in sorted order, so member ordering is stable.)
+    """
     archive = out_dir / f"{name}.tar.gz"
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(folder, arcname=name)
+    with open(archive, "wb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                tar.add(folder, arcname=name, filter=_reproducible)
     return archive
 
 
