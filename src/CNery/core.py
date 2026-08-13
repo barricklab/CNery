@@ -21,8 +21,13 @@ from itertools import cycle, islice
 
 def parse_fasta_records(fastafile):
     """
-    Parse a (multi-)FASTA file and return a list of (header, seq_len)
+    Parse a (multi-)FASTA file and return a list of (seq_id, seq_len)
     for each reference sequence.
+
+    The sequence ID is the first whitespace-delimited token of the header, matching how
+    breseq and samtools identify sequences. Everything after it is a free-text description.
+    Keeping the whole header would break two things: the "<id>:1-<len>" region handed to
+    breseq bam2cov, and the "<id>.coverage.tsv" file names looked up by --coverage-dir.
     """
     records = []
     header = None
@@ -35,7 +40,7 @@ def parse_fasta_records(fastafile):
                 # Finish previous record
                 if header is not None:
                     records.append((header, seq_len))
-                header = line[1:]  # drop ">"
+                header = line[1:].split()[0] if line[1:].split() else ""
                 seq_len = 0
             else:
                 seq_len += len(line)
@@ -45,6 +50,23 @@ def parse_fasta_records(fastafile):
         records.append((header, seq_len))
 
     return records
+
+
+#: Suffix of the per-reference coverage tables that --coverage-dir looks for. Distinct from the
+#: ".coverage.tab" files breseq writes into 08_mutation_identification, which are a different
+#: format (position last, no ref_base) and keep their historical name.
+COVERAGE_TABLE_SUFFIX = ".coverage.tsv"
+
+
+def coverage_table_path(coverage_dir, seq_id):
+    """Path of the coverage table for `seq_id` inside `coverage_dir`.
+
+    Named for the sequence ID alone -- no coordinates. breseq's default no-region output
+    names files after the full region ("REL606:1-4629812.tsv"), which is not what CNery
+    looks for and, more importantly, contains a colon: illegal in filenames on Windows and
+    displayed as "/" by the macOS Finder.
+    """
+    return os.path.join(coverage_dir, f"{seq_id}{COVERAGE_TABLE_SUFFIX}")
 
 
 def _read_coverage_tab(path):
@@ -390,23 +412,45 @@ def process_multi_genome(
     frag=350,
     extra_args=None,
     breseq_dir=None,
+    coverage_dir=None,
 ):
     """
-    Run bam2cov + preprocess per genome (FASTA header),
+    Run bam2cov + preprocess per genome (FASTA sequence ID),
     pool for GC correction, plot pooled bias,
-    then return per-genome GC-corrected DataFrames keyed by FASTA header.
+    then return per-genome GC-corrected DataFrames keyed by sequence ID.
+
+    If coverage_dir is given, coverage is read from "<coverage_dir>/<seq_id>.coverage.tsv"
+    for every reference and breseq is never invoked -- so no BAM is needed. A table must
+    exist for every sequence in the FASTA; missing ones are reported up front rather than
+    silently falling back to bam2cov, which would fail confusingly on the absent BAM.
     """
 
     records = parse_fasta_records(fastafile)
+
+    if coverage_dir is not None:
+        missing = [
+            seq_id for seq_id, _ in records
+            if not os.path.isfile(coverage_table_path(coverage_dir, seq_id))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"--coverage-dir {coverage_dir!r} has no coverage table for "
+                f"{len(missing)} of {len(records)} reference sequence(s): "
+                + ", ".join(f"{m}{COVERAGE_TABLE_SUFFIX}" for m in missing)
+                + ". Every sequence in the FASTA needs one."
+            )
 
     preprocessed = {}
     for (header, seq_len) in records:
         region = f"{header}:1-{seq_len}"
         tab_prefix = f"{output_prefix}_{header}"
 
-        # Check for pre-existing coverage tab from breseq 08_mutation_identification
+        # An explicit --coverage-dir wins; otherwise fall back to probing a breseq run's
+        # 08_mutation_identification output.
         preexisting_tab = None
-        if breseq_dir is not None:
+        if coverage_dir is not None:
+            preexisting_tab = coverage_table_path(coverage_dir, header)
+        elif breseq_dir is not None:
             candidate = os.path.join(
                 breseq_dir, "08_mutation_identification",
                 f"{header}.coverage.tab"
