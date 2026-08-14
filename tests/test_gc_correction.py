@@ -1,7 +1,17 @@
 import pytest
 import numpy as np
 import pandas as pd
-from CNery.core import gc_correction
+from CNery.core import mask_coverage_windows, fit_gc_bias, apply_gc_correction
+
+
+def gc_correction(df, zero_frac=0.1):
+    """gc_correction(df, zero_frac=...) was split into mask -> fit -> apply.
+    Kept as a thin wrapper here so every test below is unchanged except for
+    the import line, since the combined behavior (and output columns
+    gc_corr_norm_cov/gc_corr_fact) is identical to the original function."""
+    df_masked = mask_coverage_windows(df, zero_frac=zero_frac)
+    gc_fit = fit_gc_bias(df_masked)
+    return apply_gc_correction(df_masked, gc_fit)
 
 
 def _gc_df(read_counts, gc_values):
@@ -13,7 +23,6 @@ def _gc_df(read_counts, gc_values):
         "gc_percent": np.asarray(gc_values, dtype=float),
     })
 
-
 def test_true_zero_windows_stay_zero():
     rc = [100, 90, 0, 0, 0, 95, 105]
     gc = [0.50, 0.52, 0.49, 0.51, 0.48, 0.50, 0.53]
@@ -22,11 +31,9 @@ def test_true_zero_windows_stay_zero():
     assert out.iloc[3]["gc_corr_norm_cov"] == 0.0
     assert out.iloc[4]["gc_corr_norm_cov"] == 0.0
 
-
 def test_no_inf_in_output(windowed_flat):
     out = gc_correction(windowed_flat)
     assert np.isfinite(out["gc_corr_norm_cov"].values).all()
-
 
 def test_no_negative_values():
     rng = np.random.default_rng(1)
@@ -34,7 +41,6 @@ def test_no_negative_values():
     gc = np.linspace(0.35, 0.65, 60)
     out = gc_correction(_gc_df(rc, gc))
     assert (out["gc_corr_norm_cov"] >= 0).all()
-
 
 def test_deletion_block_stays_zero(windowed_with_deletion):
     out = gc_correction(windowed_with_deletion, zero_frac=0.05)

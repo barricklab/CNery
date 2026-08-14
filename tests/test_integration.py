@@ -2,13 +2,18 @@ import os
 import pytest
 import numpy as np
 import pandas as pd
-from CNery.core import gc_correction, otr_correction, run_HMM
-
+from CNery.core import (
+    mask_coverage_windows,
+    fit_gc_bias,
+    apply_gc_correction,
+    fit_otr_bias,
+    apply_otr_correction,
+    run_HMM,
+)
 
 def _ensure_dirs(base):
     for sub in ["CNV_plt", "CNV_csv", "OTR_corr"]:
         os.makedirs(os.path.join(base, sub), exist_ok=True)
-
 
 def _make_df(n=80, del_windows=None, amp_windows=None, median_cov=100.0):
     rng = np.random.default_rng(42)
@@ -31,12 +36,16 @@ def _make_df(n=80, del_windows=None, amp_windows=None, median_cov=100.0):
         "window_num": np.arange(n),
     })
 
-
 def _run_pipeline(df, out_dir):
-    df_gc = gc_correction(df, zero_frac=0.05)
-    df_otr, _, _ = otr_correction(df_gc, out_dir)
+    """gc_correction() -> otr_correction() -> run_HMM() was split into the
+    mask -> fit -> apply stages for both GC and OTR bias correction. This
+    reproduces the same end-to-end call sequence with the new API."""
+    df_masked = mask_coverage_windows(df, zero_frac=0.05)
+    gc_fit = fit_gc_bias(df_masked)
+    df_gc = apply_gc_correction(df_masked, gc_fit)
+    otr_fit_result = fit_otr_bias(df_gc, out_dir)
+    df_otr, _, _ = apply_otr_correction(otr_fit_result, out_dir)
     return run_HMM(df_otr, out_dir)
-
 
 def test_deletion_produces_cn0_call(tmp_path):
     out = str(tmp_path / "int_del")
@@ -44,7 +53,6 @@ def test_deletion_produces_cn0_call(tmp_path):
     result = _run_pipeline(_make_df(del_windows=range(30, 50)), out)
     assert "prob_copy_number" in result.columns
     assert (result["prob_copy_number"] == 0).any()
-
 
 def test_otr_bias_does_not_prevent_cn1_calls(tmp_path):
     out = str(tmp_path / "int_flat")
@@ -54,7 +62,6 @@ def test_otr_bias_does_not_prevent_cn1_calls(tmp_path):
     frac_cn1 = (result["prob_copy_number"] == 1).mean()
     assert frac_cn1 > 0.5
 
-
 def test_amplification_produces_high_cn(tmp_path):
     out = str(tmp_path / "int_amp")
     _ensure_dirs(out)
@@ -63,14 +70,12 @@ def test_amplification_produces_high_cn(tmp_path):
     assert "prob_copy_number" in result.columns
     assert result["prob_copy_number"].max() >= 1
 
-
 def test_pipeline_row_count_preserved(tmp_path):
     out = str(tmp_path / "int_rows")
     _ensure_dirs(out)
     df = _make_df()
     result = _run_pipeline(df, out)
     assert len(result) == len(df)
-
 
 def test_no_nan_in_final_output(tmp_path):
     out = str(tmp_path / "int_nan")

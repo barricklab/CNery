@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
-import os
 from pathlib import Path
 
 from .core import (
     process_multi_genome,
-    otr_correction,
+    fit_otr_bias,
+    apply_otr_correction,
     plot_otr_corr,
     run_HMM,
     plot_copy,
@@ -23,9 +23,10 @@ def main():
             "sequencing coverage across the genome to predict copy number "
             "variation (CNV)"
         ),
-        epilog=textwrap.dedent('''\
-            Run this script in the breseq output folder that contains 'data' and 'output' folders. 
-        '''),
+        epilog=textwrap.dedent(
+            "Run this script in the breseq output folder that contains "
+            "'data' and 'output' folders. \n"
+        ),
         formatter_class=RawTextHelpFormatter,
     )
 
@@ -53,20 +54,6 @@ def main():
         help=(
             "select the reference file used for breseq. "
             "Defaults to data/reference.fasta"
-        ),
-    )
-
-    parser.add_argument(
-        "--coverage-dir",
-        action="store",
-        dest="coverage_dir",
-        required=False,
-        type=str,
-        help=(
-            "folder of pre-generated per-reference coverage tables, named "
-            "'<seq_id>.coverage.tsv'. When given, breseq is never run and no BAM is "
-            "needed -- only the reference FASTA. A table must exist for every sequence "
-            "in the FASTA."
         ),
     )
 
@@ -146,8 +133,8 @@ def main():
     )
     parser.add_argument(
         "--bias",
-        choices=['all', 'none', 'gc', 'otr'],
-        default='all',
+        choices=["all", "none", "gc", "otr"],
+        default="all",
         required=False,
         help=(
             "Select specific bias correction (only OTR or only GC) to run "
@@ -163,41 +150,26 @@ def main():
         in_dir = "."
 
     bam_in = in_dir + "/data/reference.bam"
-    # Honour -ref when given. With --coverage-dir there may be no breseq run to sit inside,
-    # so the reference has to be nameable from anywhere.
-    ref_in = options.ref if options.ref is not None else in_dir + "/data/reference.fasta"
-
-    if not os.path.isfile(ref_in):
-        return (
-            f"Reference FASTA not found: {ref_in}. "
-            f"Pass -ref, or run inside a breseq output folder containing data/reference.fasta."
-        )
-
-    # The BAM is only read when coverage tables have to be generated.
-    if options.coverage_dir is None and not os.path.isfile(bam_in):
-        return (
-            f"BAM not found: {bam_in}. "
-            f"Pass --coverage-dir to use pre-generated coverage tables instead."
-        )
+    ref_in = in_dir + "/data/reference.fasta"
 
     if options.o is not None:
         out_dir = options.o
     else:
         out_dir = in_dir + "/CNV_out/"
 
-    out_subdirs = ['/CNV_plt', '/CNV_csv', '/GC_bias', '/OTR_corr']
+    out_subdirs = ["/CNV_plt", "/CNV_csv", "/GC_bias", "/OTR_corr"]
     for sub in out_subdirs:
         Path(out_dir + sub).mkdir(parents=True, exist_ok=True)
 
     region = options.reg
 
     if region is not None:
-        parts = region.split('-')
+        parts = region.split("-")
         if len(parts) == 2:
-            if parts[0] == '':
+            if parts[0] == "":
                 pltend = int(parts[1])
                 pltstart = 0
-            elif parts[1] == '':
+            elif parts[1] == "":
                 pltstart = int(parts[0])
                 pltend = 0
             else:
@@ -210,7 +182,7 @@ def main():
     else:
         pltstart, pltend = 0, 0
 
-    # Origin and terminus of replication are always inferred from the coverage profile 
+    # Origin and terminus of replication are always inferred from the coverage profile
     # print(
     #     "Origin/terminus of replication will be inferred from the "
     #     "coverage profile."
@@ -225,16 +197,9 @@ def main():
         step=options.s,
         frag=options.f,
         breseq_dir=in_dir,
-        coverage_dir=options.coverage_dir,
     )
-    # process_multi_genome already:
-    #   - runs bam2cov per genome
-    #   - preprocesses per genome
-    #   - pools all genomes to do LOWESS GC correction
-    #   - plots pooled GC bias
-    #   - returns {header: df_gc_corrected_per_genome}
 
-    smpl = out_dir.strip().split('/')[-1]
+    smpl = out_dir.strip().split("/")[-1]
     print(
         "Calculating coverage and GC% across sliding windows for each "
         "reference sequence"
@@ -247,53 +212,59 @@ def main():
             # df_b2c already GC-corrected by pooled LOWESS
             df_gc = df_b2c.copy()
             print(
-                f'{smpl} ({genome_id}): GC bias vs coverage handled '
-                f'(pooled fit).'
+                f"{smpl} ({genome_id}): GC bias vs coverage handled "
+                f"(pooled fit)."
             )
             df_gc["otr_gc_corr_norm_cov"] = df_gc["gc_corr_norm_cov"]
             df_cnv = run_HMM(df_gc, out_dir)
             plot_copy(df_cnv, pltstart, pltend, output=out_dir)
-            print(f'{smpl} ({genome_id}): CNV prediction plots saved.')
+            print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
         elif options.bias == "otr":
             # Use raw norm_raw_cov as baseline for OTR-only correction
             df_otr_in = df_b2c.copy()
             df_otr_in["gc_corr_norm_cov"] = df_otr_in["norm_raw_cov"]
-            df_otr, ori_win, ter_win = otr_correction(df_otr_in, out_dir)
+            # fit_otr_bias() then apply_otr_correction() replaces the old
+            # single-call otr_correction(df_otr_in, out_dir).
+            otr_fit_result = fit_otr_bias(df_otr_in, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
             print(
-                f'{smpl} ({genome_id}): Corrected origin/terminus of '
-                f'replication (OTR) bias in coverage.'
+                f"{smpl} ({genome_id}): Corrected origin/terminus of "
+                f"replication (OTR) bias in coverage."
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
-            print(f'{smpl} ({genome_id}): OTR bias vs coverage plots saved.')
+            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
             df_cnv = run_HMM(df_otr, out_dir)
             plot_copy(df_cnv, pltstart, pltend, output=out_dir)
-            print(f'{smpl} ({genome_id}): CNV prediction plots saved.')
+            print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
         elif options.bias == "none":
             df_none = df_b2c.copy()
             df_none["otr_gc_corr_norm_cov"] = df_none["norm_raw_cov"]
             df_cnv = run_HMM(df_none, out_dir)
             plot_copy(df_cnv, pltstart, pltend, output=out_dir)
-            print(f'{smpl} ({genome_id}): CNV prediction plots saved.')
+            print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
         elif options.bias == "all":
             # df_b2c already has GC correction applied
             df_gc = df_b2c.copy()
             print(
-                f'{smpl} ({genome_id}): GC bias vs coverage handled '
-                f'(pooled fit).'
+                f"{smpl} ({genome_id}): GC bias vs coverage handled "
+                f"(pooled fit)."
             )
-            df_otr, ori_win, ter_win = otr_correction(df_gc, out_dir)
+            # Same fit -> apply split as the "otr" branch above, replacing
+            # otr_correction(df_gc, out_dir).
+            otr_fit_result = fit_otr_bias(df_gc, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
             print(
-                f'{smpl} ({genome_id}): Corrected origin/terminus of '
-                f'replication (OTR) bias in coverage.'
+                f"{smpl} ({genome_id}): Corrected origin/terminus of "
+                f"replication (OTR) bias in coverage."
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
-            print(f'{smpl} ({genome_id}): OTR bias vs coverage plots saved.')
+            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
             df_cnv = run_HMM(df_otr, out_dir)
             plot_copy(df_cnv, pltstart, pltend, output=out_dir)
-            print(f'{smpl} ({genome_id}): CNV prediction plots saved.')
+            print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
 
 if __name__ == "__main__":

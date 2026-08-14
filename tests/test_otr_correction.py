@@ -3,12 +3,10 @@ import os
 import pytest
 import numpy as np
 import pandas as pd
-from CNery.core import otr_correction
-
+from CNery.core import fit_otr_bias, apply_otr_correction
 
 def _ensure_dirs(base):
     os.makedirs(os.path.join(base, "OTR_corr"), exist_ok=True)
-
 
 def _make_sloped_df(n=80):
     rng = np.random.default_rng(3)
@@ -34,37 +32,43 @@ def _make_sloped_df(n=80):
     })
 
 
+def _run_otr(df, out):
+    """otr_correction(df, out) was split into fit_otr_bias() + apply_otr_correction().
+    Both fixtures/dfs used here lack is_deletion/is_redundant/gc_cor_med_fil columns,
+    which fit_otr_bias() computes automatically (running mask_coverage_windows()
+    internally and median-filtering gc_corr_norm_cov) before calling otr_fit()."""
+    otr_fit_result = fit_otr_bias(df, out)
+    return apply_otr_correction(otr_fit_result, out)
+
+
 def test_required_columns_present(gc_corrected_flat, tmp_path):
     out = str(tmp_path / "otr1")
     _ensure_dirs(out)
-    df_out, _, _ = otr_correction(gc_corrected_flat, out)
+    df_out, _, _ = _run_otr(gc_corrected_flat, out)
     assert "otr_gc_corr_norm_cov" in df_out.columns
     assert "otr_gc_corr_fact" in df_out.columns
-
 
 def test_flat_coverage_no_bias_applied(gc_corrected_flat, tmp_path):
     out = str(tmp_path / "otr2")
     _ensure_dirs(out)
-    df_out, _, _ = otr_correction(gc_corrected_flat, out)
+    df_out, _, _ = _run_otr(gc_corrected_flat, out)
     assert np.isfinite(df_out["otr_gc_corr_norm_cov"].values).all()
     assert (df_out["otr_gc_corr_norm_cov"] >= 0).all()
-
 
 def test_sloped_coverage_reduces_slope(tmp_path):
     out = str(tmp_path / "otr3")
     _ensure_dirs(out)
     df = _make_sloped_df()
-    df_out, _, _ = otr_correction(df, out)
+    df_out, _, _ = _run_otr(df, out)
     # output must be finite and non-negative — correctness, not magnitude
     assert np.isfinite(df_out["otr_gc_corr_norm_cov"].values).all()
     assert (df_out["otr_gc_corr_norm_cov"] >= 0).all()
     assert len(df_out) == len(df)
 
-
 def test_json_results_has_required_keys(gc_corrected_flat, tmp_path):
     out = str(tmp_path / "otr4")
     _ensure_dirs(out)
-    otr_correction(gc_corrected_flat, out)
+    _run_otr(gc_corrected_flat, out)
     json_files = list((tmp_path / "otr4" / "OTR_corr").glob("*.json"))
     assert len(json_files) >= 1
     with open(json_files[0]) as f:

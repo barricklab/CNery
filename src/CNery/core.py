@@ -15,7 +15,6 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.special import  gammaln
-from scipy.optimize import minimize
 from itertools import cycle, islice
 
 
@@ -37,7 +36,6 @@ def parse_fasta_records(fastafile):
         for line in fh:
             line = line.rstrip()
             if line.startswith(">"):
-                # Finish previous record
                 if header is not None:
                     records.append((header, seq_len))
                 header = line[1:].split()[0] if line[1:].split() else ""
@@ -45,16 +43,12 @@ def parse_fasta_records(fastafile):
             else:
                 seq_len += len(line)
 
-    # Last record
     if header is not None:
         records.append((header, seq_len))
 
     return records
 
 
-#: Suffix of the per-reference coverage tables that --coverage-dir looks for. Distinct from the
-#: ".coverage.tab" files breseq writes into 08_mutation_identification, which are a different
-#: format (position last, no ref_base) and keep their historical name.
 COVERAGE_TABLE_SUFFIX = ".coverage.tsv"
 
 
@@ -72,14 +66,8 @@ def coverage_table_path(coverage_dir, seq_id):
 def _read_coverage_tab(path):
     """Read a breseq coverage table, dropping its commented summary block.
 
-    The trailing '#' block is variable-length: breseq writes four lines by default, one more
-    under --show-average, and three per read group. Its own
-    08_mutation_identification/*.coverage.tab files carry none at all. Matching on the comment
-    prefix therefore handles every case, whereas the fixed skipfooter=4 this replaces silently
+    The trailing '#' block is variable-length: this replaces silently
     deleted four real data rows from any footerless input.
-
-    Dropping skipfooter also lets pandas use the C engine -- it was the only reason the much
-    slower python engine was required here.
     """
     return pd.read_csv(
         path,
@@ -102,10 +90,8 @@ def bam2cov_to_df(
         print(f"Using pre-existing coverage file: {preexisting_tab}")
         return _read_coverage_tab(preexisting_tab)
 
-    # The tab output file name (may be output_prefix or output_prefix.tab)
     tab_file = output_prefix
 
-    # If no region provided, fall back to original single-genome behavior
     if region is None:
         header = None
         seq_len = 0
@@ -114,19 +100,18 @@ def bam2cov_to_df(
                 line = line.rstrip()
                 if line.startswith(">"):
                     if header is None:
-                        header = line[1:]      # drop leading ">"
+                        header = line[1:]
                     else:
-                        break                  # stop after first record
+                        break
                 else:
-                    seq_len += len(line)       # add length of sequence line
+                    seq_len += len(line)
         region = header + ":1-" + str(seq_len)
 
-    # Construct command
     cmd = [
         "breseq", "bam2cov",
-        "-t",  # request tab format
+        "-t",
         "--region", region,
-        "--resolution", "0",  # single-base resolution
+        "--resolution", "0",
         "--output", tab_file,
         "-b", bamfile,
         "-f", fastafile,
@@ -134,7 +119,6 @@ def bam2cov_to_df(
     if extra_args:
         cmd += extra_args
 
-    # Run the command
     try:
         result = subprocess.run(
             cmd, check=True,
@@ -146,26 +130,20 @@ def bam2cov_to_df(
         print(f"breseq bam2cov failed: {e.stderr}")
         raise
 
-    # breseq appends ".tab" extension if not present; handle accordingly
     if not tab_file.endswith(".tab"):
         tab_file += ".tab"
     if not os.path.isfile(tab_file):
         raise FileNotFoundError(f"Coverage output file {tab_file} was not created.")
 
-    # Load coverage as DataFrame
     try:
         df = _read_coverage_tab(tab_file)
     finally:
-        # Always remove the temp file, even if there was an error
         if os.path.exists(tab_file):
             os.remove(tab_file)
-
 
     return df
 
 
-# Process the coverage per nucleotide pileup detected across the genome
-# into normalized coverage across summary "windows" tiled across the genome
 def preprocess(df, win=200, step=100, frag=350):
 
     if (step > win):
@@ -197,6 +175,7 @@ def preprocess(df, win=200, step=100, frag=350):
     window = []
     win_end = []
     window_med_cov = []
+    pct_redundant_s = []
 
     df_b2c["cov_type"] = df_b2c["redundant"].apply(lambda x: 'R' if x > 0 else 'U')
     df_gc = pd.DataFrame(columns=["window_num"])
@@ -206,59 +185,70 @@ def preprocess(df, win=200, step=100, frag=350):
 
     # sliding window = win and increment size = step
     # summarizes GC% and median coverage
+
+    # Now every window in [i, i+win) is kept, using TOTAL coverage
+    # (unique + redundant) for its median -- so a repeat's real sequencing
+    # depth is reflected instead of just the reads that happened to map
+    # uniquely there -- and the fraction of redundant-covered bases in the
+    # window is recorded as `pct_redundant`. Downstream,
+    # mask_coverage_windows() uses `pct_redundant` to exclude
+    # heavily-redundant windows from GC/OTR bias-model FITTING and from
+    # the origin/terminus peak-trough SEARCH (see otr_fit()) while still
+    # giving them a real, bias-corrected coverage value -- so they are not
+    # miscalled as deletions by the HMM.
     while (i <= (genome_len - 1)) and (lst_win < genome_len):
 
         win_full_cov = df_b2c["unique_cov"].iloc[i:(i + win)].to_numpy()
+        win_redundant_cov = df_b2c["redundant"].iloc[i:(i + win)].to_numpy()
         cov_type = df_b2c["cov_type"].iloc[i:(i + win)].to_numpy()
-        win_cov = []
 
-        # Filter the windows overlapping redundant coverage regions.
-        # Ignores any coverage in and adjacent to repetitive/transposable changes
-        winu = 0
-        for j in range(len(cov_type)):
-            if (cov_type[j] == 'U'):
-                win_cov.insert(j, float(win_full_cov[j]))
-                winu += 1
-            else:
-                break
-
-        # If stretches of unique window does not exceed set window size,
-        # move to the next step
-        if (winu < win):
+        winu = len(cov_type)  # bases actually available (== win, except a
+                               # possible shorter final window at genome end)
+        if winu == 0:
             i = i + step
+            continue
+
+        # Total coverage per base = unique + redundant, so a window
+        # spanning a repeat is not under-counted just because some of its
+        # reads mapped ambiguously.
+        win_cov = (win_full_cov + win_redundant_cov).astype(float)
+
+        # Fraction of bases in this window overlapping redundant coverage.
+        pct_redundant = float(np.mean(cov_type == 'R'))
+
+        # Summarize the window coverage statistics
+        window_med_cov.insert(i, float(np.nanmedian(win_cov)))
+        pct_redundant_s.insert(i, pct_redundant)
+        winseq = genome[i:i + winu]
+        seq.insert(i, ''.join(str(element) for element in winseq))
+        window.insert(i, i)
+        win_end.insert(i, i + winu)
+        lst_win = win_end[(len(win_end) - 1)]
+        i_off = i + int(genome_len * 0.25)
+
+        # If fragment size is greater than the window size calculate the
+        # GC% of the entire fragment covering the coverage window
+        if (frag > win):
+            diff = int((frag - win) / 2)
+            fragseq = genome_cyc[(i_off - diff):((i_off + win) + diff)]
+            fragment.insert(i, ''.join(str(element) for element in fragseq))
+            gcc = ''.join([nucleotide for nucleotide in fragseq
+                           if nucleotide in ['C', 'G']])
+            gccp = (len(gcc) / len(fragseq))
+            gcp_s.insert(i, gccp)
+        # Otherwise use the length of the window to calculate the GC%
         else:
-            # Summarize the window coverage statistics
-            window_med_cov.insert(i, float(np.nanmedian(win_cov)))
-            winseq = genome[i:i + winu]
-            seq.insert(i, ''.join(str(element) for element in winseq))
-            window.insert(i, i)
-            win_end.insert(i, i + winu)
-            lst_win = win_end[(len(win_end) - 1)]
-            i_off = i + int(genome_len * 0.25)
+            diff = int((win - frag) / 2)
+            fragseq = list(
+                genome_cyc[i_off - diff:(i_off + win) + diff]
+            )
+            fragment.insert(i, ''.join(str(element) for element in fragseq))
+            gcc = ''.join([nucleotide for nucleotide in fragseq
+                           if nucleotide in ['C', 'G']])
+            gccp = (len(gcc) / len(fragseq))
+            gcp_s.insert(i, gccp)
 
-            # If fragment size is greater than the window size calculate the
-            # GC% of the entire fragment covering the coverage window
-            if (frag > win):
-                diff = int((frag - win) / 2)
-                fragseq = genome_cyc[(i_off - diff):((i_off + win) + diff)]
-                fragment.insert(i, ''.join(str(element) for element in fragseq))
-                gcc = ''.join([nucleotide for nucleotide in fragseq
-                               if nucleotide in ['C', 'G']])
-                gccp = (len(gcc) / len(fragseq))
-                gcp_s.insert(i, gccp)
-            # Otherwise use the length of the window to calculate the GC%
-            else:
-                diff = int((win - frag) / 2)
-                fragseq = list(
-                    genome_cyc[i_off - diff:(i_off + win) + diff]
-                )
-                fragment.insert(i, ''.join(str(element) for element in fragseq))
-                gcc = ''.join([nucleotide for nucleotide in fragseq
-                               if nucleotide in ['C', 'G']])
-                gccp = (len(gcc) / len(fragseq))
-                gcp_s.insert(i, gccp)
-
-            i = i + step
+        i = i + step
 
     # Save the window median and GC% per fragment overlapping a window
     # to the dataframe
@@ -267,6 +257,7 @@ def preprocess(df, win=200, step=100, frag=350):
     df_gc["win_len"] = df_gc["win_end"] - df_gc["win_st"]
     df_gc["gc_percent"] = gcp_s
     df_gc["read_count_cov"] = window_med_cov
+    df_gc["pct_redundant"] = pct_redundant_s
     df_gc["window_num"] = np.arange(0, len(window_med_cov), 1)
     df_gc["norm_raw_cov"] = (
         df_gc["read_count_cov"] / df_gc["read_count_cov"].median()
@@ -288,9 +279,6 @@ def gc_cor_plots(df, output):
 
     plt.figure(figsize=(10, 8))
 
-    # Use paired (gc_percent, gc_corr_fact) values so x and y stay aligned.
-    # Independent .unique() calls can return arrays of differing length once
-    # multiple GC values map to the same fit value.
     uniq = (
         df[['gc_percent', 'gc_corr_fact']]
         .drop_duplicates(subset='gc_percent')
@@ -335,71 +323,147 @@ def gc_cor_plots(df, output):
     plt.savefig(plt_full_path, format='pdf', bbox_inches='tight')
     plt.close()
 
+def mask_coverage_windows(
+    df,
+    zero_frac=0.1,
+    redundant_frac_thresh=0.0,
+    censor_col="exclude_from_fit",
+    deletion_col="is_deletion",
+):
+    """
+    Flag windows that should be excluded from bias-model FITTING, while
+    keeping the two exclusion reasons separate so they can be treated
+    differently downstream:
 
-# GC-bias correction
-def gc_correction(df, zero_frac=0.1, n_robust_iter=3, resid_mad=5.0,
-                  fit_floor_frac=0.05):
-    # Corrects trends between GC% and coverage in windows
-    # using locally weighted regression model.
+      - `is_deletion` (True/False): near-zero/outlier coverage windows,
+        i.e. genuine deletions. These ARE frozen to zero by
+        apply_gc_correction()/apply_otr_correction().
+      - `is_redundant` (True/False): windows whose `pct_redundant`
+        (computed by preprocess(), the fraction of bases in the window
+        overlapping redundant/repeat coverage) exceeds
+        `redundant_frac_thresh`. These are excluded from fitting but are
+        NOT frozen to zero -- they still receive a real bias-corrected
+        value so the HMM doesn't call spurious deletions over repeats.
+      - `censor_col` (default "exclude_from_fit"): is_deletion OR
+        is_redundant -- the single flag fit_gc_bias()/fit_otr_bias() use
+        to decide which windows inform the fit.
 
+    Does NOT drop rows -- preserves full window-index continuity for
+    downstream HMM / plotting code.
+    """
     df = df.copy()
 
-    # Identify genuinely low-coverage windows (deletions). These are excluded
-    # from the LOWESS fit so they cannot pull the bias curve down, and are
-    # frozen at zero in the corrected output (so they are still called CN=0).
     med = df["read_count_cov"].median()
-    zero_mask = df["read_count_cov"] <= (med * zero_frac)
+    zero_mask = (df["read_count_cov"] <= (med * zero_frac)).to_numpy()
 
     cov = df["norm_raw_cov"].to_numpy(dtype=float)
-    gc  = df["gc_percent"].to_numpy(dtype=float)
+    gc = df["gc_percent"].to_numpy(dtype=float)
+    finite_mask = ~(np.isfinite(cov) & np.isfinite(gc))
+
+    is_deletion = zero_mask | finite_mask
+
+    if "pct_redundant" in df.columns:
+        is_redundant = (df["pct_redundant"].to_numpy(dtype=float) > redundant_frac_thresh)
+    else:
+        is_redundant = np.zeros(len(df), dtype=bool)
+
+    df[deletion_col] = is_deletion
+    df["is_redundant"] = is_redundant
+    df[censor_col] = is_deletion | is_redundant
+
+    df["censor_reason"] = np.select(
+        [is_deletion, is_redundant],
+        ["zero_outlier", "redundant"],
+        default="clean",
+    )
+    return df
+
+
+def fit_gc_bias(
+    df,
+    censor_col="exclude_from_fit",
+    n_robust_iter=3,
+    resid_mad=5.0,
+    fit_floor_frac=0.05,
+):
+    """
+    Fit stage of GC-bias correction: iterative robust LOWESS of
+    norm_raw_cov vs gc_percent, using only windows where
+    df[censor_col] is False (i.e. neither deletions nor redundant-coverage
+    windows).
+    """
+    cov = df["norm_raw_cov"].to_numpy(dtype=float)
+    gc = df["gc_percent"].to_numpy(dtype=float)
+    censored = df[censor_col].to_numpy(dtype=bool)
 
     loess = sm.nonparametric.lowess
+    fit_mask = (~censored) & np.isfinite(cov) & np.isfinite(gc)
 
-    # Windows eligible to inform the GC fit: not deletions, finite values.
-    fit_mask = (~zero_mask) & np.isfinite(cov) & np.isfinite(gc)
-
-    # Iterative robust fit: fit the GC trend, then drop windows whose coverage
-    # is anomalous *relative to the fit at their own GC*.
     gc_sorted = fit_sorted = None
     for _ in range(max(1, n_robust_iter)):
+        gc_f = gc[fit_mask]
+        cov_f = cov[fit_mask]
         sm_out = loess(
-            cov[fit_mask], gc[fit_mask],
+            cov_f, gc_f,
             frac=0.3, it=1, delta=0.0,
             is_sorted=False, missing='none', return_sorted=True,
         )
         gc_sorted, fit_sorted = sm_out[:, 0], sm_out[:, 1]
 
-        # Residual of every window from the fit at its GC.
-        expected = np.interp(gc, gc_sorted, fit_sorted)
-        resid = cov - expected
-        med_resid = np.median(resid[fit_mask])
-        mad = np.median(np.abs(resid[fit_mask] - med_resid))
+        expected = np.interp(gc_f, gc_sorted, fit_sorted)
+        resid = cov_f - expected
+        med_resid = np.median(resid)
+        mad = np.median(np.abs(resid - med_resid))
         if mad <= 0:
             break
-        sigma = 1.4826 * mad  # MAD -> ~stddev under normality
+        sigma = 1.4826 * mad
         keep = np.abs(resid - med_resid) <= (resid_mad * sigma)
-        new_mask = fit_mask & keep
 
-        # Stop if converged or if we'd prune more than half the windows
+        new_mask = fit_mask.copy()
+        idx = np.where(fit_mask)[0]
+        new_mask[idx] = keep
+
         if new_mask.sum() == fit_mask.sum() or new_mask.sum() < 0.5 * fit_mask.sum():
+            fit_mask = new_mask
             break
         fit_mask = new_mask
 
-    # Predict the expected coverage at EVERY window's GC by interpolation
-    gc_out = np.interp(gc, gc_sorted, fit_sorted)
-
-    # Floor the denominator RELATIVE to the median fitted coverage
     fit_ref = np.median(fit_sorted)
     floor = fit_floor_frac * fit_ref if np.isfinite(fit_ref) and fit_ref > 0 else 1e-6
-    gc_out = np.clip(gc_out, floor, None)
+
+    return {"gc_sorted": gc_sorted, "fit_sorted": fit_sorted, "floor": floor}
+
+
+def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
+    """
+    Apply stage of GC-bias correction: interpolate the fitted LOWESS curve
+    at EVERY window's GC% (both fit-eligible and censored windows) and
+    divide raw normalized coverage by it.
+
+    Only windows flagged `deletion_col` (genuine near-zero/outlier
+    coverage) are frozen at zero. Redundant-coverage windows (censored
+    from fitting but NOT flagged as deletions) still get a real corrected
+    value here -- masked for FITTING but not zeroed in the CORRECTED
+    output, avoiding spurious deletion calls over repeats.
+
+    Returns
+    -------
+    df : DataFrame with gc_corr_norm_cov and gc_corr_fact columns added.
+    """
+    df = df.copy()
+    cov = df["norm_raw_cov"].to_numpy(dtype=float)
+    gc = df["gc_percent"].to_numpy(dtype=float)
+    is_deletion = df[deletion_col].to_numpy(dtype=bool)
+
+    gc_out = np.interp(gc, gc_fit["gc_sorted"], gc_fit["fit_sorted"])
+    gc_out = np.clip(gc_out, gc_fit["floor"], None)
 
     gc_corr = np.zeros_like(cov)
-    valid = ~zero_mask
+    valid = ~is_deletion
     gc_corr[valid] = cov[valid] / gc_out[valid]
 
     df["gc_corr_norm_cov"] = gc_corr
-    df["gc_corr_fact"]     = gc_out
-
+    df["gc_corr_fact"] = gc_out
     return df
 
 
@@ -445,8 +509,6 @@ def process_multi_genome(
         region = f"{header}:1-{seq_len}"
         tab_prefix = f"{output_prefix}_{header}"
 
-        # An explicit --coverage-dir wins; otherwise fall back to probing a breseq run's
-        # 08_mutation_identification output.
         preexisting_tab = None
         if coverage_dir is not None:
             preexisting_tab = coverage_table_path(coverage_dir, header)
@@ -458,7 +520,6 @@ def process_multi_genome(
             if os.path.isfile(candidate):
                 preexisting_tab = candidate
 
-        # per-genome bam2cov
         df_raw = bam2cov_to_df(
             bamfile,
             fastafile,
@@ -468,34 +529,29 @@ def process_multi_genome(
             preexisting_tab=preexisting_tab,
         )
 
-        # per-genome preprocessing
         df_pre = preprocess(df_raw, win=win, step=step, frag=frag)
         df_pre["genome_id"] = header
         preprocessed[header] = df_pre
 
-    # Pool all genomes for a shared LOWESS GC correction
     df_pooled = pd.concat(preprocessed.values(), ignore_index=True)
 
-    # Global renormalization before LOWESS
     global_median = df_pooled["read_count_cov"].median()
     df_pooled["norm_raw_cov"] = df_pooled["read_count_cov"] / global_median
 
-    # Pooled GC correction
-    df_pooled = gc_correction(df_pooled)
+    df_pooled = mask_coverage_windows(df_pooled)
+    gc_fit = fit_gc_bias(df_pooled)
+    df_pooled = apply_gc_correction(df_pooled, gc_fit)
 
-    # Pooled GC-bias plot
     gc_cor_plots(df_pooled, output_prefix)
 
-    # Re-separate corrected data by genome_id
     per_genome_corrected = {}
     for header, _ in records:
         df_g = df_pooled[df_pooled["genome_id"] == header].copy()
         df_g.reset_index(drop=True, inplace=True)
         per_genome_corrected[header] = df_g
 
-
-
     return per_genome_corrected
+
 
 def plot_otr_corr(df, output, ori, ter):
 
@@ -525,370 +581,198 @@ def plot_otr_corr(df, output, ori, ter):
     
     plt.close()
 
-#Function to fit lines between ori-ter-coordinates to determine the best fit to actual coverage across genomic windows
-def fit_func(params, x, y):
-    x1, x2, y1, y2, = params
-    
-    m = (y1-y2) / (x1-x2)
-    c = y1 - m * (x1)
-    error = 0
-    for i in range(len(x)):
-        y_pred = m*x[i] + c
-        error += (y[i]-y_pred) ** 2
-    return error
+
+def circular_arc(start, end, n):
+    """
+    Real genome positions and "unwrapped" x-coordinates for the arc walking
+    forward from `start` to `end` around a circular genome of length `n`,
+    wrapping past n-1 back to 0 if `end` < `start`. Unwrapped x keeps
+    increasing past `n` on wraparound so a line can be fit against it
+    without a false discontinuity at the FASTA coordinate 0/n boundary.
+    """
+    if end >= start:
+        unwrapped = np.arange(start, end + 1)
+    else:
+        unwrapped = np.arange(start, end + 1 + n)
+    real_positions = unwrapped % n
+    return real_positions, unwrapped
+
+
+def fit_arc_line(ux, y_arc, fit_mask, fallback_value):
+    """OLS line through an arc's real (masked) points; falls back to a flat
+    line at `fallback_value` if too few clean points remain to fit."""
+    if fit_mask.sum() >= 2:
+        slope, intercept = np.polyfit(ux[fit_mask], y_arc[fit_mask], 1)
+    else:
+        slope, intercept = 0.0, fallback_value
+    return slope, intercept
+
 
 #Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
-def otr_fit(df):
-    
-    cyc = False
-    bias = False
-    pt = "trough"
-    x = df.index
-    y = df["gc_corr_norm_cov"]
-    y_med_fil = df["gc_cor_med_fil"]
+#
+# Detects the origin (coverage peak) and terminus (coverage trough) of
+# replication from the median-filtered coverage profile, then fits a
+# straight line through each of the two circular arcs connecting them
+# (ordinary least squares, using every window in the arc). Windows
+# flagged as deletions or redundant coverage (via mask_coverage_windows())
+# are excluded from the line fits so they cannot distort the ramp.
+def otr_fit(df, bias_threshold=1.0):
 
-    # The ori->ter ramp (y_fit) is a straight line between the 
-    # fitted origin and terminus coverages
-    _yv = np.asarray(y, dtype=float)
-    _yfin = _yv[np.isfinite(_yv) & (_yv > 0)]
-    _yref = np.median(_yfin) if _yfin.size else 1.0
+    x = df.index.to_numpy()
+    y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
+    y_med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float)
+    n = len(x)
+
+    # Windows to exclude from the arc line fits: genuine deletions and
+    # redundant/repeat-coverage windows, if mask_coverage_windows() has
+    # already flagged them.
+    exclude = np.zeros(n, dtype=bool)
+    if "is_deletion" in df.columns:
+        exclude |= df["is_deletion"].to_numpy(dtype=bool)
+    if "is_redundant" in df.columns:
+        exclude |= df["is_redundant"].to_numpy(dtype=bool)
+
+    # For the peak/trough SEARCH specifically, dilate the exclusion by one
+    # window on each side (circularly -- np.roll wraps correctly around a
+    # circular chromosome).
+    exclude_for_search = exclude | np.roll(exclude, 1) | np.roll(exclude, -1)
+
+    _yv = y[np.isfinite(y) & (y > 0)]
+    _yref = np.median(_yv) if _yv.size else 1.0
     otr_floor = 0.1 * _yref if _yref > 0 else 1e-6
 
-    len_init = len(x)
-    
-    x_cyc = list(islice(cycle(x), 0, len_init*3))
-    y_cyc = list(islice(cycle(y), 0, len_init*3))
-    
-    xori_guess = y_med_fil.argmax()
-    xter_guess = y_med_fil.argmin()
-    o_idx = int(y_med_fil.to_numpy().argmax())
-    t_idx = int(y_med_fil.to_numpy().argmin())
-    yori_guess = y.iloc[o_idx]
-    yter_guess = y.iloc[t_idx]
-
-    print(f'xori_guess:{xori_guess} and xter_guess: {xter_guess}')
-
-
-    if (abs((xori_guess - xter_guess)) >= (len_init * 0.35) and abs((xori_guess - xter_guess)) <= (len_init * 0.65)):
-
-        bias = True
-        
-        if (xori_guess < len_init * 0.1) or (xori_guess > len_init * 0.9):
-            xori_guess = 0
-            y1 = y_cyc[:xter_guess]
-            y2 = y_cyc[xter_guess:len_init]
-            x1 = x_cyc[:xter_guess]
-            x2 = x_cyc[xter_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
-
-        elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
-            xter_guess = 0
-            y1 = y_cyc[:xori_guess]
-            y2 = y_cyc[xori_guess:len_init]
-            x1 = x_cyc[:xori_guess]
-            x2 = x_cyc[xori_guess:len_init]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
-            pt = "peak"
-        
-        else:
-            xi = xori_guess if (xori_guess < xter_guess) else xter_guess
-            xj = xori_guess if (xori_guess > xter_guess) else xter_guess
-            y1 = y_cyc[xi:xj]
-            y2 = y_cyc[xj:(xi+len_init)]
-            x1 = x_cyc[xi:xj]
-            x2 = x_cyc[xj:(xi+len_init)]
-            initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-            initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
-            cyc = True
-
+    # Peak/trough search excludes masked windows: -inf so they can never
+    # win the argmax, +inf so they can never win the argmin. If EVERY
+    # window happens to be masked (degenerate edge case), fall back to the
+    # unmasked profile rather than crashing on an all-inf array.
+    if exclude_for_search.all():
+        y_for_max = y_med_fil
+        y_for_min = y_med_fil
     else:
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
+        y_for_max = np.where(exclude_for_search, -np.inf, y_med_fil)
+        y_for_min = np.where(exclude_for_search, np.inf, y_med_fil)
+
+    o_idx = int(np.nanargmax(y_for_max))
+    t_idx = int(np.nanargmin(y_for_min))
+    y_ori = y[o_idx]
+    y_ter = y[t_idx]
+
+    print(f'o_idx:{o_idx} and t_idx: {t_idx}')
+
+    # Bias is only corrected if ori/ter are roughly opposite each other on
+    # the circular genome (consistent with bidirectional replication) and
+    # the peak/trough coverage ratio clears bias_threshold. bias_threshold
+    # is left at 1.0 for now (any ori>ter passes); revisit if noise alone
+    # is triggering false-positive corrections.
+    circular_dist = min(abs(o_idx - t_idx), n - abs(o_idx - t_idx))
+    separation_ok = (0.35 * n <= circular_dist <= 0.65 * n)
+    magnitude_ok = (y_ter > 0) and ((y_ori / y_ter) > bias_threshold)
+
+    if not (separation_ok and magnitude_ok):
+        y_fit = np.repeat(np.mean(y), n)
         print("OTR bias not detected")
+        return y, y_fit, o_idx, t_idx, False
 
-        return y_corr, y_fit, xori_guess, xter_guess, bias
-    
-    result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
-    result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
-    
-    xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
-    xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
-    
-    xori_opt = np.mean([xori_opt1, xori_opt2])
-    xter_opt = np.mean([xter_opt1, xter_opt2])
-    yori_opt = np.mean([yori_opt1, yori_opt2])
-    yter_opt = np.mean([yter_opt1, yter_opt2])
-    
-    print(f'guess1:{initial_guess1}, guess2:{initial_guess2}')
-    # print(f'xori_opt1:{xori_opt1} and xter_opt1: {xter_opt1}')
-    print(f'yori_opt1:{yori_opt1} and yter_opt1: {yter_opt1}')
-    # print(f'xori_opt2:{xori_opt2} and xter_opt2: {xter_opt2}')
-    print(f'yori_opt2:{yori_opt2} and yter_opt2: {yter_opt2}')
+    bias = True
 
+    # Split the circle into the two arcs connecting origin and terminus.
+    pos_a, ux_a = circular_arc(o_idx, t_idx, n)
+    pos_b, ux_b = circular_arc(t_idx, o_idx, n)
 
-    y1_fit=[]
-    y2_fit=[]
+    y_a = y[pos_a]
+    y_b = y[pos_b]
+    fit_mask_a = ~exclude[pos_a]
+    fit_mask_b = ~exclude[pos_b]
 
-    if (yori_opt / yter_opt) > 1:
-        bias = True
-    else:
-        bias = False
-    
-    if bias and cyc:
-        
-        if (xori_opt > xter_opt):
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
-        else:
-            m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-            # c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-            m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-            m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-            c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-            c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-            y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-            y_fit = y1_fit + y2_fit
-            y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
-        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
-        y_corr = y / y_fit
+    slope_a, intercept_a = fit_arc_line(ux_a, y_a, fit_mask_a, y_ori)
+    slope_b, intercept_b = fit_arc_line(ux_b, y_b, fit_mask_b, y_ter)
 
-    elif bias and not cyc:
-        if pt == "peak":
-            xter_opt = 0
-            
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
+    y_fit_a = slope_a * ux_a + intercept_a
+    y_fit_b = slope_b * ux_b + intercept_b
 
-            c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
-            c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            y_fit = y1_fit + y2_fit
-            
-        else:
-            xori_opt = 0
-            
-            m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-            m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
-            
-            c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
-            c_opt2 = yter_opt1 - m_opt2 * (int(xter_opt2))
-            
-            y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-            y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            
-            y_fit = y1_fit + y2_fit
-            print(f'm_opt1:{m_opt1} and m_opt2:{m_opt2}')
-            print(f'c_opt1:{c_opt1} and c_opt2:{c_opt2}')
+    y_fit = np.empty(n, dtype=float)
+    y_fit[pos_a] = y_fit_a
+    # pos_a and pos_b share their two endpoints (o_idx, t_idx); both arcs'
+    # lines are anchored near the true peak/trough there, so assigning
+    # arc B's value last at the shared points is a negligible difference.
+    y_fit[pos_b] = y_fit_b
 
-
-        y_fit = np.clip(np.asarray(y_fit, dtype=float), otr_floor, None)
-        y_corr = y / y_fit
-
-    else:
-        # y_corr = np.repeat(np.mean(y), len_init)
-        y_corr = y
-        y_fit = np.repeat(np.mean(y), len_init)
-        print("OTR bias not detected")
-        return y_corr, y_fit, o_idx, t_idx, bias
+    y_fit = np.clip(y_fit, otr_floor, None)
+    y_corr = y / y_fit
 
     return y_corr, y_fit, o_idx, t_idx, bias
 
-#Fit the coverage between the origin and terminus coordinates set by user to detect the presence and the degree of bias observed
-# def otr_set(df, ter_idx, ori_idx):
-    
-#     cyc = False
-#     bias = False
-#     pt = "trough"
-#     x = df.index
-#     y = df["gc_corr_norm_cov"]
-#     y_med_fil = df["gc_cor_med_fil"]
-    
-#     len_init = len(x)
-    
-#     x_cyc = list(islice(cycle(x), 0, len_init*3))
-#     y_cyc = list(islice(cycle(y), 0, len_init*3))
-    
-#     xori_guess = ori_idx
-#     xter_guess = ter_idx
-#     o_idx = int(y_med_fil.to_numpy().argmax())
-#     t_idx = int(y_med_fil.to_numpy().argmin())
-#     yori_guess = y.iloc[o_idx]
-#     yter_guess = y.iloc[t_idx]
-#     # yori_guess = y[y_med_fil.argmax()]
-#     # yter_guess = y[y_med_fil.argmin()] 
-    
-#     if (abs(xori_guess-xter_guess) > len_init * 0.3 ):
-#         if (xori_guess < len_init*0.1) or (xori_guess > len_init * 0.9):
-#             xori_guess = 0
-#             y1 = y_cyc[:xter_guess]
-#             y2 = y_cyc[xter_guess:len_init]
-#             x1 = x_cyc[:xter_guess]
-#             x2 = x_cyc[xter_guess:len_init]
-#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-#             initial_guess2 = [xter_guess, xori_guess, yter_guess, yori_guess]
-#         elif (xter_guess < len_init*0.1) or (xter_guess > len_init * 0.9):
-#             xter_guess = 0
-#             y1 = y_cyc[:xori_guess]
-#             y2 = y_cyc[xori_guess:len_init]
-#             x1 = x_cyc[:xori_guess]
-#             x2 = x_cyc[xori_guess:len_init]
-#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-#             initial_guess2 = [len_init, xori_guess, yter_guess, yori_guess]
-#             pt = "peak"
-#         else:
-#             xi = xori_guess if (xori_guess < xter_guess) else xter_guess
-#             xj = xori_guess if (xori_guess > xter_guess) else xter_guess
-#             y1 = y_cyc[xi:xj]
-#             y2 = y_cyc[xj:(xi+len_init)]
-#             x1 = x_cyc[xi:xj]
-#             x2 = x_cyc[xj:(xi+len_init)]
-#             initial_guess1 = [xori_guess, xter_guess, yori_guess, yter_guess]
-#             initial_guess2 = [xter_guess, len_init, yter_guess, yori_guess]
-#             cyc = True
-#         bias = True
-#     else:
-#         y_corr = y
-#         y_fit = np.repeat(np.mean(y), len_init)
-#         print("Specified ori and ter too close to each other. No correction applied.")
-#         return y_corr, y_fit, bias
-    
-#     result1 = minimize(fit_func, initial_guess1, args = (x1, y1))
-#     result2 = minimize(fit_func, initial_guess2, args = (x2, y2))
-    
-#     xori_opt1, xter_opt1, yori_opt1, yter_opt1 = result1.x
-#     xter_opt2, xori_opt2, yter_opt2, yori_opt2 = result2.x
-    
-#     xori_opt = np.mean([xori_opt1, xori_opt2])
-#     xter_opt = np.mean([xter_opt1, xter_opt2])
-#     yori_opt = np.mean([yori_opt1, yori_opt2])
-#     yter_opt = np.mean([yter_opt1, yter_opt2])
-    
-#     y1_fit=[]
-#     y2_fit=[]
-    
-#     if (yori_opt / yter_opt) > 1:
-#         bias = True
-#     else:
-#         bias = False
-
-#     if bias and cyc:
-        
-#         if (xori_opt > xter_opt):
-#             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-#             c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-#             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-#             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-#             c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-#             c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-#             y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-#             y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-#             y_fit = y1_fit + y2_fit
-#             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xter_guess), (2*len(y_fit) - int(xter_guess)))))
-#         else:
-#             m_opt = (yori_opt - yter_opt) / (xori_opt - xter_opt)
-#             c_opt = yori_opt - m_opt * (xori_opt - xter_opt)
-#             m_opt1 = (yori_opt-yter_opt) / (xori_guess-xter_guess)
-#             m_opt2 = (yter_opt-yori_opt) / (len(x)-(xori_guess-xter_guess))
-            
-#             c_opt1 = yori_opt - m_opt * (xori_opt-xter_opt)
-#             c_opt2 = yter_opt - m_opt * (xter_opt-xori_opt)
-            
-#             y1_fit = [m_opt1 * x + c_opt1 for x in range(len(x1))]
-#             y2_fit = [m_opt2 * x + c_opt2 for x in range(len(x2))]
-#             y_fit = y1_fit + y2_fit
-#             y_fit = np.array(list(islice(cycle(y_fit), len(y_fit)-int(xori_guess), (2*len(y_fit) - int(xori_guess)))))
-#         y_corr = y / y_fit
-        
-#     elif bias and not cyc:
-#         if pt == "peak":
-#             xter_opt = 0
-            
-#             m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-#             m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
-
-#             c_opt1 = yori_opt2 - m_opt1 * (int(xori_opt1))
-#             c_opt2 = yori_opt2 - m_opt2 * (int(xori_opt2))
-            
-#             y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-#             y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-#             y_fit = y1_fit + y2_fit
-            
-#         else:
-#             xori_opt = 0
-            
-#             m_opt1 = (yori_opt1 - yter_opt1) / (xori_opt1 - xter_opt1)
-#             m_opt2 = (yter_opt2 - yori_opt2) / (xter_opt2 - xori_opt2)
-            
-#             c_opt1 = yter_opt1 - m_opt1 * (int(xter_opt1))
-#             c_opt2 = yter_opt1 - m_opt2 * (int(xori_opt2))
-            
-#             y1_fit = [m_opt1 * x + c_opt1 for x in x1]
-#             y2_fit = [m_opt2 * x + c_opt2 for x in x2]
-            
-#             y_fit = y1_fit + y2_fit
-            
-#         y_corr = y / y_fit
-#     else:
-#         # y_corr = np.repeat(np.mean(y), len_init)
-#         y_corr = y
-#         y_fit = np.repeat(np.mean(y), len_init)
-#         print("OTR bias not detected")
-#         return y_corr, y_fit, xori_guess, xter_guess, bias
-
-#     return y_corr, y_fit, bias
 
 def find_nearest(array, value):
     array = np.asarray(array)
     idx = (np.abs(array - value)).argmin()
     return idx
 
-#Correction of the normalized coverage based on the bias detected.
-def otr_correction(df, output):
+
+# ---------------------------------------------------------------------------
+# mask -> fit -> apply split for origin-to-terminus (OTR) bias.
+# otr_fit() (above) now does its own masking internally (via the
+# is_deletion/is_redundant columns), so this only needs to ensure those
+# columns exist before calling it.
+# ---------------------------------------------------------------------------
+def fit_otr_bias(df, output):
+    """
+    Fit stage: runs the median-filter smoothing (if not already present),
+    ensures deletion/redundant masking columns exist (running
+    mask_coverage_windows() if they don't -- e.g. when OTR correction is
+    run without a prior GC-correction pass), and runs otr_fit().
+
+    """
+    df = df.copy()
+
+    if "is_deletion" not in df.columns or "is_redundant" not in df.columns:
+        df = mask_coverage_windows(df)
 
     if "gc_cor_med_fil" not in df.columns:
         n = len(df)
-        # choose a safe window: at least 3, at most n, and odd
-        win = max(3, int(n/50))
+        win = max(3, int(n / 50))
         win = min(win, n)
         if win % 2 == 0:
             win -= 1
         if win < 1:
-            # degenerate case: just copy the original series
             df["gc_cor_med_fil"] = df["gc_corr_norm_cov"].copy()
         else:
             df["gc_cor_med_fil"] = ndimage.median_filter(
-                df["gc_corr_norm_cov"],
-                size=win,
-                mode="reflect",
+                df["gc_corr_norm_cov"], size=win, mode="reflect"
             )
 
-    genome_id = str(df["genome_id"][0])
-    samplename = output.strip().split('/')[-1] + genome_id
-    saveplt = str(output+"/OTR_corr/")
+    y_corr, y_fit, o_idx, t_idx, bias = otr_fit(df)
 
-    # Fit the bias curve to the most probable location of ori/ter based on
-    # coverage peaks and troughs respectively.
-    h1, f1, ori_idx, ter_idx, bias = otr_fit(df)
+    return {
+        "y_corr": np.asarray(y_corr, dtype=float),
+        "y_fit": np.asarray(y_fit, dtype=float),
+        "o_idx": o_idx,
+        "t_idx": t_idx,
+        "bias": bias,
+        "df_with_medfil": df,
+    }
+
+
+def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
+    """
+    Windows flagged `deletion_col` are left un-scaled at their GC-corrected value. 
+    Redundant coverage windows, DO receive the OTR scaling factor, so they are not
+    zeroed or frozen and won't be miscalled as deletions by the HMM.
+    """
+    df = otr_fit_result["df_with_medfil"].copy()
+    genome_id = str(df["genome_id"][0])
+    samplename = output.strip().split("/")[-1] + genome_id
+    saveplt = str(output + "/OTR_corr/")
+    os.makedirs(saveplt, exist_ok=True)
+
+    y_corr = otr_fit_result["y_corr"]
+    f1 = otr_fit_result["y_fit"]
+    o_idx, t_idx, bias = (
+        otr_fit_result["o_idx"], otr_fit_result["t_idx"], otr_fit_result["bias"]
+    )
+
     if bias:
+        ori_idx, ter_idx = o_idx, t_idx
         xori = df["win_st"].iloc[ori_idx]
         xter = df["win_st"].iloc[ter_idx]
         yori = f1[ori_idx]
@@ -896,7 +780,7 @@ def otr_correction(df, output):
         OTR = yori / (yter + 0.001)
     else:
         xori = df["win_st"].iloc[0]
-        xter = df["win_end"].iloc[len(df)-1]
+        xter = df["win_end"].iloc[len(df) - 1]
         yori = np.nan
         yter = np.nan
         OTR = "Not detected"
@@ -909,17 +793,24 @@ def otr_correction(df, output):
         "Origin-to-Termius/Bias Ratio": OTR,
         "Correction type": "Ori-ter coordinates fit by coverage",
     }
-    # df["otr_gc_corr_norm_cov"] = h1
-    # df["otr_gc_corr_fact"] = f1
+
     df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"].copy()
-    low = df["read_count_cov"] <= df["read_count_cov"].median() * 0.1
-    df.loc[~low, "otr_gc_corr_norm_cov"] = h1[~low]  # only apply scaling where coverage is non‑trivially positive
+
+    if deletion_col in df.columns:
+        low = df[deletion_col].to_numpy(dtype=bool)
+    else:
+        low = (df["read_count_cov"] <= df["read_count_cov"].median() * 0.1).to_numpy()
+
+    # scale everything that's not a genuine deletion (redundant windows included),
+    # using otr_fit()'s own y_corr rather than a fresh division by f1.
+    df.loc[~low, "otr_gc_corr_norm_cov"] = y_corr[~low]
     df["otr_gc_corr_fact"] = f1
 
     with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
         json.dump(results, f, indent=4)
 
     return df, xori, xter
+
 
 def plot_copy(df_cnv, pltstart, pltend, output):
     
