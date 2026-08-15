@@ -4,7 +4,9 @@ import argparse
 from pathlib import Path
 
 from .core import (
+    DEFAULT_FILE_ENDING,
     process_multi_genome,
+    resolve_coverage_inputs,
     fit_otr_bias,
     apply_otr_correction,
     plot_otr_corr,
@@ -24,36 +26,38 @@ def main():
             "variation (CNV)"
         ),
         epilog=textwrap.dedent(
-            "Run this script in the breseq output folder that contains "
-            "'data' and 'output' folders. \n"
+            "Inputs are breseq 'bam2cov --format TSV' coverage tables. Run with no "
+            "arguments in a folder that holds them, or name files and/or folders "
+            "directly. \n"
         ),
         formatter_class=RawTextHelpFormatter,
     )
 
     # Define the command line arguments
     parser.add_argument(
-        "-i",
-        "--input",
-        action="store",
-        dest="i",
-        required=False,
-        type=str,
+        "inputs",
+        nargs="*",
+        metavar="INPUT",
         help=(
-            "input folder path "
-            "(the breseq output folder with 'data' and 'output' folders). "
-            "Defaults to current folder"
+            "Coverage table files, and/or folders containing them. Folders are "
+            "searched (top level only) for files ending in --file-ending. Every "
+            "table given is analyzed together, sharing one GC-bias fit, so these "
+            "should be the reference sequences of a single sample. "
+            "Defaults to the current folder."
         ),
     )
 
     parser.add_argument(
-        "-ref",
-        action="store",
-        dest="ref",
-        required=False,
-        type=str,
+        "--file-ending",
+        action="append",
+        dest="file_ending",
+        metavar="ENDING",
         help=(
-            "select the reference file used for breseq. "
-            "Defaults to data/reference.fasta"
+            "File ending that identifies a coverage table inside an input folder. "
+            "Repeat the flag to accept more than one. Any --file-ending REPLACES "
+            f"the default ('{DEFAULT_FILE_ENDING}') rather than adding to it. "
+            "A file named directly on the command line is always used, whatever "
+            "it is called."
         ),
     )
 
@@ -144,18 +148,17 @@ def main():
 
     # Parse the command line arguments
     options = parser.parse_args()
-    if options.i is not None:
-        in_dir = options.i
-    else:
-        in_dir = "."
 
-    bam_in = in_dir + "/data/reference.bam"
-    ref_in = in_dir + "/data/reference.fasta"
+    inputs = options.inputs if options.inputs else ["."]
+
+    # Resolve and validate inputs BEFORE creating anything on disk, so a typo or a
+    # folder with no tables in it fails without leaving an empty CNV_out/ tree behind.
+    coverage_inputs = resolve_coverage_inputs(inputs, options.file_ending)
 
     if options.o is not None:
         out_dir = options.o
     else:
-        out_dir = in_dir + "/CNV_out/"
+        out_dir = "CNV_out/"
 
     out_subdirs = ["/CNV_plt", "/CNV_csv", "/GC_bias", "/OTR_corr"]
     for sub in out_subdirs:
@@ -190,13 +193,11 @@ def main():
 
     # process single or multiple genomes in a unified way
     per_genome = process_multi_genome(
-        bamfile=bam_in,
-        fastafile=ref_in,
+        coverage_inputs,
         output_prefix=out_dir,
         win=options.w,
         step=options.s,
         frag=options.f,
-        breseq_dir=in_dir,
     )
 
     smpl = out_dir.strip().split("/")[-1]

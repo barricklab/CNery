@@ -3,8 +3,10 @@ channels:
   - bioconda
   - conda-forge
   - defaults
+# breseq is NOT a dependency: CNery reads pre-generated coverage tables and never invokes it.
+# Generating those tables needs pre-release breseq from the Barrick lab channel -- not the
+# bioconda build that used to be pinned here. See "Generating a coverage table" in README.md.
 dependencies:
-  - breseq
   - pandas>=2.2.0
   - numpy>=1.26.0
   - matplotlib>=3.8.0

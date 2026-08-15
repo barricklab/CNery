@@ -40,9 +40,10 @@ from CNery.core import (
     apply_otr_correction,
     coverage_table_path,
     fit_otr_bias,
-    parse_fasta_records,
+    genome_id_from_path,
     preprocess,
     process_multi_genome,
+    resolve_coverage_inputs,
     run_HMM,
 )
 from data._fetch import load_registry
@@ -102,11 +103,9 @@ def pipeline(dataset_dir, tmp_path_factory):
         (out / sub).mkdir()
 
     per_genome = process_multi_genome(
-        bamfile=os.path.join(str(path), "reference.bam"),   # absent by design
-        fastafile=os.path.join(str(path), "reference.fasta"),
+        resolve_coverage_inputs([str(path)]),
         output_prefix=str(out),
         win=WIN, step=STEP, frag=FRAG,
-        coverage_dir=str(path),
     )
     df_gc = per_genome[spec.seq_id]
     # otr_correction(df, out) was split into fit_otr_bias() + apply_otr_correction().
@@ -204,10 +203,19 @@ class TestInputIntegrity:
         name, df = raw_table
         assert df.shape[1] == DATASETS[name].data_columns
 
-    def test_reference_agrees_with_the_table(self, dataset_dir):
+    def test_seq_id_is_recoverable_from_the_file_name(self, dataset_dir):
+        # The sequence ID now comes from the file name rather than a FASTA header, so
+        # the naming rule has to hold against real file names -- including
+        # "REL606_2314906bp_shift", which the "strip only the ending" rule must leave
+        # intact rather than cutting at a dot.
         name, path = dataset_dir
-        records = parse_fasta_records(os.path.join(str(path), "reference.fasta"))
-        assert records == [(DATASETS[name].seq_id, GENOME_LEN)]
+        table = coverage_table_path(str(path), DATASETS[name].seq_id)
+        assert os.path.isfile(table)
+        assert genome_id_from_path(table) == DATASETS[name].seq_id
+
+    def test_resolving_the_folder_finds_exactly_this_table(self, dataset_dir):
+        name, path = dataset_dir
+        assert list(resolve_coverage_inputs([str(path)])) == [DATASETS[name].seq_id]
 
 
 # --------------------------------------------------------------------------- read groups
