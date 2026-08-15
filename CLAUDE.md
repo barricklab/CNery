@@ -25,11 +25,15 @@ pre-generated coverage tables and never shell out to breseq. To produce such a t
 [pre-release breseq](https://github.com/barricklab/conda), not the bioconda release.
 
 **Tests.** Run from the repo root. `pyproject.toml` supplies `testpaths=["tests"]`,
-`pythonpath=["src"]`, and `addopts="-q --tb=short -m 'not authentic'"`, so tests import `CNery.core`
+`pythonpath=["src"]`, and `addopts="-q --tb=short"`, so tests import `CNery.core`
 with no install step and no `PYTHONPATH` fiddling.
 
+A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
+
 ```bash
-conda run -p $PWD/env pytest                    # 59 synthetic tests, ~10s
+conda run -p $PWD/env pytest                    # all 147; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 75, offline, ~10s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 72, real coverage tables
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
@@ -127,8 +131,10 @@ source of every output plot/CSV filename, so it must survive any transformation 
 
 ## Testing conventions
 
-The default suite is synthetic and offline. Tests that need real BAM/FASTA are marked `authentic`
-and **deselected by default** (see below) — so a plain `pytest` never touches the network.
+Both tiers run by default. Tests needing real coverage tables are marked `authentic`; everything
+else gets a `synthetic` marker applied automatically by `pytest_collection_modifyitems` in
+`tests/conftest.py`, so the two are exhaustive and mutually exclusive and a new test cannot escape
+both. Never hand-mark a test `synthetic`.
 
 Synthetic tests construct windowed DataFrames staged to match the column
 contract at each pipeline point — reuse the `tests/conftest.py` fixtures (`windowed_flat`,
@@ -153,14 +159,17 @@ verified against a sha256 pinned in `tests/data/registry.json`, and used only by
 `@pytest.mark.authentic`.
 
 ```bash
-conda run -p $PWD/env pytest -m authentic       # opt in; downloads on first run
-CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest -m authentic   # relocate the cache
+conda run -p $PWD/env pytest -m authentic       # this tier only
+CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest   # relocate the ~105 MB cache
 ```
 
-**Run this before pushing anything that changes pipeline numerics.** The default suite deselects
-these, so real-data coverage lapses silently otherwise. Also check the result says *passed*, not
-*skipped* — an unfetchable dataset skips (with the dataset, URL, and error in the reason) rather than
-failing, which keeps offline work possible but can look like success at a glance.
+Three datasets, differing where it matters — 0/1/2 read groups, 10/18/26 columns, and **4/7/10-line
+footers**. That last spread is deliberate: none is 4, so they are real regression coverage for the
+prefix-based footer stripping that replaced `skipfooter=4`.
+
+Check the result says *passed*, not *skipped* — an unfetchable dataset skips (with the dataset, URL,
+and error in the reason) rather than failing, which keeps offline work possible but can look like
+success at a glance.
 
 **Layout.** One release per dataset version, tagged `testdata-<name>-v<N>`, holding a single
 `<name>.tar.gz`. Adding or revising a dataset touches only its own registry entry — nothing else is

@@ -19,6 +19,20 @@
       "sha256": "b353c01858440a73f8c2867fab8336306a30f4cd8149e15249edc15d9e71353e",
       "bytes": 24311738,
       "description": "LTEE Ara+1 50k-generation coverage table against a circularly permuted REL606 reference; no BAM"
+    },
+    "ltee_ara_m3_32k_2rg": {
+      "tag": "testdata-ltee_ara_m3_32k_2rg-v1",
+      "file": "ltee_ara_m3_32k_2rg.tar.gz",
+      "sha256": "ff044aa3ea9f717a8e779828ed996478a129e5cdd6cbe7da1a0db9cb1d888002",
+      "bytes": 50755929,
+      "description": "LTEE Ara-3 32k generations, two read groups; 26-column table with a 10-line footer"
+    },
+    "ltee_ara_m3_38k": {
+      "tag": "testdata-ltee_ara_m3_38k-v1",
+      "file": "ltee_ara_m3_38k.tar.gz",
+      "sha256": "867e0cafc565c79a0e5ec2fa6ec915b5595addac917259e9fac750562f340fa6",
+      "bytes": 38729657,
+      "description": "LTEE Ara-3 38k generations, one read group; 18-column table with a 7-line footer"
     }
   }
 }

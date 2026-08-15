@@ -24,38 +24,45 @@ If you do need breseq for generating new test data, install it separately. See t
 Run pytest from the repository root. pyproject.toml supplies testpaths, pythonpath=["src"],
 and the default marker filter, so no install step or PYTHONPATH fiddling is needed.
 
-Run the default suite. Synthetic data only, never touches the network, a few seconds:
+Run everything. This is the default. On a cold cache it downloads ~105 MB of authentic
+datasets and takes about a minute; afterwards it is roughly a minute from cache:
 $ conda run -p $PWD/env pytest
+
+Run only the synthetic tier. Fast, offline, a few seconds -- the inner loop while editing:
+$ conda run -p $PWD/env pytest -m synthetic
+
+Run only the authentic tier:
+$ conda run -p $PWD/env pytest -m authentic
 
 Run one file, one test, or by name:
 $ conda run -p $PWD/env pytest tests/test_hmm.py
 $ conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 $ conda run -p $PWD/env pytest -k gc_correction
 
-Run the authentic-data tests. These download real datasets from GitHub Releases on first use
-(tens of megabytes), so they are deselected by default:
-$ conda run -p $PWD/env pytest -m authentic
-
-Run everything:
-$ conda run -p $PWD/env pytest -m ""
-
 === The Two Test Tiers ===
 
 The suite is split into two tiers, and which one a test belongs in is a deliberate choice.
+Both run by default; the markers exist to let you opt *out*, not in.
 
-DEFAULT TIER. Synthetic DataFrames built in tests/conftest.py. Fast, hermetic, no network.
-This is what runs on a bare `pytest`, and it must stay that way: a plain test run should never
-download anything or depend on an external service. Most tests belong here.
+SYNTHETIC TIER. DataFrames built in tests/conftest.py. Fast, hermetic, no network. Most tests
+belong here, and this tier must stay offline: `-m synthetic` should never download anything or
+depend on an external service.
 
-AUTHENTIC TIER. Real breseq coverage tables fetched from GitHub Releases, marked with
-@pytest.mark.authentic and deselected via addopts in pyproject.toml. Use this tier only when
+AUTHENTIC TIER. Real breseq coverage tables fetched from GitHub Releases. Use it only when
 synthetic data genuinely cannot exercise what you are testing -- real coordinate gaps, real
-repeat regions, real replication bias, the actual on-disk file schema.
+repeat regions, real per-read-group columns, the actual on-disk file schema.
 
-IMPORTANT: because the authentic tier is opt-in, it is easy for it to silently stop running.
-Run `pytest -m authentic` before pushing anything that changes pipeline numerics, and check
-the result says "passed" and not "skipped". An unfetchable dataset skips rather than fails, so
-that offline work stays possible, which means a skipped run can look like success at a glance.
+Tests are marked with @pytest.mark.authentic. You do NOT mark synthetic tests: conftest.py
+applies the `synthetic` marker automatically to anything not marked authentic, so the two
+markers stay exhaustive and mutually exclusive and a new test cannot land in neither tier.
+
+The default deliberately includes the authentic tier. An opt-in tier is one people forget, and
+real-data coverage then lapses silently. The cost is that a cold-cache run is slow, which is
+what `-m synthetic` is for.
+
+IMPORTANT: an unfetchable dataset skips rather than fails, so offline work stays possible.
+That means a default run without network access reports passes and skips together. Check for
+skips instead of reading green as proof everything ran.
 
 === Writing Tests in the Default Tier ===
 
@@ -117,6 +124,20 @@ published asset; publish a new version instead.
 
 Downloads are cached in pooch's cache directory. Set CNERY_TESTDATA_DIR to relocate it, for
 example to share one cache between checkouts or to keep large tables off a small disk.
+
+The published datasets, chosen to differ where it matters rather than to accumulate more of
+the same:
+
+  ltee_ara_p1_50k_shift   24 MB   0 read groups, 10 cols,  4-line footer, permuted reference
+  ltee_ara_m3_32k_2rg     48 MB   2 read groups, 26 cols, 10-line footer, CN up to 10
+  ltee_ara_m3_38k         37 MB   1 read group,  18 cols,  7-line footer, 108 kb CN=2 region
+
+The three footer lengths matter: none is 4, so together they are real regression coverage for
+the prefix-based footer stripping that replaced skipfooter=4. A fixed skip of four lines would
+silently delete 6 and 3 real data rows from the 32k and 38k tables respectively.
+
+When adding a dataset, prefer one that covers something none of the existing ones do. Another
+sample with the same shape costs download time and adds little.
 
 === Golden Files ===
 

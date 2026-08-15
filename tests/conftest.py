@@ -8,6 +8,18 @@ import pandas as pd
 from data._fetch import DatasetUnavailable, fetch_dataset, load_registry
 
 
+def pytest_collection_modifyitems(config, items):
+    """Mark everything not `authentic` as `synthetic`.
+
+    Applied automatically rather than by hand so the two markers stay exhaustive and mutually
+    exclusive by construction: a new test cannot end up in neither tier and quietly escape
+    both `-m synthetic` and `-m authentic`.
+    """
+    for item in items:
+        if item.get_closest_marker("authentic") is None:
+            item.add_marker(pytest.mark.synthetic)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--regenerate-goldens",
