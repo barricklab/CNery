@@ -169,6 +169,54 @@ def resolve_coverage_inputs(paths, file_endings=None):
     return resolved
 
 
+def parse_region(text):
+    """Parse a --region argument into (seq_id, start, end).
+
+    Accepts "SEQ_ID:START-END", and "START-END" without a sequence ID -- which is
+    only meaningful when the run has a single input sequence, checked by the caller,
+    which is the one place that knows what was resolved. Either coordinate may be
+    omitted for an open interval: "SEQ:100-" or "SEQ:-500". A missing coordinate is
+    returned as 0, meaning "the genome end on that side".
+
+    Raises ValueError with a message suitable for showing to the user.
+    """
+    seq_id = None
+    coords = text
+
+    # rsplit: the coordinate half never contains a colon, so this survives a
+    # sequence ID that does.
+    if ":" in text:
+        seq_id, coords = text.rsplit(":", 1)
+        if not seq_id:
+            raise ValueError(
+                f"invalid region {text!r}: no sequence ID before the ':'."
+            )
+
+    parts = coords.split("-")
+    if len(parts) != 2:
+        raise ValueError(
+            f"invalid region {text!r}: expected two coordinates separated by a "
+            "'-', as in 'REL606:3497890-3955678', '3497890-' or '-3955678'."
+        )
+
+    try:
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else 0
+    except ValueError:
+        raise ValueError(
+            f"invalid region {text!r}: both coordinates must be whole numbers."
+        )
+
+    if start < 0 or end < 0:
+        raise ValueError(f"invalid region {text!r}: coordinates cannot be negative.")
+    if start and end and start >= end:
+        raise ValueError(
+            f"invalid region {text!r}: the start coordinate must come before the end."
+        )
+
+    return seq_id, start, end
+
+
 def _detect_delimiter(path):
     """Tab or comma, decided by the header row rather than by the file name.
 
@@ -944,6 +992,17 @@ def plot_copy(df_cnv, pltstart, pltend, output):
         stidx =find_nearest(win_st,pltstart)
         endidx = find_nearest(win_end, pltend)
         df_plt = df_cnv.iloc[stidx:endidx]
+
+    # find_nearest() clamps rather than failing, so a region lying wholly outside this
+    # sequence collapses both ends onto the same window and slices to nothing. That
+    # used to surface as "cannot convert float NaN to integer" from the median below.
+    if df_plt.empty:
+        print(
+            f"WARNING: the requested region ({pltstart}-{pltend}) does not overlap "
+            f"{genome_id}, which spans {int(win_st.min())}-{int(win_end.max())}. "
+            "Plotting the whole sequence instead."
+        )
+        df_plt = df_cnv
 
     plt.figure(figsize=(10, 8))
 

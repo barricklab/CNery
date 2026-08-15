@@ -49,8 +49,8 @@ CNery coverage/ extra/pContig.coverage.csv -o CNV_out
 
 Folders are searched, top level only, for files ending in `coverage.csv`, `coverage.tsv` or
 `coverage.tab` — all three are found by default, and they may sit side by side. (`.tab` is the
-legacy extension breseq's deprecated `--table` flag writes; its contents are ordinary TSV.) Use `--file-ending` if your tables are named
-otherwise; repeat the flag to accept several. Note that any `--file-ending` **replaces** the defaults
+legacy extension breseq's deprecated `--table` flag writes; its contents are ordinary TSV.) Use
+`--file-ending` if your tables are named otherwise; repeat the flag to accept several. Note that any `--file-ending` **replaces** the defaults
 rather than adding to them:
 
 ```bash
@@ -76,13 +76,32 @@ Calculate coverage with a 500 bp window sliding in 250 bp steps; sequencing frag
 CNery <inputs> -o <output folder> -w 500 -s 250 -f 300
 ```
 
-Analyze coverage across the whole genome, but restrict CNV/coverage plots to a specific genomic segment:
+Analyze coverage across the whole genome, but restrict the CNV plot to a specific genomic segment:
 
 ```bash
-CNery <inputs> -o <output folder> --region 3497890-3955678 -w 1000 -s 500
+CNery <inputs> -o <output folder> --region REL606:3497890-3955678 -w 1000 -s 500
 ```
 
-The `--region` argument accepts open intervals too (`-reg 3497890-` from a start to end of genome, `-reg -3955678` from start of genome to an end position).
+The sequence ID is the one derived from the table's file name. `SEQ_ID:` may be omitted when the run
+has only one input sequence:
+
+```bash
+CNery REL606.coverage.csv -o CNV_out --region 3497890-3955678
+```
+
+Repeat the flag to plot several sequences, at most once each:
+
+```bash
+CNery coverage/ -o CNV_out --region REL606:3497890-3955678 --region pPlasmid:1-40000
+```
+
+Open intervals work too — `REL606:3497890-` runs to the end of that sequence, `REL606:-3955678` from
+its start.
+
+Two things to know. **Giving any `--region` also selects which sequences are plotted**: a sequence
+not named gets no CNV plot. And `--region` affects **plotting only** — coverage, bias fitting and
+copy-number calling always cover every sequence, and the output CSVs always contain every window for
+every sequence, plotted or not.
 
 Control which bias correction is applied before CN prediction:
 
@@ -264,8 +283,8 @@ Each coverage table produces its own set of outputs, named with the sequence ID 
 ```
 $ CNery -h
 
-usage: CNery [-h] [--file-ending ENDING] [-reg REG] [-o O] [-w W] [-s S]
-             [-f F] [-e E] [--bias {all,none,gc,otr}]
+usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
+             [-w W] [-s S] [-f F] [-e E] [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -285,10 +304,23 @@ options:
                         an input folder. Repeat the flag to accept more than
                         one. Any --file-ending REPLACES the defaults
                         ('coverage.csv', 'coverage.tsv', 'coverage.tab')
-                        rather than adding to them. A file named directly on the command line is
-                        always used, whatever it is called.
-  -reg REG              select the region of the genome to evaluate
-                        (format: START-END, e.g. 1000-50000).
+                        rather than adding to them. A file named directly on
+                        the command line is always used, whatever it is
+                        called.
+  --region SEQ_ID:START-END
+                        Plot the CNV calls for one sequence over a genomic
+                        segment, e.g. 'REL606:3497890-3955678'. The sequence
+                        ID is the one derived from the table's file name.
+                        Repeat the flag to plot several sequences, at most
+                        once each. 'SEQ_ID:' may be omitted when the run has
+                        only one input sequence. Open intervals are accepted:
+                        'REL606:3497890-' runs to the end of the sequence,
+                        'REL606:-3955678' from its start. Giving any --region
+                        also selects WHICH sequences are plotted: those not
+                        named get no CNV plot. This affects plotting only --
+                        coverage, bias fitting and copy-number calling always
+                        cover every sequence, and the output CSVs always
+                        contain every window.
   -o, --output O        output file prefix / storage location. Defaults to
                         the 'CNV_out' folder in the current dir.
   -w, --window W        Window length used to parse the genome and compute
@@ -296,10 +328,11 @@ options:
   -s, --step-size S     Step size (<= window size) for each progression of
                         the window across the genome. Set step-size = window
                         size for non-overlapping windows. Default: 100.
-  -f, --frag_size F     Average fragment size of the sequencing reads.
-                        Default: 500.
+  -f, --frag-size F     Average fragment size of the sequencing reads.
+                        Default: 150.
   -e, --error-rate E    Approximate error rate in sequencing read coverage /
-                        reference alignment. Default: 0.05.
+                        reference alignment. Widens the negative-binomial
+                        emission distributions in the HMM. Default: 0.15.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'
