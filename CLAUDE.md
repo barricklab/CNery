@@ -31,9 +31,9 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 147; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 75, offline, ~10s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 72, real coverage tables
+conda run -p $PWD/env pytest                    # all 159; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 78, offline, ~10s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 81, real coverage tables
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
@@ -68,16 +68,24 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 
 | Column | Written by | Meaning |
 | --- | --- | --- |
-| `read_count_cov` | `preprocess` | median unique coverage in the window |
+| `read_count_cov` | `preprocess` | median total (unique + redundant) coverage in the window |
 | `norm_raw_cov` | `preprocess` | `read_count_cov` / its median |
-| `gc_corr_norm_cov` | `gc_correction` | divided by the LOWESS fit at that window's GC |
-| `otr_gc_corr_norm_cov` | `otr_correction` | divided by the ori→ter ramp |
+| `pct_redundant` | `preprocess` | fraction of the window's bases overlapping repeat coverage |
+| `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
+| `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
+| `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
 | `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts |
 | `prob_copy_number` | `run_HMM` | Viterbi state |
 
 Supporting columns other stages depend on: `gc_cor_med_fil` (median filter of `gc_corr_norm_cov`;
-seeds the ori/ter guess in `otr_fit`) and `gc_corr_fact` / `otr_gc_corr_fact` (the divisors, retained
+seeds the ori/ter guess in `otr_fit`), `exclude_from_fit` / `censor_reason` (`is_deletion OR
+is_redundant`, and which one it was) and `gc_corr_fact` / `otr_gc_corr_fact` (the divisors, retained
 for the diagnostic plots).
+
+Each correction is split **fit / apply**, with a shared masking step in front:
+`mask_coverage_windows` → `fit_gc_bias` → `apply_gc_correction`, and
+`fit_otr_bias` → `apply_otr_correction`. The fit stages see only uncensored windows; the apply
+stages run over every window.
 
 Adding a stage means reading the previous column name and writing the next one.
 
@@ -85,26 +93,29 @@ Adding a stage means reading the previous column name and writing the next one.
 
 `get_CNV.py:212-265` implements the four modes by *renaming data into the column the next stage
 expects*, rather than by branching inside the correction functions. `run_HMM` unconditionally reads
-`otr_gc_corr_norm_cov`; `otr_correction` unconditionally reads `gc_corr_norm_cov`.
+`otr_gc_corr_norm_cov`; `fit_otr_bias` unconditionally reads `gc_corr_norm_cov`.
 
 - `all` — no aliasing; both corrections run in sequence.
 - `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely.
-- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `otr_correction` sees uncorrected input.
+- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input.
 - `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`.
 
 Any new bias mode is another aliasing branch here, not a new parameter threaded through `core.py`.
 
 Note that GC correction has *already run* by the time this dispatch executes — `process_multi_genome`
 does it unconditionally, and the `otr`/`none` branches discard the result by overwriting the column.
+That is also why `is_deletion` / `is_redundant` are present on the frame in all four modes:
+`mask_coverage_windows` runs as part of that unconditional GC stage.
 
 ### Multi-genome flow
 
-`process_multi_genome` (`core.py:379`) is the top of the pipeline and handles every record in the
+`process_multi_genome` (`core.py:481`) is the top of the pipeline and handles every record in the
 BAM/FASTA in one pass:
 
 1. Per FASTA record: `bam2cov_to_df` → `preprocess` → tag rows with `genome_id = <fasta header>`.
 2. **Pool all records into one frame**, renormalize `norm_raw_cov` against a single global median,
-   and run one shared LOWESS `gc_correction` across the pool.
+   and run one shared `mask_coverage_windows` → `fit_gc_bias` → `apply_gc_correction` across the
+   pool.
 3. Split back apart on `genome_id` and return `{header: df}`.
 
 GC bias is deliberately fitted globally across chromosome + plasmids + contigs (one pooled diagnostic
@@ -113,15 +124,29 @@ source of every output plot/CSV filename, so it must survive any transformation 
 
 ### Deliberate behavior that reads like a bug
 
-- `preprocess` (`core.py:182`) **discards any window overlapping redundant (repeat) coverage**. Window
-  ordinal is therefore not proportional to genomic coordinate, and the window count falls short of
-  `genome_len / step`.
-- `gc_correction` (`core.py:313`) excludes near-zero windows from the LOWESS fit and **freezes them at
-  exactly `0.0`** in the output, so real deletions still get called CN=0 rather than being divided
-  back up toward 1. Asserted directly in `tests/test_gc_correction.py` and `tests/test_regression.py`.
-- `otr_correction` (`core.py:866`) applies the OTR factor only where coverage exceeds 10% of the
-  median, for the same reason.
-- The HMM (`core.py:955-1067`) stacks a geometric zero-state row on top of one negative-binomial
+- `preprocess` (`core.py:147`) **keeps** every window overlapping redundant (repeat) coverage,
+  records the overlapping fraction as `pct_redundant`, and takes the window median over *total*
+  (unique + redundant) coverage so a repeat's real depth is reflected. Window ordinal is therefore
+  proportional to genomic coordinate. It does drop the **trailing partial window** at the genome
+  end, so the count is exactly `(genome_len - win) // step + 1` — a short final window would take
+  its median over fewer bases and would set the genome-end coordinate for the last CN segment and
+  for the terminus fallback in `apply_otr_correction`.
+- Censoring is one flag with three consumers. `mask_coverage_windows` (`core.py:337`) turns
+  `pct_redundant > 0` into `is_redundant`, which excludes the window from the GC LOWESS fit
+  (`fit_gc_bias`), from the OTR fit and its ori/ter peak-trough search (`fit_otr_bias`, `otr_fit`),
+  and from the Viterbi observation sequence and emission-model estimate (`run_HMM`). It is never
+  dropped from the frame: it still gets a bias-corrected coverage value and inherits
+  `prob_copy_number` from the segment it sits in. Leaving repeat windows in the HMM made pile-ups
+  invent their own high-CN segments and split genuine deletions in two — see
+  `TestCopyNumber::test_no_segment_starts_on_a_repeat_window` in `tests/test_authentic.py`.
+- `apply_gc_correction` (`core.py:448`) **freezes near-zero windows at exactly `0.0`**, so real
+  deletions still get called CN=0 rather than being divided back up toward 1. Note this applies to
+  `is_deletion` only, not `is_redundant` — the two censoring reasons are kept separate precisely
+  because they are treated differently here. Asserted directly in `tests/test_gc_correction.py`
+  and `tests/test_regression.py`.
+- `apply_otr_correction` (`core.py:767`) applies the OTR factor everywhere except `is_deletion`
+  windows, for the same reason.
+- The HMM (`core.py:920-1021`) stacks a geometric zero-state row on top of one negative-binomial
   emission row per copy number, so **state index == copy number** and the matrices are
   `n_states + 1` square/rows. The negative binomial (not Poisson) is intentional: coverage is
   overdispersed, and `run_HMM` nudges `var` above `mean` when a synthetic-flat input would otherwise
@@ -140,10 +165,15 @@ Synthetic tests construct windowed DataFrames staged to match the column
 contract at each pipeline point — reuse the `tests/conftest.py` fixtures (`windowed_flat`,
 `windowed_with_deletion`, `windowed_with_amplification`, `gc_corrected_flat`, `otr_corrected_flat`,
 `single_fasta`) rather than hand-rolling frames, so a change to the contract surfaces in one place.
+These fixtures deliberately carry **no** `pct_redundant` / `is_redundant` column, so they exercise
+the uncensored path; `run_HMM` falls back to using every window when the column is absent or when
+censoring would leave fewer than `min_called_windows`. Add the column explicitly when a test is
+about censoring behavior.
 
-Because the writers assume their output directories exist, any test that reaches `otr_correction`,
-`run_HMM`, or a plot function must `os.makedirs` the subdirs under `tmp_path` first — see
-`_ensure_dirs` in `tests/test_integration.py` and `tests/test_otr_correction.py`.
+Because the writers assume their output directories exist, any test that reaches
+`apply_otr_correction`, `run_HMM`, or a plot function must `os.makedirs` the subdirs under
+`tmp_path` first — see `_ensure_dirs` in `tests/test_integration.py` and
+`tests/test_otr_correction.py`.
 
 For anything touching the breseq subprocess, follow `tests/test_bam2cov_io.py`: patch
 `subprocess.run` with a side effect that writes a fake `.tab` file. Coverage tables are read by

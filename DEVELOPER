@@ -76,8 +76,12 @@ in one place instead of in every test:
   otr_corrected_flat      -- adds otr_gc_corr_norm_cov, otr_gc_corr_fact
   single_fasta            -- a one-record FASTA on disk
 
+None of these carry pct_redundant or is_redundant, so they exercise the uncensored path:
+run_HMM uses every window when the column is absent. Add it explicitly if your test is about
+how repeat-overlapping windows are censored from the fit and the Viterbi sequence.
+
 The writer functions assume their output subdirectories already exist. Any test reaching
-otr_correction, run_HMM, or a plot function must create CNV_plt/, CNV_csv/, GC_bias/ and
+apply_otr_correction, run_HMM, or a plot function must create CNV_plt/, CNV_csv/, GC_bias/ and
 OTR_corr/ under tmp_path first -- see _ensure_dirs in tests/test_integration.py.
 
 For anything invoking breseq, patch subprocess.run with a side effect that writes a fake

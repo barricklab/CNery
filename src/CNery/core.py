@@ -186,27 +186,38 @@ def preprocess(df, win=200, step=100, frag=350):
     # sliding window = win and increment size = step
     # summarizes GC% and median coverage
 
-    # Now every window in [i, i+win) is kept, using TOTAL coverage
+    # Every full-width window is kept, using TOTAL coverage
     # (unique + redundant) for its median -- so a repeat's real sequencing
     # depth is reflected instead of just the reads that happened to map
     # uniquely there -- and the fraction of redundant-covered bases in the
     # window is recorded as `pct_redundant`. Downstream,
-    # mask_coverage_windows() uses `pct_redundant` to exclude
-    # heavily-redundant windows from GC/OTR bias-model FITTING and from
-    # the origin/terminus peak-trough SEARCH (see otr_fit()) while still
-    # giving them a real, bias-corrected coverage value -- so they are not
-    # miscalled as deletions by the HMM.
+    # mask_coverage_windows() turns `pct_redundant` into `is_redundant`,
+    # which censors the window from GC/OTR bias-model FITTING, from the
+    # origin/terminus peak-trough SEARCH (see otr_fit()) and from the
+    # Viterbi observation sequence (see run_HMM()), while it still receives
+    # a real bias-corrected coverage value and inherits the copy number of
+    # the segment it sits in -- so a repeat neither invents an
+    # amplification nor breaks a genuine deletion in two.
     while (i <= (genome_len - 1)) and (lst_win < genome_len):
 
         win_full_cov = df_b2c["unique_cov"].iloc[i:(i + win)].to_numpy()
         win_redundant_cov = df_b2c["redundant"].iloc[i:(i + win)].to_numpy()
         cov_type = df_b2c["cov_type"].iloc[i:(i + win)].to_numpy()
 
-        winu = len(cov_type)  # bases actually available (== win, except a
-                               # possible shorter final window at genome end)
-        if winu == 0:
-            i = i + step
-            continue
+        winu = len(cov_type)  # bases actually available
+
+        # Only windows backed by the full `win` bases are emitted. A trailing
+        # partial window at the genome end would take its median over fewer
+        # bases, and its short `win_end` would set the genome-end coordinate
+        # used for the final CN segment and for the terminus fallback in
+        # apply_otr_correction() -- so it is dropped.
+        if winu < win:
+            # ...unless no full window fits at all, i.e. the reference is
+            # shorter than `win` (a small plasmid or contig). Then this
+            # partial window is all there is, and returning an empty frame
+            # would be worse than returning a short one.
+            if window or winu == 0:
+                break
 
         # Total coverage per base = unique + redundant, so a window
         # spanning a repeat is not under-counted just because some of its
@@ -1008,7 +1019,28 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
 
 
 def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
-            max_copy_number=100):
+            max_copy_number=100, min_called_windows=100):
+    """
+    Viterbi copy-number calling.
+
+    Windows flagged `is_redundant` by mask_coverage_windows() are censored
+    from the observation sequence and from the emission-model estimate:
+    coverage over a repeat reflects how many copies collapsed onto that
+    locus, not the sample's copy number there, so leaving them in both
+    inflates the variance -- pushing `n_states` up until pile-ups get their
+    own spurious high-CN segments -- and lets a single repeat window break a
+    genuine deletion in two.
+
+    They are not dropped from the frame. Each still carries its
+    bias-corrected coverage and inherits `prob_copy_number` from the segment
+    it falls in, and `is_redundant` is written to the CNV.csv alongside so an
+    inherited call can be told from a real one.
+
+    `min_called_windows` is a floor: if censoring would leave fewer windows
+    than this, every window is used instead. That keeps small references and
+    the synthetic test fixtures -- which carry no `is_redundant` column at
+    all -- behaving exactly as before.
+    """
 
     saveloc = os.path.join(output, "CNV_csv")
     genome_id = str(df["genome_id"].iloc[0])
@@ -1022,13 +1054,24 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
 
     rc_cap = int(max(1.0, max_copy_number) * med)
 
-    cor_rc = (
+    # Back-converted read counts are computed for EVERY window -- the column
+    # is part of the pipeline contract and feeds the diagnostic plots.
+    new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = (
         (new_exp["otr_gc_corr_norm_cov"] * med)
         .round()
         .astype(int)
         .clip(upper=rc_cap)
-        .tolist()
     )
+
+    if "is_redundant" in new_exp.columns:
+        called = ~new_exp["is_redundant"].to_numpy(dtype=bool)
+    else:
+        called = np.ones(len(new_exp), dtype=bool)
+    if called.sum() < min_called_windows:
+        called = np.ones(len(new_exp), dtype=bool)
+
+    obs_exp = new_exp.loc[called]
+    cor_rc = obs_exp["otr_gc_corr_rdcnt_cov"].tolist()
 
     mean = np.mean(cor_rc)
     var = np.var(cor_rc)
@@ -1036,9 +1079,7 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
     if mean > 0 and var <= mean:
         var = mean * (1.0 + 1e-3)
 
-    new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = cor_rc
-
-    cov_max = int(np.nan_to_num(new_exp["otr_gc_corr_norm_cov"].max()))
+    cov_max = int(np.nan_to_num(obs_exp["otr_gc_corr_norm_cov"].max()))
     n_states = min(max(cov_max, 5), int(max_copy_number))
 
     rc_max = int(np.max(cor_rc))
@@ -1055,12 +1096,16 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         remain_prob=(1 - changeprob),
     )
 
+    # HMM_copy_number indexes win_st/win_end positionally, so the censored
+    # subset can be passed straight through. chr_length stays the genome end
+    # over ALL windows -- the last segment must reach it even if the final
+    # window is censored.
     copy_numbers = HMM_copy_number(
         cor_rc,
         this_transition,
         this_emission,
-        new_exp["win_st"],
-        new_exp["win_end"],
+        obs_exp["win_st"],
+        obs_exp["win_end"],
         new_exp["win_end"].max(),
     )
 
@@ -1070,29 +1115,22 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
     cn_brk = cn_brk.drop(columns="Endpos")
     cn_brk.to_csv(brk_full_path, index=False)
 
-    CN_HMM = []
+    # Assign by window index rather than by appending to a flat list: once
+    # censored windows are absent from the observation sequence a segment can
+    # span windows that never voted for it, so the old
+    # len(CN_HMM) == len(new_exp) invariant no longer holds.
+    CN_HMM = pd.Series(np.nan, index=new_exp.index, dtype=float)
 
-    for cnrow in range(len(copy_numbers)):
-        state = int(copy_numbers["State"].iloc[cnrow])
-        hmmstart = int(copy_numbers["Startpos"].iloc[cnrow])
-        hmmend = int(copy_numbers["Endpos"].iloc[cnrow])
+    for cnrow in copy_numbers.itertuples():
+        in_segment = (
+            (new_exp["win_st"] >= int(cnrow.Startpos))
+            & (new_exp["win_st"] < int(cnrow.Endpos))
+        )
+        CN_HMM[in_segment] = int(cnrow.State)
 
-        idx_list = new_exp.loc[
-            (hmmstart <= new_exp["win_st"]) & (new_exp["win_st"] <= hmmend)
-        ].index
-
-        if len(idx_list) == 0:
-            continue
-
-        CN_HMM_row = []
-        for idx in idx_list:
-            row = new_exp.loc[idx]
-            if (row["win_st"] >= hmmstart) and (row["win_end"] <= hmmend):
-                CN_HMM_row.append(state)
-
-        CN_HMM.extend(CN_HMM_row)
-
-    new_exp.loc[:, "prob_copy_number"] = CN_HMM
+    # Windows on a segment boundary can fall outside every half-open interval;
+    # carry the neighbouring call across rather than leaving a hole.
+    new_exp.loc[:, "prob_copy_number"] = CN_HMM.ffill().bfill().astype(int)
 
     csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
 

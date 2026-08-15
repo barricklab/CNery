@@ -37,8 +37,9 @@ import pytest
 
 from CNery.core import (
     _read_coverage_tab,
+    apply_otr_correction,
     coverage_table_path,
-    otr_correction,
+    fit_otr_bias,
     parse_fasta_records,
     preprocess,
     process_multi_genome,
@@ -108,7 +109,10 @@ def pipeline(dataset_dir, tmp_path_factory):
         coverage_dir=str(path),
     )
     df_gc = per_genome[spec.seq_id]
-    df_otr, ori, ter = otr_correction(df_gc, str(out))
+    # otr_correction(df, out) was split into fit_otr_bias() + apply_otr_correction().
+    # df_gc already carries is_deletion/is_redundant from the mask_coverage_windows()
+    # call inside process_multi_genome()'s GC stage, so fit_otr_bias() reuses them.
+    df_otr, ori, ter = apply_otr_correction(fit_otr_bias(df_gc, str(out)), str(out))
     df_cnv = run_HMM(df_otr, str(out))
     return {"name": name, "spec": spec, "out": out,
             "gc": df_gc, "otr": df_otr, "cnv": df_cnv}
@@ -259,9 +263,19 @@ class TestPipelineShape:
         assert np.isfinite(values).all()
         assert (values >= 0).all()
 
-    def test_windows_fall_short_of_the_naive_count(self, pipeline):
-        # Every dataset has real repeat coverage, so preprocess drops overlapping windows.
-        assert len(pipeline["gc"]) < GENOME_LEN // STEP
+    def test_window_count_is_stable(self, pipeline):
+        # preprocess() keeps every repeat-overlapping window (flagging pct_redundant
+        # instead of dropping it) and emits only full-width windows, so the count is
+        # exactly the number of `win`-wide windows that fit at stride `step`.
+        assert len(pipeline["gc"]) == (GENOME_LEN - WIN) // STEP + 1 == 9258
+
+    def test_repeat_windows_are_retained_and_flagged(self, pipeline):
+        # All three references have known repeat content; the windows over it must be
+        # present in the frame, not dropped, and carry a nonzero pct_redundant.
+        df = pipeline["gc"]
+        assert "pct_redundant" in df.columns
+        assert (df["pct_redundant"] > 0).any()
+        assert df["is_redundant"].equals(df["pct_redundant"] > 0)
 
     def test_gc_correction_does_not_resurrect_deletions(self, pipeline):
         df = pipeline["gc"]
@@ -277,11 +291,12 @@ class TestPipelineShape:
 class TestOriginTerminus:
     """Records that OTR correction fires on none of the three datasets.
 
-    otr_fit requires the origin/terminus seed to be 35-65% of the genome apart
-    (core.py:523). Measured separations: 6.0% (p1_50k_shift), 31.7% (m3_32k_2rg) and 33.3%
-    (m3_38k). REL606's true origin and terminus are roughly antipodal, so ~50% is expected;
-    two independent samples landing at 31-33% suggests the median-filter seed compresses the
-    separation rather than three unlucky datasets.
+    otr_fit requires the median-filter seed to place origin and terminus 35-65% of the
+    genome apart, measured as a circular distance (`separation_ok`, core.py:679). Measured
+    separations: 30.6% (p1_50k_shift), 31.2% (m3_32k_2rg) and 32.7% (m3_38k) -- all just
+    under the floor. REL606's true origin and terminus are roughly antipodal, so ~50% is
+    expected; three independent samples landing at 30-33% points at the seed compressing
+    the separation rather than at three unlucky datasets.
 
     These assertions fail if detection starts OR stops happening -- either is a real change
     worth noticing while this area is under development.
@@ -342,6 +357,30 @@ class TestCopyNumber:
         calls = pipeline["cnv"]["prob_copy_number"]
         assert calls.mode().iloc[0] == 1
         assert (calls == 1).mean() > 0.8
+
+    def test_no_segment_starts_on_a_repeat_window(self, pipeline):
+        """Repeat pile-ups must not invent breakpoints.
+
+        Coverage over a repeat reflects how many copies collapsed onto that locus,
+        not the sample's copy number there. Before run_HMM() censored `is_redundant`
+        windows from the observation sequence, those windows both invented
+        high-CN segments of their own (State 5-10 on all three datasets) and split
+        genuine deletions in two. Segment starts come from the win_st of windows
+        that were actually observed, so a redundant window can no longer be one.
+        """
+        df = pipeline["cnv"]
+        redundant_starts = set(df.loc[df["is_redundant"], "win_st"])
+        produced = pd.read_csv(_produced(pipeline, "CNV_csv", "_break_pts.csv"))
+        # The first segment starts at 0, which is a coordinate rather than a window.
+        offenders = sorted(set(produced["Startpos"][1:]) & redundant_starts)
+        assert not offenders, f"segments start on repeat windows: {offenders}"
+
+    def test_repeat_windows_inherit_a_call(self, pipeline):
+        # Censored from the fit, but not left uncalled -- every window keeps an
+        # integer copy number so the CNV.csv stays complete.
+        df = pipeline["cnv"]
+        assert df["is_redundant"].any()
+        assert not df.loc[df["is_redundant"], "prob_copy_number"].isna().any()
 
     def test_deletions_and_amplifications_are_called(self, pipeline):
         states = set(pipeline["cnv"]["prob_copy_number"].unique())
