@@ -36,7 +36,7 @@ import pandas as pd
 import pytest
 
 from CNery.core import (
-    _read_coverage_tab,
+    _read_coverage_table,
     apply_otr_correction,
     coverage_table_path,
     fit_otr_bias,
@@ -90,7 +90,7 @@ def dataset_dir(request):
 @pytest.fixture(scope="session")
 def raw_table(dataset_dir):
     name, path = dataset_dir
-    return name, _read_coverage_tab(coverage_table_path(str(path), DATASETS[name].seq_id))
+    return name, _read_coverage_table(coverage_table_path(str(path), DATASETS[name].seq_id))
 
 
 @pytest.fixture(scope="session")

@@ -11,25 +11,29 @@ import pytest
 
 from CNery.core import (
     COVERAGE_TABLE_SUFFIX,
-    DEFAULT_FILE_ENDING,
+    DEFAULT_FILE_ENDINGS,
     coverage_table_path,
     genome_id_from_path,
     process_multi_genome,
     resolve_coverage_inputs,
 )
 
-HEADER = (
-    "position\tref_base\tunique_top_cov\tunique_bot_cov"
-    "\tredundant_top_cov\tredundant_bot_cov"
-)
+COLUMNS = [
+    "position", "ref_base",
+    "unique_top_cov", "unique_bot_cov",
+    "redundant_top_cov", "redundant_bot_cov",
+]
 
 
-def _write_table(path, seq, cov=25):
-    rows = "\n".join(
-        f"{i + 1}\t{base}\t{cov}\t{cov}\t0\t0" for i, base in enumerate(seq)
-    )
-    footer = f"#\tnumber_of_positions\t{len(seq)}\n"
-    path.write_text(HEADER + "\n" + rows + "\n" + footer)
+def _write_table(path, seq, cov=25, d="\t"):
+    """A coverage table, delimited by `d` throughout -- header, data and footer."""
+    lines = [d.join(COLUMNS)]
+    lines += [
+        d.join(str(v) for v in (i + 1, base, cov, cov, 0, 0))
+        for i, base in enumerate(seq)
+    ]
+    lines.append(d.join(("#", "number_of_positions", str(len(seq)))))
+    path.write_text("\n".join(lines) + "\n")
     return path
 
 
@@ -57,7 +61,8 @@ class TestCoverageTablePath:
         assert ":" not in os.path.basename(coverage_table_path("/cov", "REL606"))
 
     def test_suffix_tracks_the_default_ending(self):
-        assert COVERAGE_TABLE_SUFFIX == "." + DEFAULT_FILE_ENDING
+        assert COVERAGE_TABLE_SUFFIX == ".coverage.tsv"
+        assert "coverage.tsv" in DEFAULT_FILE_ENDINGS
 
 
 class TestGenomeIdFromPath:
@@ -93,6 +98,44 @@ class TestGenomeIdFromPath:
     def test_name_that_is_only_the_ending(self):
         # No "." in front of the ending to remove, so fall back to the extension rule.
         assert genome_id_from_path("/cov/coverage.tsv") == "coverage"
+
+    def test_csv_ending_is_stripped_too(self):
+        assert genome_id_from_path("/cov/REL606.coverage.csv") == "REL606"
+
+    def test_csv_interior_dots_are_kept(self):
+        assert genome_id_from_path("/cov/my.sample.1.coverage.csv") == "my.sample.1"
+
+
+class TestBothFormatsAreDefaults:
+    """CSV and TSV are found without being asked for; they differ only in delimiter."""
+
+    def test_csv_is_picked_up_by_default(self, tmp_path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        _write_table(d / "chrA.coverage.csv", "ACGT" * 10, d=",")
+        assert list(resolve_coverage_inputs([str(d)])) == ["chrA"]
+
+    def test_a_folder_may_mix_the_two(self, tmp_path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        _write_table(d / "chrA.coverage.csv", "ACGT" * 10, d=",")
+        _write_table(d / "chrB.coverage.tsv", "GGCC" * 10, d="\t")
+        assert set(resolve_coverage_inputs([str(d)])) == {"chrA", "chrB"}
+
+    def test_same_sequence_in_both_formats_is_ambiguous(self, tmp_path):
+        # Both resolve to the same sequence ID. They could disagree -- different BAMs,
+        # different windowing -- so refuse rather than silently picking one.
+        d = tmp_path / "dir"
+        d.mkdir()
+        _write_table(d / "REL606.coverage.csv", "ACGT" * 10, d=",")
+        _write_table(d / "REL606.coverage.tsv", "GGCC" * 10, d="\t")
+
+        with pytest.raises(ValueError) as excinfo:
+            resolve_coverage_inputs([str(d)])
+        message = str(excinfo.value)
+        assert "REL606" in message
+        assert "REL606.coverage.csv" in message
+        assert "REL606.coverage.tsv" in message
 
 
 class TestResolveCoverageInputs:
@@ -190,7 +233,8 @@ class TestInputErrors:
             resolve_coverage_inputs([str(d)])
         message = str(excinfo.value)
         assert str(d) in message
-        assert DEFAULT_FILE_ENDING in message
+        for ending in DEFAULT_FILE_ENDINGS:
+            assert ending in message
 
     def test_duplicate_genome_id_names_both_paths(self, tmp_path):
         a = tmp_path / "runA"

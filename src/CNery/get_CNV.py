@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .core import (
-    DEFAULT_FILE_ENDING,
+    DEFAULT_FILE_ENDINGS,
     process_multi_genome,
     resolve_coverage_inputs,
     fit_otr_bias,
@@ -26,7 +26,7 @@ def main():
             "variation (CNV)"
         ),
         epilog=textwrap.dedent(
-            "Inputs are breseq 'bam2cov --format TSV' coverage tables. Run with no "
+            "Inputs are breseq 'bam2cov' coverage tables (CSV or TSV). Run with no "
             "arguments in a folder that holds them, or name files and/or folders "
             "directly. \n"
         ),
@@ -55,9 +55,10 @@ def main():
         help=(
             "File ending that identifies a coverage table inside an input folder. "
             "Repeat the flag to accept more than one. Any --file-ending REPLACES "
-            f"the default ('{DEFAULT_FILE_ENDING}') rather than adding to it. "
-            "A file named directly on the command line is always used, whatever "
-            "it is called."
+            "the defaults ("
+            + ", ".join(f"'{e}'" for e in DEFAULT_FILE_ENDINGS)
+            + ") rather than adding to them. A file named directly on the command "
+            "line is always used, whatever it is called."
         ),
     )
 

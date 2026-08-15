@@ -85,6 +85,8 @@ OTR_corr/ under tmp_path first -- see _ensure_dirs in tests/test_integration.py.
 
 Nothing mocks a subprocess: CNery never runs breseq. A test that needs a coverage table
 writes one -- see _write_table in tests/test_inputs.py or tests/test_coverage_table_io.py.
+Those helpers take a delimiter argument, because bam2cov's CSV and TSV output differ only
+in that separator; tests that care about format parametrize over both.
 Do not assume a fixed footer length: breseq writes four commented summary lines by default,
 one more under --show-average, three per read group, and none at all in its own
 08_mutation_identification output. TestFooterHandling in tests/test_coverage_table_io.py

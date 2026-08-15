@@ -4,8 +4,9 @@
 
 Recent updates (latest commits):
 
-- **Coverage tables are the only input** — `CNery` reads *breseq* `bam2cov --format TSV` coverage tables and nothing else. It no longer needs a BAM or a reference FASTA, and never runs `breseq` itself. The reference sequence it needs for GC content is already in the table's own `ref_base` column.
-- **Files and folders on the command line** — name coverage tables directly, or name folders and let `CNery` find them by file ending (`--file-ending`, default `coverage.tsv`). Files and folders can be mixed in one command.
+- **Coverage tables are the only input** — `CNery` reads *breseq* `bam2cov` coverage tables and nothing else. It no longer needs a BAM or a reference FASTA, and never runs `breseq` itself. The reference sequence it needs for GC content is already in the table's own `ref_base` column.
+- **CSV or TSV, full or `--total-only`** — all four shapes of table are read without being declared. The delimiter is detected from the file's own header row, and the column schema from its column names. `--total-only` tables are the recommended input: they carry three coverage columns instead of eight, so they are markedly smaller, and CNery loses nothing by using them.
+- **Files and folders on the command line** — name coverage tables directly, or name folders and let `CNery` find them by file ending (`--file-ending`, defaults `coverage.csv`, `coverage.tsv` and `coverage.tab`). Files and folders can be mixed in one command.
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
 - **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
@@ -42,21 +43,23 @@ Run with no arguments at all and it reads the current folder. You can also name 
 mix files and folders in one command:
 
 ```bash
-CNery REL606.coverage.tsv pPlasmid.coverage.tsv -o CNV_out
-CNery coverage/ extra/pContig.coverage.tsv -o CNV_out
+CNery REL606.coverage.csv pPlasmid.coverage.csv -o CNV_out
+CNery coverage/ extra/pContig.coverage.csv -o CNV_out
 ```
 
-Folders are searched, top level only, for files ending in `coverage.tsv`. Use `--file-ending` if your
-tables are named otherwise; repeat the flag to accept several. Note that any `--file-ending`
-**replaces** the default rather than adding to it:
+Folders are searched, top level only, for files ending in `coverage.csv`, `coverage.tsv` or
+`coverage.tab` — all three are found by default, and they may sit side by side. (`.tab` is the
+legacy extension breseq's deprecated `--table` flag writes; its contents are ordinary TSV.) Use `--file-ending` if your tables are named
+otherwise; repeat the flag to accept several. Note that any `--file-ending` **replaces** the defaults
+rather than adding to them:
 
 ```bash
 CNery coverage/ --file-ending cov.txt
-CNery coverage/ --file-ending cov.txt --file-ending coverage.tsv
+CNery coverage/ --file-ending cov.txt --file-ending coverage.csv
 ```
 
 A table's sequence ID comes from its file name, with the matched ending and the `.` in front of it
-removed — `REL606.coverage.tsv` becomes `REL606`, and `NC_012967.1.coverage.tsv` becomes
+removed — `REL606.coverage.csv` becomes `REL606`, and `NC_012967.1.coverage.tsv` becomes
 `NC_012967.1`. That ID names every output file, and no two inputs may share one.
 
 **Everything passed in one command is analyzed together**, sharing a single GC-bias fit and one
@@ -108,12 +111,13 @@ against them as often as you like — no BAM, no reference FASTA, and `breseq` n
 on the machine that runs `CNery`. The reference sequence `CNery` needs for GC content is already in
 each table's `ref_base` column.
 
-The conventional layout is one table per reference sequence, named `<seq_id>.coverage.tsv`:
+The conventional layout is one table per reference sequence, named `<seq_id>.coverage.csv` (or
+`.coverage.tsv` — both are found by default):
 
 ```
 coverage/
-├── REL606.coverage.tsv
-└── pPlasmid.coverage.tsv
+├── REL606.coverage.csv
+└── pPlasmid.coverage.csv
 ```
 
 ```bash
@@ -134,7 +138,8 @@ up sequence IDs or lengths. `--output` is then a directory:
 ```bash
 mkdir -p coverage
 breseq bam2cov \
-  --format TSV \
+  --format CSV \
+  --total-only \
   --resolution 0 \
   --output coverage \
   -b data/reference.bam \
@@ -142,25 +147,33 @@ breseq bam2cov \
 ```
 
 To generate a single table instead, name the region using the sequence ID exactly as it appears in
-the FASTA, and give `--output` a name ending in `.coverage.tsv`:
+the FASTA, and give `--output` a name ending in `.coverage.csv`:
 
 ```bash
 breseq bam2cov \
-  --format TSV \
+  --format CSV \
+  --total-only \
   --region REL606:1-4629812 \
   --resolution 0 \
-  --output coverage/REL606.coverage.tsv \
+  --output coverage/REL606.coverage.csv \
   -b data/reference.bam \
   -f data/reference.fasta
 ```
 
-Three options matter:
+Four options matter:
 
 - **`--resolution 0`** outputs every position. The default is 600, which samples only 600 points
   across the whole region — far too sparse for windowed coverage, and it fails silently by producing
   a well-formed but nearly empty table.
-- **`--format TSV`** produces a tab-separated table instead of a plot. (`-t` is accepted as a
-  shorthand for the same thing.)
+- **`--format CSV`** produces a comma-separated table instead of a plot; `TSV` gives the same
+  columns tab-separated. `CNery` reads either and works out which from the file itself, so the
+  choice is yours. (The old `-t` / `--table` flag is **deprecated**: it still selects TSV, but writes
+  the legacy `.tab` extension. `CNery` matches that too, but prefer `--format TSV`.)
+- **`--total-only`** (short flag `-1`) writes `unique_cov`, `redundant_cov` and `total_cov` in place
+  of the eight strand-split coverage columns — roughly 2.5× smaller files. `breseq` sums the strands
+  itself, and those sums are exactly what `CNery` computes from the wider table, so **nothing CNery
+  uses is lost**: repeat detection via `redundant_cov` still works, and copy-number calls are
+  unchanged. Recommended.
 - **`--per-read-group`** *(optional)* repeats every coverage column once per read group (`@RG`) in
   the BAM, prefixed `RG-<n>_` where `<n>` is the read group's index in the BAM header. Requires a
   table format; it is rejected with `--format PNG`. A BAM with no read groups yields a single `RG-0`
@@ -168,7 +181,8 @@ Three options matter:
 
 ```bash
 breseq bam2cov \
-  --format TSV \
+  --format CSV \
+  --total-only \
   --per-read-group \
   --resolution 0 \
   --output coverage \
@@ -184,18 +198,28 @@ per-read-group columns today — they pass through — so the option is safe to 
 per-library coverage available in the same file for other tools.
 
 The output carries a header row, one row per reference position, and a trailing `#`-commented summary
-block:
+block. With `--total-only --format CSV`:
+
+```
+position,ref_base,unique_cov,redundant_cov,total_cov
+1,G,32,0,32
+2,G,32,0,32
+...
+#,region_unique_average_cov,56.7267
+#,region_repeat_average_cov,0
+#,region_average_cov,56.7267
+#,number_of_positions,4629812
+```
+
+Without `--total-only`, each count is split by strand and six further columns follow:
 
 ```
 position	ref_base	unique_top_cov	unique_bot_cov	redundant_top_cov	redundant_bot_cov	...
 1	G	14	18	0	0	...
-2	G	14	18	0	0	...
-...
-#	region_unique_average_cov	56.7267
-#	region_repeat_average_cov	0
-#	region_average_cov	56.7267
-#	number_of_positions	4629812
 ```
+
+The delimiter is the only difference between `--format CSV` and `--format TSV`; it is used for the
+header, the data and the footer alike.
 
 That summary block is variable in length — `--show-average` adds a line, and `--per-read-group` adds
 three per group (`#	RG-0_region_unique_average_cov	…`) — so anything parsing these tables should
@@ -205,11 +229,12 @@ For the same reason, do not assume a fixed column count: `position` must be the 
 named coverage columns must be present, but extra columns to the right are expected and should be
 ignored rather than treated as an error.
 
-`CNery` reads six of these columns — `position`, `ref_base`, and the four `unique_*`/`redundant_*`
-coverage columns — and checks for them as soon as a table is opened, so a file with the wrong schema
-is rejected by name instead of failing later. Note that *breseq*'s own
-`08_mutation_identification/*.coverage.tab` files use a **different** schema (position last, no
-`ref_base`) and are not usable as `CNery` input.
+`CNery` needs `position`, `ref_base`, and unique-versus-redundant coverage in one of the two shapes
+above — `unique_cov` + `redundant_cov`, or the four strand-split `unique_*`/`redundant_*` columns. It
+checks for them as soon as a table is opened, so a file with the wrong schema is rejected by name
+instead of failing later. `total_cov` is ignored: it is `unique_cov + redundant_cov` by construction.
+Note that *breseq*'s own `08_mutation_identification/*.coverage.tab` files use a **different** schema
+(position last, no `ref_base`) and are not usable as `CNery` input.
 
 If you do need the sequence IDs and lengths for a `--region` argument, read them from the FASTA
 headers or the `.fai` index:
@@ -258,10 +283,10 @@ options:
   -h, --help            show this help message and exit
   --file-ending ENDING  File ending that identifies a coverage table inside
                         an input folder. Repeat the flag to accept more than
-                        one. Any --file-ending REPLACES the default
-                        ('coverage.tsv') rather than adding to it. A file
-                        named directly on the command line is always used,
-                        whatever it is called.
+                        one. Any --file-ending REPLACES the defaults
+                        ('coverage.csv', 'coverage.tsv', 'coverage.tab')
+                        rather than adding to them. A file named directly on the command line is
+                        always used, whatever it is called.
   -reg REG              select the region of the genome to evaluate
                         (format: START-END, e.g. 1000-50000).
   -o, --output O        output file prefix / storage location. Defaults to
@@ -281,7 +306,7 @@ options:
                         applies only that one, 'none' skips bias correction.
                         Default: all.
 
-Inputs are breseq 'bam2cov --format TSV' coverage tables. Run with no
+Inputs are breseq 'bam2cov' coverage tables (CSV or TSV). Run with no
 arguments in a folder that holds them, or name files and/or folders directly.
 ```
 

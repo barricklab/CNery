@@ -17,23 +17,33 @@ from scipy.special import  gammaln
 from itertools import cycle, islice
 
 
-DEFAULT_FILE_ENDING = "coverage.tsv"
+# breseq bam2cov writes either CSV or TSV; both are picked up without being asked for,
+# since the two differ only in their delimiter and CNery detects that from the file itself.
+# ".coverage.tab" is the same TSV content under the legacy extension that the deprecated
+# --table (-t) flag still writes, so it is accepted too.
+DEFAULT_FILE_ENDINGS = ("coverage.csv", "coverage.tsv", "coverage.tab")
 
-COVERAGE_TABLE_SUFFIX = "." + DEFAULT_FILE_ENDING
+COVERAGE_TABLE_SUFFIX = ".coverage.tsv"
 
-# The columns preprocess() actually reads out of a coverage table. `ref_base` is the one
-# that matters most: it carries the reference sequence, which is where GC content comes
-# from -- CNery never reads a FASTA.
-REQUIRED_COVERAGE_COLUMNS = (
-    "ref_base",
+# Every coverage table carries these two, whichever coverage schema it uses. `ref_base` is
+# the one that matters most: it holds the reference sequence, which is where GC content
+# comes from -- CNery never reads a FASTA.
+BASE_COVERAGE_COLUMNS = ("ref_base",)
+
+# The two coverage schemas bam2cov emits. Plain output splits each count by strand;
+# --total-only sums the strands in C++ and writes the pair CNery actually wants, plus a
+# `total_cov` that is just their sum. Both reduce to the same two canonical columns, so
+# --total-only loses nothing CNery uses -- see normalize_coverage_columns().
+STRAND_SPLIT_COLUMNS = (
     "unique_top_cov",
     "unique_bot_cov",
     "redundant_top_cov",
     "redundant_bot_cov",
 )
+TOTAL_ONLY_COLUMNS = ("unique_cov", "redundant_cov")
 
 
-def coverage_table_path(coverage_dir, seq_id):
+def coverage_table_path(coverage_dir, seq_id, suffix=COVERAGE_TABLE_SUFFIX):
     """Path of the coverage table for `seq_id` inside `coverage_dir`.
 
     Named for the sequence ID alone -- no coordinates. breseq's default no-region output
@@ -41,7 +51,7 @@ def coverage_table_path(coverage_dir, seq_id):
     looks for and, more importantly, contains a colon: illegal in filenames on Windows and
     displayed as "/" by the macOS Finder.
     """
-    return os.path.join(coverage_dir, f"{seq_id}{COVERAGE_TABLE_SUFFIX}")
+    return os.path.join(coverage_dir, f"{seq_id}{suffix}")
 
 
 def normalize_file_endings(file_endings=None):
@@ -51,7 +61,7 @@ def normalize_file_endings(file_endings=None):
     through: supplying --file-ending REPLACES the default rather than adding to it.
     """
     if file_endings is None:
-        file_endings = [DEFAULT_FILE_ENDING]
+        file_endings = list(DEFAULT_FILE_ENDINGS)
     if isinstance(file_endings, str):
         file_endings = [file_endings]
     return [str(e).lstrip(".") for e in file_endings if str(e).strip()]
@@ -159,44 +169,112 @@ def resolve_coverage_inputs(paths, file_endings=None):
     return resolved
 
 
-def _read_coverage_tab(path):
+def _detect_delimiter(path):
+    """Tab or comma, decided by the header row rather than by the file name.
+
+    bam2cov's CSV and TSV output differ only in this separator, so the format is a
+    property of the bytes and not of the extension. Detecting it from the content means a
+    file named directly on the command line works whatever it is called, and a
+    comma-delimited table someone saved as ".tsv" still reads correctly.
+
+    csv.Sniffer is deliberately not used: it guesses from a sample and misfires on
+    single-column input, where it may pick a character out of the data itself.
+    """
+    with open(path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            tabs = line.count("\t")
+            commas = line.count(",")
+            if tabs > commas:
+                return "\t"
+            if commas > tabs:
+                return ","
+            raise ValueError(
+                f"Cannot tell whether {path} is tab- or comma-separated: its header row "
+                f"has {tabs} tab(s) and {commas} comma(s). Expected a breseq "
+                "'bam2cov --format TSV' or '--format CSV' coverage table."
+            )
+
+    raise ValueError(f"{path} has no header row -- it is empty, or entirely comments.")
+
+
+def _read_coverage_table(path):
     """Read a breseq coverage table, dropping its commented summary block.
 
-    The trailing '#' block is variable-length: this replaces silently
-    deleted four real data rows from any footerless input.
+    The trailing '#' block is variable-length: this replaces a fixed skipfooter=4, which
+    silently deleted four real data rows from any footerless input. The block is written
+    with the same delimiter as the data, so it is stripped by its '#' prefix in CSV
+    exactly as in TSV.
     """
     return pd.read_csv(
         path,
-        sep="\t",
+        sep=_detect_delimiter(path),
         header=0,
         index_col=0,
         comment="#",
     )
 
 
+def normalize_coverage_columns(df, path=None):
+    """Reduce either bam2cov coverage schema to the canonical `unique_cov`/`redundant` pair.
+
+    Plain bam2cov output splits each count by strand; `--total-only` sums the strands
+    itself and writes `unique_cov`, `redundant_cov` and `total_cov`. Those first two are
+    exactly the sums CNery would compute anyway, so the narrower table costs nothing:
+    `pct_redundant`, repeat censoring and the window median all behave identically.
+    `total_cov` is ignored -- it is `unique_cov + redundant_cov` by construction.
+
+    Idempotent, so it is safe to call both when a table is read and again in preprocess(),
+    which lets preprocess() keep working on a raw frame handed to it directly.
+    """
+    where = f"{path}: " if path else ""
+
+    missing_base = [c for c in BASE_COVERAGE_COLUMNS if c not in df.columns]
+    have_total_only = all(c in df.columns for c in TOTAL_ONLY_COLUMNS)
+    have_strand_split = all(c in df.columns for c in STRAND_SPLIT_COLUMNS)
+
+    if missing_base or not (have_total_only or have_strand_split):
+        raise ValueError(
+            f"{where}not a usable coverage table. Missing "
+            + ", ".join(missing_base + ([] if (have_total_only or have_strand_split)
+                                        else ["coverage columns"]))
+            + ". Expected a breseq 'bam2cov' table whose first column is the position, "
+            "carrying "
+            + ", ".join(BASE_COVERAGE_COLUMNS)
+            + " plus either "
+            + ", ".join(STRAND_SPLIT_COLUMNS)
+            + " or, with --total-only, "
+            + ", ".join(TOTAL_ONLY_COLUMNS)
+            + ". Found: "
+            + (", ".join(map(str, df.columns)) if len(df.columns) else "(no columns)")
+            + "."
+        )
+
+    df = df.copy()
+
+    if have_total_only:
+        # Already strand-summed by breseq; only the name of the redundant column differs.
+        df["redundant"] = df["redundant_cov"]
+    else:
+        df["unique_cov"] = df["unique_top_cov"] + df["unique_bot_cov"]
+        df["redundant"] = df["redundant_top_cov"] + df["redundant_bot_cov"]
+
+    return df
+
+
 def read_coverage_table(path):
     """Read a coverage table and check it carries the columns the pipeline needs.
 
     Without this check a file with the wrong schema fails much later and much less
-    clearly: _read_coverage_tab() takes the first column as the position index whatever
+    clearly: _read_coverage_table() takes the first column as the position index whatever
     it holds, so a mismatched table parses "successfully" and then raises a bare KeyError
     from inside preprocess(). That mattered little when tables could only come from a
     directory CNery named itself, but any file can now be passed on the command line.
     """
-    df = _read_coverage_tab(path)
-
-    absent = [c for c in REQUIRED_COVERAGE_COLUMNS if c not in df.columns]
-    if absent:
-        raise ValueError(
-            f"{path} is not a usable coverage table: missing column(s) "
-            + ", ".join(absent)
-            + ". Expected a breseq 'bam2cov --format TSV' table, whose first column is "
-            "the position and which carries: "
-            + ", ".join(REQUIRED_COVERAGE_COLUMNS)
-            + "."
-        )
-
-    return df
+    return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
 def preprocess(df, win=200, step=100, frag=350):
@@ -207,9 +285,10 @@ def preprocess(df, win=200, step=100, frag=350):
             f'Excluding segments of the genome for analysis.'
         )
 
-    df_b2c = df.copy()
-    df_b2c["unique_cov"] = df_b2c["unique_top_cov"] + df_b2c["unique_bot_cov"]
-    df_b2c["redundant"] = df_b2c['redundant_top_cov'] + df_b2c['redundant_bot_cov']
+    # Accepts either bam2cov coverage schema. Idempotent, so calling it again here is
+    # harmless when the frame already came through read_coverage_table(), and it keeps
+    # preprocess() usable on a raw frame handed to it directly.
+    df_b2c = normalize_coverage_columns(df)
 
     start_coord = int(df_b2c.index[0])
     genome = df_b2c['ref_base']

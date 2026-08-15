@@ -12,20 +12,34 @@ import pytest
 
 from CNery.get_CNV import main
 
-HEADER = (
-    "position\tref_base\tunique_top_cov\tunique_bot_cov"
-    "\tredundant_top_cov\tredundant_bot_cov"
-)
+COLUMNS = [
+    "position", "ref_base",
+    "unique_top_cov", "unique_bot_cov",
+    "redundant_top_cov", "redundant_bot_cov",
+]
+TOTAL_ONLY_COLUMNS = ["position", "ref_base", "unique_cov", "redundant_cov", "total_cov"]
 
 # Enough windows at -w 100 -s 50 for the HMM and the OTR fit to have something to chew on.
 SEQ = ("ACGTACGGCTAA" * 250)
 
 
-def _write_table(path, seq=SEQ, cov=25):
-    rows = "\n".join(
-        f"{i + 1}\t{base}\t{cov}\t{cov}\t0\t0" for i, base in enumerate(seq)
-    )
-    path.write_text(HEADER + "\n" + rows + "\n#\tnumber_of_positions\t%d\n" % len(seq))
+def _render(header, rows, n, d):
+    lines = [d.join(header)]
+    lines += [d.join(str(v) for v in row) for row in rows]
+    lines.append(d.join(("#", "number_of_positions", str(n))))
+    return "\n".join(lines) + "\n"
+
+
+def _write_table(path, seq=SEQ, cov=25, d="\t"):
+    rows = [(i + 1, base, cov, cov, 0, 0) for i, base in enumerate(seq)]
+    path.write_text(_render(COLUMNS, rows, len(seq), d))
+    return path
+
+
+def _write_total_only(path, seq=SEQ, cov=25, d=","):
+    """The same coverage in the shape `bam2cov --total-only` writes."""
+    rows = [(i + 1, base, cov * 2, 0, cov * 2) for i, base in enumerate(seq)]
+    path.write_text(_render(TOTAL_ONLY_COLUMNS, rows, len(seq), d))
     return path
 
 
@@ -79,6 +93,59 @@ class TestPositionalInputs:
         _run(monkeypatch, ["-o", out, "-w", "100", "-s", "50"])
 
         assert any("chrA" in n for n in _csv_names(out))
+
+
+class TestFormats:
+    """All four shapes of the same table run end to end without being declared."""
+
+    def test_csv_folder(self, tmp_path, monkeypatch):
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "chrA.coverage.csv", d=",")
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "-o", out, "-w", "100", "-s", "50"])
+
+        assert any("chrA" in n for n in _csv_names(out))
+
+    def test_total_only_csv_folder(self, tmp_path, monkeypatch):
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_total_only(cov / "chrA.coverage.csv")
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "-o", out, "-w", "100", "-s", "50"])
+
+        assert any("chrA" in n for n in _csv_names(out))
+
+    def test_csv_and_tsv_together(self, tmp_path, monkeypatch):
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "chrA.coverage.csv", d=",")
+        _write_table(cov / "chrB.coverage.tsv", d="\t")
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "-o", out, "-w", "100", "-s", "50"])
+
+        names = _csv_names(out)
+        assert any("chrA" in n for n in names)
+        assert any("chrB" in n for n in names)
+
+    def test_total_only_matches_strand_split_end_to_end(self, tmp_path, monkeypatch):
+        # The two spellings of one dataset must produce the same calls, not merely both
+        # produce output.
+        strand = tmp_path / "strand"
+        total = tmp_path / "total"
+        strand.mkdir()
+        total.mkdir()
+        _write_table(strand / "chrA.coverage.tsv", d="\t")
+        _write_total_only(total / "chrA.coverage.csv")
+
+        outs = {}
+        for name, folder in (("s", strand), ("t", total)):
+            out = tmp_path / f"out_{name}"
+            _run(monkeypatch, [str(folder), "-o", str(out), "-w", "100", "-s", "50"])
+            produced = [n for n in _csv_names(str(out)) if n.endswith("_CNV.csv")]
+            outs[name] = (out / "CNV_csv" / produced[0]).read_text()
+
+        assert outs["s"] == outs["t"]
 
 
 class TestFileEndingFlag:
