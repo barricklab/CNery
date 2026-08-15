@@ -5,7 +5,6 @@ from CNery.core import (
     solve_pr,
     setup_transition_matrix,
     setup_emission_matrix,
-    parse_fasta_records,
 )
 
 
@@ -71,30 +70,3 @@ class TestEmissionMatrix:
 
     def test_shape(self, basic_emission):
         assert basic_emission.shape == (6, 151)
-
-
-class TestParseFastaRecords:
-    @pytest.fixture
-    def single_fasta(self, tmp_path):
-        fa = tmp_path / "single.fasta"
-        fa.write_text(">chr1\n" + "ACGT" * 1000 + "\n")
-        return str(fa)
-
-    @pytest.fixture
-    def multi_fasta(self, tmp_path):
-        fa = tmp_path / "multi.fasta"
-        fa.write_text(">chr1\n" + "ACGT" * 1000 + "\n>plas1\n" + "GCTA" * 500 + "\n")
-        return str(fa)
-
-    def test_single_record_length(self, single_fasta):
-        records = parse_fasta_records(single_fasta)
-        assert len(records) == 1
-
-    def test_multi_record_lengths(self, multi_fasta):
-        records = parse_fasta_records(multi_fasta)
-        assert len(records) == 2
-
-    def test_empty_fasta(self, tmp_path):
-        fa = tmp_path / "empty.fasta"
-        fa.write_text("")
-        assert parse_fasta_records(str(fa)) == []

@@ -19,8 +19,9 @@ Without ``--publish`` this only builds the archive and prints the entry -- nothi
 and no release is created, so it is safe to run to inspect what would happen. The collision check
 still runs on a dry run, so a version clash surfaces before you do the real one.
 
-The folder should hold what CNery actually reads: ``reference.bam`` (+ ``.bai``) and
-``reference.fasta`` (+ ``.fai``). A ``dataset.json`` provenance manifest is generated alongside
+The folder should hold what CNery actually reads: one coverage table per sequence, named
+``<seq_id>.coverage.tsv``. No BAM and no reference FASTA -- they are not inputs, and shipping
+them only inflates the download. A ``dataset.json`` provenance manifest is generated alongside
 them if absent; fill in its blank fields before publishing, because authentic data without
 provenance stops being reproducible as soon as whoever generated it moves on.
 """
@@ -201,7 +202,7 @@ def publish(tag, archive, name, version):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("folder", type=Path, help="folder holding reference.bam / reference.fasta")
+    parser.add_argument("folder", type=Path, help="folder holding the <seq_id>.coverage.tsv tables")
     parser.add_argument("--name", required=True, help="dataset name, e.g. lambda")
     parser.add_argument("--version", type=int, default=None,
                         help="dataset version; defaults to one past the highest already published")

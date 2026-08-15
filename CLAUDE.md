@@ -19,10 +19,10 @@ conda run -p $PWD/env <command>          # or: conda activate $PWD/env
 
 **breseq is deliberately not in this environment.** The pre-release builds CNery targets hard-depend
 on `cnery-prerelease`, so installing breseq would place a packaged copy of CNery in site-packages,
-shadowing the working tree anywhere `pythonpath=["src"]` does not reach. Tests therefore run against
-pre-generated coverage tables and never shell out to breseq. To produce such a table, see
-"Generating a coverage table" in `README.md` — it needs
-[pre-release breseq](https://github.com/barricklab/conda), not the bioconda release.
+shadowing the working tree anywhere `pythonpath=["src"]` does not reach. CNery never invokes breseq
+anyway — it reads pre-generated coverage tables. To produce such a table, see "Generating a coverage
+table" in `README.md` — it needs [pre-release breseq](https://github.com/barricklab/conda), not the
+bioconda release.
 
 **Tests.** Run from the repo root. `pyproject.toml` supplies `testpaths=["tests"]`,
 `pythonpath=["src"]`, and `addopts="-q --tb=short"`, so tests import `CNery.core`
@@ -31,26 +31,65 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 159; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 78, offline, ~10s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 81, real coverage tables
+conda run -p $PWD/env pytest                    # all 221; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 137, offline, ~14s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 84, real coverage tables
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
 ```
 
-**Running the tool.** Console entry point is `CNery` → `CNery.get_CNV:main`. Run it inside a breseq
-output folder containing `data/`, or point at one with `CNery -i <breseq_output_dir>`. Full flag list
-is in `README.md` and `CNery -h`.
+**Running the tool.** Console entry point is `CNery` → `CNery.get_CNV:main`. Full flag list is in
+`README.md` and `CNery -h`.
 
-`breseq` must be on `PATH` — `bam2cov_to_df` shells out to `breseq bam2cov` — unless coverage tables
-are supplied, in which case breseq is never invoked and no BAM is needed. Two sources, explicit first:
+**Coverage tables are the only input.** No BAM, no FASTA, and breseq is never invoked — it does not
+need to be on `PATH`. Inputs are positional and may mix files and directories; with no arguments the
+current directory is used.
 
-- `--coverage-dir <dir>` → `<dir>/<seq_id>.coverage.**tsv**`. Required for every sequence in the
-  FASTA; missing ones raise before any processing. `coverage_table_path` in `core.py` owns this name.
-- otherwise `<breseq_dir>/08_mutation_identification/<seq_id>.coverage.**tab**` if present. Note the
-  different suffix: these are breseq's own files, in a **different schema** (position last, no
-  `ref_base`), and keep their historical name.
+- A **file** is read whatever it is named.
+- A **directory** contributes the files inside it — top level only, no recursion — whose names end in
+  one of `--file-ending` (defaults `coverage.csv`, `coverage.tsv` **and** `coverage.tab`, the last
+  being the legacy extension the deprecated `--table` flag writes; repeatable, and any value
+  given **replaces** the defaults rather than extending them). Because all three are defaults, a
+  folder holding `REL606.coverage.csv` *and* `REL606.coverage.tsv` is a duplicate-ID error, not a
+  silent preference.
+- `genome_id` is the basename minus the matched ending *and the single `.` before it*, so
+  `my.sample.1.coverage.tsv` → `my.sample.1`. Not `os.path.splitext`, and emphatically not a split on
+  the first dot: sequence IDs routinely contain dots.
+
+`resolve_coverage_inputs` (`core.py`) owns all of this and returns an ordered `{genome_id: path}`
+mapping. It raises — naming the offending paths — for a missing path, a directory that matched
+nothing, or two inputs resolving to the same `genome_id`. `get_CNV.main` calls it **before** creating
+any output directory, so a bad invocation leaves nothing behind.
+
+### Format and schema are detected, never declared
+
+`bam2cov` writes four shapes of the same table and CNery accepts all four.
+
+- **Delimiter** — `_detect_delimiter` reads the first non-comment line and compares tab against comma
+  counts. Content, not extension: a file named on the command line may be called anything, and CSV
+  and TSV differ *only* in this separator (`coverage_output.cpp:219-221`), footer included. Not
+  `csv.Sniffer`, which guesses from a sample and misfires on single-column input.
+- **Schema** — `normalize_coverage_columns` reduces either shape to the canonical `unique_cov` /
+  `redundant` pair that `preprocess` has always built internally:
+  - plain output splits by strand: `unique_top_cov + unique_bot_cov`, `redundant_top_cov +
+    redundant_bot_cov`;
+  - `--total-only` ships `unique_cov`, `redundant_cov`, `total_cov` — breseq has already done those
+    sums (`coverage_output.cpp:467-472`), so **`--total-only` loses nothing CNery uses**.
+    `pct_redundant` and repeat censoring keep working, and `total_cov` is ignored as derivable.
+
+  It is idempotent, and `preprocess` calls it too, so `preprocess` still works on a raw frame handed
+  to it directly (`tests/test_authentic.py` does exactly that).
+
+`read_coverage_table` runs the schema check the moment a file is opened. Without it a wrong-schema
+file parses cleanly (`_read_coverage_table` takes column 0 as the position index whatever it holds)
+and fails later as a bare `KeyError`. breseq's own `08_mutation_identification/*.coverage.tab` files
+are exactly that case — position last, no `ref_base` — and are **not** valid input.
+
+Note `-t` is breseq's deprecated `--table` flag, *not* `--total-only` (which is `-1`); it writes
+ordinary TSV under the legacy `.tab` extension, which is why `coverage.tab` is a default ending.
+breseq's own `08_mutation_identification/*.coverage.tab` files share that extension but not the
+schema, so pointing CNery at that directory now finds them and rejects them by name.
 
 No linter, formatter, or CI is configured.
 
@@ -109,18 +148,24 @@ That is also why `is_deletion` / `is_redundant` are present on the frame in all 
 
 ### Multi-genome flow
 
-`process_multi_genome` (`core.py:481`) is the top of the pipeline and handles every record in the
-BAM/FASTA in one pass:
+`process_multi_genome` is the top of the pipeline. It takes the `{genome_id: path}` mapping from
+`resolve_coverage_inputs` and handles every table in one pass:
 
-1. Per FASTA record: `bam2cov_to_df` → `preprocess` → tag rows with `genome_id = <fasta header>`.
-2. **Pool all records into one frame**, renormalize `norm_raw_cov` against a single global median,
+1. Per table: `read_coverage_table` → `preprocess` → tag rows with `genome_id`.
+2. **Pool all tables into one frame**, renormalize `norm_raw_cov` against a single global median,
    and run one shared `mask_coverage_windows` → `fit_gc_bias` → `apply_gc_correction` across the
    pool.
-3. Split back apart on `genome_id` and return `{header: df}`.
+3. Split back apart on `genome_id` and return `{genome_id: df}`.
 
 GC bias is deliberately fitted globally across chromosome + plasmids + contigs (one pooled diagnostic
 plot). OTR correction and CN calling are then per-reference. `genome_id` is both the split key and the
 source of every output plot/CSV filename, so it must survive any transformation you add.
+
+The shared global median in step 2 is why one invocation should carry the references of **one
+sample**. Passing two samples' tables together cross-normalizes them against each other.
+
+Note that `process_multi_genome` does no globbing: resolution is the caller's job, so that bad inputs
+are rejected before `get_CNV.main` creates any output directory.
 
 ### Deliberate behavior that reads like a bug
 
@@ -152,7 +197,8 @@ source of every output plot/CSV filename, so it must survive any transformation 
   overdispersed, and `run_HMM` nudges `var` above `mean` when a synthetic-flat input would otherwise
   make `solve_pr` divide by a non-positive number.
 - Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
-  `get_CNV.py:158-160`; the writer functions in `core.py` assume they already exist.
+  `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
+  functions in `core.py` assume they already exist.
 
 ## Testing conventions
 
@@ -163,8 +209,8 @@ both. Never hand-mark a test `synthetic`.
 
 Synthetic tests construct windowed DataFrames staged to match the column
 contract at each pipeline point — reuse the `tests/conftest.py` fixtures (`windowed_flat`,
-`windowed_with_deletion`, `windowed_with_amplification`, `gc_corrected_flat`, `otr_corrected_flat`,
-`single_fasta`) rather than hand-rolling frames, so a change to the contract surfaces in one place.
+`windowed_with_deletion`, `windowed_with_amplification`, `gc_corrected_flat`, `otr_corrected_flat`)
+rather than hand-rolling frames, so a change to the contract surfaces in one place.
 These fixtures deliberately carry **no** `pct_redundant` / `is_redundant` column, so they exercise
 the uncensored path; `run_HMM` falls back to using every window when the column is absent or when
 censoring would leave fewer than `min_called_windows`. Add the column explicitly when a test is
@@ -175,16 +221,23 @@ Because the writers assume their output directories exist, any test that reaches
 `tmp_path` first — see `_ensure_dirs` in `tests/test_integration.py` and
 `tests/test_otr_correction.py`.
 
-For anything touching the breseq subprocess, follow `tests/test_bam2cov_io.py`: patch
-`subprocess.run` with a side effect that writes a fake `.tab` file. Coverage tables are read by
-`_read_coverage_tab` (`core.py`), which strips the trailing summary block by its `#` prefix — the
-block is **variable-length** (four lines by default, +1 under `--show-average`, +3 per read group,
-and none at all in breseq's own `08_mutation_identification/*.coverage.tab`), so never assume a fixed
-count. `TestFooterHandling` in that file covers each of those shapes.
+Nothing in the suite mocks a subprocess: CNery never runs breseq, so tests that need a coverage
+table write one. Tables are read by `_read_coverage_table` (`core.py`), which strips the trailing
+summary block by its `#` prefix — the block is **variable-length** (four lines by default, +1 under
+`--show-average`, +3 per read group, and none at all in breseq's own
+`08_mutation_identification/*.coverage.tab`), so never assume a fixed count. `TestFooterHandling` in
+`tests/test_coverage_table_io.py` covers each of those shapes.
+
+Delimiter, footer and schema detection are covered in `tests/test_coverage_table_io.py`, including
+an equivalence class proving a `--total-only` table and a strand-split one of the same data give
+identical windowed output. Input resolution and the file-ending/`genome_id` rules are in
+`tests/test_inputs.py`;
+`tests/test_cli.py` drives `main()` through argparse with `monkeypatch.setattr(sys, "argv", ...)`,
+which is the only place the real command-line surface is exercised.
 
 ## Authentic datasets
 
-Real BAM/FASTA live as GitHub Release assets, not in the repo. They are fetched and cached by pooch,
+Real coverage tables live as GitHub Release assets, not in the repo. They are fetched and cached by pooch,
 verified against a sha256 pinned in `tests/data/registry.json`, and used only by tests marked
 `@pytest.mark.authentic`.
 

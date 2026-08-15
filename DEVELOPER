@@ -74,7 +74,6 @@ in one place instead of in every test:
                           -- post-preprocess frames (read_count_cov, norm_raw_cov, gc_percent)
   gc_corrected_flat       -- adds gc_corr_norm_cov, gc_corr_fact
   otr_corrected_flat      -- adds otr_gc_corr_norm_cov, otr_gc_corr_fact
-  single_fasta            -- a one-record FASTA on disk
 
 None of these carry pct_redundant or is_redundant, so they exercise the uncensored path:
 run_HMM uses every window when the column is absent. Add it explicitly if your test is about
@@ -84,11 +83,20 @@ The writer functions assume their output subdirectories already exist. Any test 
 apply_otr_correction, run_HMM, or a plot function must create CNV_plt/, CNV_csv/, GC_bias/ and
 OTR_corr/ under tmp_path first -- see _ensure_dirs in tests/test_integration.py.
 
-For anything invoking breseq, patch subprocess.run with a side effect that writes a fake
-table, as tests/test_bam2cov_io.py does. Do not assume a fixed footer length: breseq writes
-four commented summary lines by default, one more under --show-average, three per read group,
-and none at all in its own 08_mutation_identification output. TestFooterHandling covers each
-of those shapes.
+Nothing mocks a subprocess: CNery never runs breseq. A test that needs a coverage table
+writes one -- see _write_table in tests/test_inputs.py or tests/test_coverage_table_io.py.
+Those helpers take a delimiter argument, because bam2cov's CSV and TSV output differ only
+in that separator; tests that care about format parametrize over both.
+Do not assume a fixed footer length: breseq writes four commented summary lines by default,
+one more under --show-average, three per read group, and none at all in its own
+08_mutation_identification output. TestFooterHandling in tests/test_coverage_table_io.py
+covers each of those shapes.
+
+Input handling has two homes. tests/test_inputs.py covers resolution: which files a folder
+yields, how --file-ending is matched, and how a sequence ID is cut out of a file name.
+tests/test_cli.py drives main() through argparse via monkeypatch.setattr(sys, "argv", ...),
+and is the only place the real command-line surface is exercised -- including that a bad
+invocation creates no output folder.
 
 Make assertions match the test name. A test called test_deletion_yields_cn0 that only asserts
 the result is not None passes forever and protects nothing.
@@ -99,10 +107,11 @@ Datasets are published as GitHub Release assets, one release per dataset version
 testdata-<name>-v<N> and carrying a single <name>.tar.gz. Adding or revising one touches only
 its own entry in tests/data/registry.json; no other dataset is regenerated or re-uploaded.
 
-Stage a folder containing what CNery reads -- the reference FASTA and one coverage table per
-sequence, named <seq_id>.coverage.tsv. Do NOT include the BAM: CNery reads coverage tables
-directly through --coverage-dir and never opens it, so shipping it would multiply the download
-size for nothing.
+Stage a folder containing what CNery reads: one coverage table per sequence, named
+<seq_id>.coverage.tsv. Do NOT include the BAM, and a reference FASTA is not needed either --
+coverage tables are the only input, and the reference sequence CNery uses for GC content is
+already in each table's ref_base column. Shipping either would multiply the download size for
+nothing.
 
 Build and inspect without uploading:
 $ python tests/data/add_testdata.py <folder> --name <name> --description "..."

@@ -3,7 +3,6 @@
 
 import os
 import json
-import subprocess
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -18,41 +17,33 @@ from scipy.special import  gammaln
 from itertools import cycle, islice
 
 
-def parse_fasta_records(fastafile):
-    """
-    Parse a (multi-)FASTA file and return a list of (seq_id, seq_len)
-    for each reference sequence.
-
-    The sequence ID is the first whitespace-delimited token of the header, matching how
-    breseq and samtools identify sequences. Everything after it is a free-text description.
-    Keeping the whole header would break two things: the "<id>:1-<len>" region handed to
-    breseq bam2cov, and the "<id>.coverage.tsv" file names looked up by --coverage-dir.
-    """
-    records = []
-    header = None
-    seq_len = 0
-
-    with open(fastafile) as fh:
-        for line in fh:
-            line = line.rstrip()
-            if line.startswith(">"):
-                if header is not None:
-                    records.append((header, seq_len))
-                header = line[1:].split()[0] if line[1:].split() else ""
-                seq_len = 0
-            else:
-                seq_len += len(line)
-
-    if header is not None:
-        records.append((header, seq_len))
-
-    return records
-
+# breseq bam2cov writes either CSV or TSV; both are picked up without being asked for,
+# since the two differ only in their delimiter and CNery detects that from the file itself.
+# ".coverage.tab" is the same TSV content under the legacy extension that the deprecated
+# --table (-t) flag still writes, so it is accepted too.
+DEFAULT_FILE_ENDINGS = ("coverage.csv", "coverage.tsv", "coverage.tab")
 
 COVERAGE_TABLE_SUFFIX = ".coverage.tsv"
 
+# Every coverage table carries these two, whichever coverage schema it uses. `ref_base` is
+# the one that matters most: it holds the reference sequence, which is where GC content
+# comes from -- CNery never reads a FASTA.
+BASE_COVERAGE_COLUMNS = ("ref_base",)
 
-def coverage_table_path(coverage_dir, seq_id):
+# The two coverage schemas bam2cov emits. Plain output splits each count by strand;
+# --total-only sums the strands in C++ and writes the pair CNery actually wants, plus a
+# `total_cov` that is just their sum. Both reduce to the same two canonical columns, so
+# --total-only loses nothing CNery uses -- see normalize_coverage_columns().
+STRAND_SPLIT_COLUMNS = (
+    "unique_top_cov",
+    "unique_bot_cov",
+    "redundant_top_cov",
+    "redundant_bot_cov",
+)
+TOTAL_ONLY_COLUMNS = ("unique_cov", "redundant_cov")
+
+
+def coverage_table_path(coverage_dir, seq_id, suffix=COVERAGE_TABLE_SUFFIX):
     """Path of the coverage table for `seq_id` inside `coverage_dir`.
 
     Named for the sequence ID alone -- no coordinates. breseq's default no-region output
@@ -60,88 +51,278 @@ def coverage_table_path(coverage_dir, seq_id):
     looks for and, more importantly, contains a colon: illegal in filenames on Windows and
     displayed as "/" by the macOS Finder.
     """
-    return os.path.join(coverage_dir, f"{seq_id}{COVERAGE_TABLE_SUFFIX}")
+    return os.path.join(coverage_dir, f"{seq_id}{suffix}")
 
 
-def _read_coverage_tab(path):
+def normalize_file_endings(file_endings=None):
+    """The endings to match, as a list, with any leading dots removed.
+
+    None means "the default", so a caller can pass argparse's unset value straight
+    through: supplying --file-ending REPLACES the default rather than adding to it.
+    """
+    if file_endings is None:
+        file_endings = list(DEFAULT_FILE_ENDINGS)
+    if isinstance(file_endings, str):
+        file_endings = [file_endings]
+    return [str(e).lstrip(".") for e in file_endings if str(e).strip()]
+
+
+def genome_id_from_path(path, file_endings=None):
+    """Sequence ID for a coverage table: its basename minus the matched file ending.
+
+    Only the ending and the single "." in front of it are removed -- NOT everything
+    after the first dot -- so "my.sample.1.coverage.tsv" gives "my.sample.1". Sequence
+    IDs routinely contain dots, and truncating at the first one would silently merge
+    distinct references into one genome_id.
+
+    Endings are tried in the order given, so an earlier one wins over a later one that
+    also matches. A file named explicitly on the command line need not match any ending
+    at all; then only its final extension is dropped.
+    """
+    name = os.path.basename(path)
+    for ending in normalize_file_endings(file_endings):
+        suffix = "." + ending
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)]
+    return os.path.splitext(name)[0]
+
+
+def matches_file_ending(name, file_endings=None):
+    """Whether `name` ends in one of `file_endings`, preceded by a "."."""
+    return any(
+        name.endswith("." + ending)
+        for ending in normalize_file_endings(file_endings)
+    )
+
+
+def resolve_coverage_inputs(paths, file_endings=None):
+    """Expand command-line inputs into an ordered {genome_id: path} mapping.
+
+    `paths` may mix files and directories. A file is taken as given, whatever it is
+    named; a directory contributes the files inside it -- top level only, no recursion --
+    whose names end in one of `file_endings`. Directory listings are sorted so a run is
+    reproducible regardless of filesystem order.
+
+    Every problem is reported before any table is read, so a bad invocation cannot leave
+    half a run's worth of output behind. Directories are not searched recursively on
+    purpose: a stale copy of a table one level down would otherwise collide with the live
+    one and turn a working command into a duplicate-ID error.
+    """
+    endings = normalize_file_endings(file_endings)
+    tried = ", ".join(endings) if endings else "(none)"
+
+    missing = []
+    empty_dirs = []
+    resolved = {}
+    origin = {}
+
+    for path in paths:
+        if not os.path.exists(path):
+            missing.append(path)
+            continue
+
+        if os.path.isdir(path):
+            found = [
+                os.path.join(path, name)
+                for name in sorted(os.listdir(path))
+                if matches_file_ending(name, endings)
+                and os.path.isfile(os.path.join(path, name))
+            ]
+            if not found:
+                empty_dirs.append(path)
+                continue
+        elif os.path.isfile(path):
+            found = [path]
+        else:
+            missing.append(path)
+            continue
+
+        for table in found:
+            genome_id = genome_id_from_path(table, endings)
+            if genome_id in resolved:
+                raise ValueError(
+                    f"Duplicate sequence ID {genome_id!r} from two inputs:\n"
+                    f"  {origin[genome_id]}\n"
+                    f"  {table}\n"
+                    "Sequence IDs come from the file name, so two tables cannot share "
+                    "one. Rename a file or run them separately."
+                )
+            resolved[genome_id] = table
+            origin[genome_id] = table
+
+    if missing:
+        raise FileNotFoundError(
+            "No such input path(s): " + ", ".join(missing)
+        )
+    if empty_dirs:
+        raise FileNotFoundError(
+            "No coverage tables in: " + ", ".join(empty_dirs)
+            + f". Looked for files ending in: {tried}. "
+            "Use --file-ending to match a different name."
+        )
+    if not resolved:
+        raise FileNotFoundError(
+            f"No coverage tables found in: {', '.join(paths)}. "
+            f"Looked for files ending in: {tried}."
+        )
+
+    return resolved
+
+
+def parse_region(text):
+    """Parse a --region argument into (seq_id, start, end).
+
+    Accepts "SEQ_ID:START-END", and "START-END" without a sequence ID -- which is
+    only meaningful when the run has a single input sequence, checked by the caller,
+    which is the one place that knows what was resolved. Either coordinate may be
+    omitted for an open interval: "SEQ:100-" or "SEQ:-500". A missing coordinate is
+    returned as 0, meaning "the genome end on that side".
+
+    Raises ValueError with a message suitable for showing to the user.
+    """
+    seq_id = None
+    coords = text
+
+    # rsplit: the coordinate half never contains a colon, so this survives a
+    # sequence ID that does.
+    if ":" in text:
+        seq_id, coords = text.rsplit(":", 1)
+        if not seq_id:
+            raise ValueError(
+                f"invalid region {text!r}: no sequence ID before the ':'."
+            )
+
+    parts = coords.split("-")
+    if len(parts) != 2:
+        raise ValueError(
+            f"invalid region {text!r}: expected two coordinates separated by a "
+            "'-', as in 'REL606:3497890-3955678', '3497890-' or '-3955678'."
+        )
+
+    try:
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else 0
+    except ValueError:
+        raise ValueError(
+            f"invalid region {text!r}: both coordinates must be whole numbers."
+        )
+
+    if start < 0 or end < 0:
+        raise ValueError(f"invalid region {text!r}: coordinates cannot be negative.")
+    if start and end and start >= end:
+        raise ValueError(
+            f"invalid region {text!r}: the start coordinate must come before the end."
+        )
+
+    return seq_id, start, end
+
+
+def _detect_delimiter(path):
+    """Tab or comma, decided by the header row rather than by the file name.
+
+    bam2cov's CSV and TSV output differ only in this separator, so the format is a
+    property of the bytes and not of the extension. Detecting it from the content means a
+    file named directly on the command line works whatever it is called, and a
+    comma-delimited table someone saved as ".tsv" still reads correctly.
+
+    csv.Sniffer is deliberately not used: it guesses from a sample and misfires on
+    single-column input, where it may pick a character out of the data itself.
+    """
+    with open(path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            tabs = line.count("\t")
+            commas = line.count(",")
+            if tabs > commas:
+                return "\t"
+            if commas > tabs:
+                return ","
+            raise ValueError(
+                f"Cannot tell whether {path} is tab- or comma-separated: its header row "
+                f"has {tabs} tab(s) and {commas} comma(s). Expected a breseq "
+                "'bam2cov --format TSV' or '--format CSV' coverage table."
+            )
+
+    raise ValueError(f"{path} has no header row -- it is empty, or entirely comments.")
+
+
+def _read_coverage_table(path):
     """Read a breseq coverage table, dropping its commented summary block.
 
-    The trailing '#' block is variable-length: this replaces silently
-    deleted four real data rows from any footerless input.
+    The trailing '#' block is variable-length: this replaces a fixed skipfooter=4, which
+    silently deleted four real data rows from any footerless input. The block is written
+    with the same delimiter as the data, so it is stripped by its '#' prefix in CSV
+    exactly as in TSV.
     """
     return pd.read_csv(
         path,
-        sep="\t",
+        sep=_detect_delimiter(path),
         header=0,
         index_col=0,
         comment="#",
     )
 
 
-def bam2cov_to_df(
-    bamfile,               # path to BAM
-    fastafile,             # path to FASTA
-    output_prefix,         # output tab file: e.g. "coverage.tab"
-    extra_args=None,       # optional, list for any extra CLI args
-    region=None,           # optional, "REF:1-12345" to avoid re-parsing FASTA
-    preexisting_tab=None,  # optional, path to an existing .tab file to use instead of running breseq
-):
-    if preexisting_tab is not None and os.path.isfile(preexisting_tab):
-        print(f"Using pre-existing coverage file: {preexisting_tab}")
-        return _read_coverage_tab(preexisting_tab)
+def normalize_coverage_columns(df, path=None):
+    """Reduce either bam2cov coverage schema to the canonical `unique_cov`/`redundant` pair.
 
-    tab_file = output_prefix
+    Plain bam2cov output splits each count by strand; `--total-only` sums the strands
+    itself and writes `unique_cov`, `redundant_cov` and `total_cov`. Those first two are
+    exactly the sums CNery would compute anyway, so the narrower table costs nothing:
+    `pct_redundant`, repeat censoring and the window median all behave identically.
+    `total_cov` is ignored -- it is `unique_cov + redundant_cov` by construction.
 
-    if region is None:
-        header = None
-        seq_len = 0
-        with open(fastafile) as fh:
-            for line in fh:
-                line = line.rstrip()
-                if line.startswith(">"):
-                    if header is None:
-                        header = line[1:]
-                    else:
-                        break
-                else:
-                    seq_len += len(line)
-        region = header + ":1-" + str(seq_len)
+    Idempotent, so it is safe to call both when a table is read and again in preprocess(),
+    which lets preprocess() keep working on a raw frame handed to it directly.
+    """
+    where = f"{path}: " if path else ""
 
-    cmd = [
-        "breseq", "bam2cov",
-        "-t",
-        "--region", region,
-        "--resolution", "0",
-        "--output", tab_file,
-        "-b", bamfile,
-        "-f", fastafile,
-    ]
-    if extra_args:
-        cmd += extra_args
+    missing_base = [c for c in BASE_COVERAGE_COLUMNS if c not in df.columns]
+    have_total_only = all(c in df.columns for c in TOTAL_ONLY_COLUMNS)
+    have_strand_split = all(c in df.columns for c in STRAND_SPLIT_COLUMNS)
 
-    try:
-        result = subprocess.run(
-            cmd, check=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    if missing_base or not (have_total_only or have_strand_split):
+        raise ValueError(
+            f"{where}not a usable coverage table. Missing "
+            + ", ".join(missing_base + ([] if (have_total_only or have_strand_split)
+                                        else ["coverage columns"]))
+            + ". Expected a breseq 'bam2cov' table whose first column is the position, "
+            "carrying "
+            + ", ".join(BASE_COVERAGE_COLUMNS)
+            + " plus either "
+            + ", ".join(STRAND_SPLIT_COLUMNS)
+            + " or, with --total-only, "
+            + ", ".join(TOTAL_ONLY_COLUMNS)
+            + ". Found: "
+            + (", ".join(map(str, df.columns)) if len(df.columns) else "(no columns)")
+            + "."
         )
-        print(result.stdout)
-        print(result.stderr)
-    except subprocess.CalledProcessError as e:
-        print(f"breseq bam2cov failed: {e.stderr}")
-        raise
 
-    if not tab_file.endswith(".tab"):
-        tab_file += ".tab"
-    if not os.path.isfile(tab_file):
-        raise FileNotFoundError(f"Coverage output file {tab_file} was not created.")
+    df = df.copy()
 
-    try:
-        df = _read_coverage_tab(tab_file)
-    finally:
-        if os.path.exists(tab_file):
-            os.remove(tab_file)
+    if have_total_only:
+        # Already strand-summed by breseq; only the name of the redundant column differs.
+        df["redundant"] = df["redundant_cov"]
+    else:
+        df["unique_cov"] = df["unique_top_cov"] + df["unique_bot_cov"]
+        df["redundant"] = df["redundant_top_cov"] + df["redundant_bot_cov"]
 
     return df
+
+
+def read_coverage_table(path):
+    """Read a coverage table and check it carries the columns the pipeline needs.
+
+    Without this check a file with the wrong schema fails much later and much less
+    clearly: _read_coverage_table() takes the first column as the position index whatever
+    it holds, so a mismatched table parses "successfully" and then raises a bare KeyError
+    from inside preprocess(). That mattered little when tables could only come from a
+    directory CNery named itself, but any file can now be passed on the command line.
+    """
+    return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
 def preprocess(df, win=200, step=100, frag=350):
@@ -152,9 +333,10 @@ def preprocess(df, win=200, step=100, frag=350):
             f'Excluding segments of the genome for analysis.'
         )
 
-    df_b2c = df.copy()
-    df_b2c["unique_cov"] = df_b2c["unique_top_cov"] + df_b2c["unique_bot_cov"]
-    df_b2c["redundant"] = df_b2c['redundant_top_cov'] + df_b2c['redundant_bot_cov']
+    # Accepts either bam2cov coverage schema. Idempotent, so calling it again here is
+    # harmless when the frame already came through read_coverage_table(), and it keeps
+    # preprocess() usable on a raw frame handed to it directly.
+    df_b2c = normalize_coverage_columns(df)
 
     start_coord = int(df_b2c.index[0])
     genome = df_b2c['ref_base']
@@ -479,70 +661,33 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
 
 
 def process_multi_genome(
-    bamfile,
-    fastafile,
+    coverage_inputs,
     output_prefix,
     win=200,
     step=100,
     frag=350,
-    extra_args=None,
-    breseq_dir=None,
-    coverage_dir=None,
 ):
     """
-    Run bam2cov + preprocess per genome (FASTA sequence ID),
-    pool for GC correction, plot pooled bias,
+    Preprocess every coverage table, pool them for GC correction, plot the pooled bias,
     then return per-genome GC-corrected DataFrames keyed by sequence ID.
 
-    If coverage_dir is given, coverage is read from "<coverage_dir>/<seq_id>.coverage.tsv"
-    for every reference and breseq is never invoked -- so no BAM is needed. A table must
-    exist for every sequence in the FASTA; missing ones are reported up front rather than
-    silently falling back to bam2cov, which would fail confusingly on the absent BAM.
+    `coverage_inputs` is an ordered {genome_id: path} mapping, as produced by
+    resolve_coverage_inputs(). Resolution is the caller's job so that a bad set of inputs
+    is rejected before any output directory is created.
+
+    GC bias is fitted ONCE across every table -- chromosome, plasmids and contigs
+    together -- because it is a property of the sequencing chemistry, not of any one
+    reference. OTR correction and CN calling then happen per reference, back in
+    get_CNV.main(). Note the shared global median this implies: the tables passed in one
+    call should be the references of a single sample, not several samples.
     """
 
-    records = parse_fasta_records(fastafile)
-
-    if coverage_dir is not None:
-        missing = [
-            seq_id for seq_id, _ in records
-            if not os.path.isfile(coverage_table_path(coverage_dir, seq_id))
-        ]
-        if missing:
-            raise FileNotFoundError(
-                f"--coverage-dir {coverage_dir!r} has no coverage table for "
-                f"{len(missing)} of {len(records)} reference sequence(s): "
-                + ", ".join(f"{m}{COVERAGE_TABLE_SUFFIX}" for m in missing)
-                + ". Every sequence in the FASTA needs one."
-            )
-
     preprocessed = {}
-    for (header, seq_len) in records:
-        region = f"{header}:1-{seq_len}"
-        tab_prefix = f"{output_prefix}_{header}"
-
-        preexisting_tab = None
-        if coverage_dir is not None:
-            preexisting_tab = coverage_table_path(coverage_dir, header)
-        elif breseq_dir is not None:
-            candidate = os.path.join(
-                breseq_dir, "08_mutation_identification",
-                f"{header}.coverage.tab"
-            )
-            if os.path.isfile(candidate):
-                preexisting_tab = candidate
-
-        df_raw = bam2cov_to_df(
-            bamfile,
-            fastafile,
-            tab_prefix,
-            extra_args=extra_args,
-            region=region,
-            preexisting_tab=preexisting_tab,
-        )
-
+    for genome_id, path in coverage_inputs.items():
+        df_raw = read_coverage_table(path)
         df_pre = preprocess(df_raw, win=win, step=step, frag=frag)
-        df_pre["genome_id"] = header
-        preprocessed[header] = df_pre
+        df_pre["genome_id"] = genome_id
+        preprocessed[genome_id] = df_pre
 
     df_pooled = pd.concat(preprocessed.values(), ignore_index=True)
 
@@ -556,10 +701,10 @@ def process_multi_genome(
     gc_cor_plots(df_pooled, output_prefix)
 
     per_genome_corrected = {}
-    for header, _ in records:
-        df_g = df_pooled[df_pooled["genome_id"] == header].copy()
+    for genome_id in coverage_inputs:
+        df_g = df_pooled[df_pooled["genome_id"] == genome_id].copy()
         df_g.reset_index(drop=True, inplace=True)
-        per_genome_corrected[header] = df_g
+        per_genome_corrected[genome_id] = df_g
 
     return per_genome_corrected
 
@@ -847,6 +992,17 @@ def plot_copy(df_cnv, pltstart, pltend, output):
         stidx =find_nearest(win_st,pltstart)
         endidx = find_nearest(win_end, pltend)
         df_plt = df_cnv.iloc[stidx:endidx]
+
+    # find_nearest() clamps rather than failing, so a region lying wholly outside this
+    # sequence collapses both ends onto the same window and slices to nothing. That
+    # used to surface as "cannot convert float NaN to integer" from the median below.
+    if df_plt.empty:
+        print(
+            f"WARNING: the requested region ({pltstart}-{pltend}) does not overlap "
+            f"{genome_id}, which spans {int(win_st.min())}-{int(win_end.max())}. "
+            "Plotting the whole sequence instead."
+        )
+        df_plt = df_cnv
 
     plt.figure(figsize=(10, 8))
 

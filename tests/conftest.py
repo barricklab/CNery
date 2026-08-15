@@ -126,10 +126,3 @@ def otr_corrected_flat(gc_corrected_flat):
     df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"].copy()
     df["otr_gc_corr_fact"] = np.ones(len(df))
     return df
-
-
-@pytest.fixture
-def single_fasta(tmp_path):
-    fa = tmp_path / "single.fasta"
-    fa.write_text(">chr1\n" + "ACGT" * 1000 + "\n")
-    return str(fa)
