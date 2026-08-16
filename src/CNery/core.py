@@ -1106,72 +1106,148 @@ def setup_transition_matrix(n_states, remain_prob):
     # np.savetxt("transition.csv", transition, delimiter=",") 
     return transition
 
+def _log_emission_lookup(obs, emission_matrix):
+    """Select log emission probabilities for `obs` from a (state, count) table.
+
+    Returns an (n_obs, n_states) array -- the orientation _viterbi_forward()
+    wants -- with exact zeros mapped to -inf rather than a warning.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logemi = np.log(np.asarray(emission_matrix, dtype=float))
+    logemi[np.isnan(logemi)] = -np.inf
+    return logemi[:, np.asarray(obs, dtype=int)].T
+
+
+def _viterbi_forward(log_emission_obs, log_transition, log_start):
+    """Forward pass of Viterbi, keeping backpointers.
+
+    `log_transition` is indexed [from, to] -- the orientation the recursion
+    actually needs. The old code indexed it [to, from] and got away with it
+    only because setup_transition_matrix() returns a symmetric matrix.
+
+    Returns (logv, ptr) where ptr[i, l] is the state at i-1 on the best path
+    that ends in state `l` at window i. ptr[0] is unused.
+    """
+    log_emission_obs = np.asarray(log_emission_obs, dtype=float)
+    n_obs, n_states = log_emission_obs.shape
+
+    logv = np.full((n_obs, n_states), -np.inf)
+    ptr = np.zeros((n_obs, n_states), dtype=np.int32)
+
+    logv[0] = log_start + log_emission_obs[0]
+
+    state_idx = np.arange(n_states)
+    for i in range(1, n_obs):
+        # cand[k, l] = score of the best path reaching k at i-1, then k -> l
+        cand = logv[i - 1][:, None] + log_transition
+        ptr[i] = np.argmax(cand, axis=0)
+        logv[i] = cand[ptr[i], state_idx] + log_emission_obs[i]
+
+    return logv, ptr
+
+
+def _backtrace(logv, ptr):
+    """Recover the single most probable state path from the forward pass.
+
+    This is the step the old code was missing: it took np.argmax(logv, axis=1)
+    per window, which is a per-window max over paths *ending* there and is not
+    a path at all. Inside an elevated run the high-state column climbs relative
+    to CN1 window by window and only overtakes at the last one, which is why an
+    amplification could come out labelled `1,1,3`.
+    """
+    n_obs = logv.shape[0]
+    path = np.empty(n_obs, dtype=int)
+    path[-1] = int(np.argmax(logv[-1]))
+    for i in range(n_obs - 1, 0, -1):
+        path[i - 1] = ptr[i, path[i]]
+    return path
+
+
+def viterbi_path(log_emission_obs, log_transition, log_start):
+    """Most probable state path. See _viterbi_forward() for the conventions."""
+    logv, ptr = _viterbi_forward(log_emission_obs, log_transition, log_start)
+    return _backtrace(logv, ptr)
+
+
+def _default_log_start(log_transition):
+    """Start distribution: the reference is entered from copy number 1.
+
+    Window 0 therefore contributes its own emission and may differ from CN1 at
+    the cost of exactly one transition, instead of being pinned to CN1 by the
+    old `logv[0, 1] = log(1e-100)`. That matters for a circularly permuted
+    reference, which can begin inside a deletion.
+    """
+    return log_transition[1, :].copy()
+
+
 #Make Viterbi Matrtix
 def make_viterbi_mat(obs, transition_matrix, emission_matrix):
-    num_states = transition_matrix.shape[0]
-    
-    # Create a mask for the zero values
-    mask = (emission_matrix == 0)
-    # Take the logarithm of the non-zero values
-    logemi = np.zeros_like(emission_matrix, dtype=float)
-    logemi[~mask] = np.log(emission_matrix[~mask])
+    """Forward Viterbi scores only, kept for callers that want the matrix.
 
-    # Handle the zero values separately, set to -inf
-    logemi[mask] = -np.inf 
-
-    logv = np.full((len(obs), num_states), np.nan)
-    logtrans = np.log(transition_matrix)
-    
-    logv[0,:] = -np.inf
-    
-    #start prob of state = 1 when including zero state
-
-    logv[0, 1] = np.log(1e-100)
-    
-    for i in range(1, len(obs)):
-        for l in range(num_states):
-            statelprobcounti = logemi[l, obs[i]]
-            maxstate = max(logv[i - 1, :] + logtrans[l, :])
-            logv[i, l] = statelprobcounti + maxstate
-    # np.savetxt("viterbi.csv", logv, delimiter = ',')
+    Segment calling goes through HMM_copy_number(), which needs the
+    backpointers this discards.
+    """
+    log_transition = np.log(transition_matrix)
+    logv, _ = _viterbi_forward(
+        _log_emission_lookup(obs, emission_matrix),
+        log_transition,
+        _default_log_start(log_transition),
+    )
     return logv
 
 
-def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length):
-    states = np.arange(emission_matrix.shape[0])
+def _segments_from_path(path, win_st, win_end, chr_length):
+    """Collapse a per-window state path into Startpos/Endpos/State rows."""
+    def _at(seq, i):
+        return seq.iloc[i] if hasattr(seq, "iloc") else seq[i]
 
-    v = make_viterbi_mat(obs, transition_matrix, emission_matrix)
-
-    most_probable_state_path = np.argmax(v, axis=1)
     rows = []
-
-    prev_most_probable_state = most_probable_state_path[0]
-    prev_most_probable_state_name = states[prev_most_probable_state]
     start_pos = 0
+    prev_state = path[0]
 
-    for i in range(len(obs) - 1):
-        most_probable_state = most_probable_state_path[i]
-        most_probable_state_name = states[most_probable_state]
-
-        if most_probable_state_name != prev_most_probable_state_name:
-            endpos = win_end.iloc[i - 1] if hasattr(win_end, "iloc") else win_end[i - 1]
+    # range(1, len(path)) -- the old loop ran to len(obs) - 1 and so could never
+    # emit a state change at the final window.
+    for i in range(1, len(path)):
+        state = path[i]
+        if state != prev_state:
             rows.append({
                 "Startpos": start_pos,
-                "Endpos": endpos,
-                "State": prev_most_probable_state_name,
+                "Endpos": _at(win_end, i - 1),
+                "State": prev_state,
             })
-            start_pos = win_st.iloc[i] if hasattr(win_st, "iloc") else win_st[i]
-
-        prev_most_probable_state_name = most_probable_state_name
+            start_pos = _at(win_st, i)
+        prev_state = state
 
     rows.append({
         "Startpos": start_pos,
         "Endpos": chr_length,
-        "State": prev_most_probable_state_name,
+        "State": prev_state,
     })
 
-    results = pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
-    return results
+    return pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
+
+
+def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length,
+                    *, log_emission_obs=None, emission_weight=1.0):
+    """Segment the genome by Viterbi decoding.
+
+    `log_emission_obs` lets a caller supply a per-window (n_obs, n_states) log
+    emission matrix directly -- needed once the GC/OTR corrections enter as
+    per-window offsets on the mean, which a shared (state, count) lookup table
+    cannot express. When omitted, `emission_matrix` is used as that lookup.
+
+    `emission_weight` tempers the likelihood by a constant factor, used to stop
+    overlapping windows counting the same bases more than once.
+    """
+    if log_emission_obs is None:
+        log_emission_obs = _log_emission_lookup(obs, emission_matrix)
+    log_emission_obs = np.asarray(log_emission_obs, dtype=float) * float(emission_weight)
+
+    log_transition = np.log(transition_matrix)
+    path = viterbi_path(
+        log_emission_obs, log_transition, _default_log_start(log_transition)
+    )
+    return _segments_from_path(path, win_st, win_end, chr_length)
 
 
 def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
