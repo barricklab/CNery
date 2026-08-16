@@ -3,12 +3,17 @@ from itertools import product
 import pytest
 import numpy as np
 import pandas as pd
+from scipy.stats import nbinom
+
 from CNery.core import (
     setup_transition_matrix,
     setup_emission_matrix,
     make_viterbi_mat,
     viterbi_path,
     HMM_copy_number,
+    fit_censored_negative_binomial,
+    log_emission_with_offsets,
+    bias_offsets,
     _log_emission_lookup,
     _default_log_start,
 )
@@ -149,6 +154,117 @@ def test_path_matches_brute_force_over_an_asymmetric_matrix():
     assert list(got) == list(best)
 
 
+def _nb_counts(mu, size, n, rng):
+    return nbinom.rvs(size, size / (size + mu), size=n, random_state=rng).astype(float)
+
+
+class TestCensoredNegativeBinomialFit:
+    """The single-copy emission parameters, fitted the way breseq fits its own."""
+
+    def test_ignores_amplifications_and_deletions(self):
+        rng = np.random.default_rng(0)
+        mu, size = 63.0, 40.0
+        clean = _nb_counts(mu, size, 27000, rng)
+        amplified = _nb_counts(2 * mu, 2 * size, 9000, rng)
+        deleted = np.zeros(9000)
+
+        got_mu, got_size = fit_censored_negative_binomial(
+            np.concatenate([clean, amplified, deleted])
+        )
+        assert got_mu == pytest.approx(mu, rel=0.05)
+        assert got_size == pytest.approx(size, rel=0.25)
+
+        # The uncensored moments this replaces are wrong by a wide margin.
+        contaminated = np.concatenate([clean, amplified, deleted])
+        assert contaminated.var() / contaminated.mean() > 4 * (
+            (got_mu + got_mu ** 2 / got_size) / got_mu
+        )
+
+    def test_recovers_parameters_through_offsets(self):
+        """Bias belongs in the mean; absorbing it into the dispersion is lossy."""
+        rng = np.random.default_rng(1)
+        mu, size = 63.0, 40.0
+        offsets = 1.0 + 0.25 * np.sin(np.linspace(0, 12 * np.pi, 30000))
+        counts = _nb_counts(mu * offsets, size, 30000, rng)
+
+        with_offsets = fit_censored_negative_binomial(counts, offsets)
+        assert with_offsets[0] == pytest.approx(mu, rel=0.05)
+        assert with_offsets[1] == pytest.approx(size, rel=0.15)
+
+        # Ignoring them re-reads the bias as overdispersion, halving `size`.
+        without = fit_censored_negative_binomial(counts)
+        assert without[1] < 0.6 * with_offsets[1]
+
+    def test_every_redundant_window_is_excluded(self, tmp_path):
+        """A window clipping an IS element sits inside the censoring band.
+
+        So it cannot be left to the [0.5, 1.5] bounds to remove -- it has to be
+        dropped before the histogram is built.
+        """
+        df = _flat_frame_with_repeat_spike(n=300)
+        # Mild repeats at 1.3x: well inside [0.5, 1.5] x mode.
+        df.loc[200:229, "read_count_cov"] = 130.0
+        df.loc[200:229, "is_redundant"] = True
+        df.loc[200:229, "pct_redundant"] = 0.5
+
+        clean_only = df.loc[~df["is_redundant"], "read_count_cov"].to_numpy(float)
+        assert fit_censored_negative_binomial(
+            df["read_count_cov"].to_numpy(float)[~df["is_redundant"].to_numpy(bool)]
+        ) == fit_censored_negative_binomial(clean_only)
+
+        result, _ = _run(df, tmp_path)
+        assert set(result.loc[200:229, "prob_copy_number"]) == {1}
+
+    def test_flat_and_underdispersed_frames_fall_back_to_the_guard(self):
+        """A negative binomial has no finite `size` for under-dispersed data."""
+        flat = fit_censored_negative_binomial(np.full(300, 100.0))
+        assert flat[0] == pytest.approx(100.0)
+        # var = mean * (1 + 1e-3) -> size = mean / 1e-3
+        assert flat[1] == pytest.approx(100.0 / 1e-3, rel=1e-6)
+
+        rng = np.random.default_rng(2)
+        gaussian = fit_censored_negative_binomial(rng.normal(100, 5, 500))
+        assert gaussian[1] > 1e3      # far sharper than the data's own spread
+
+    def test_too_little_data_returns_none(self):
+        assert fit_censored_negative_binomial(np.array([100.0, 101.0])) is None
+        assert fit_censored_negative_binomial(np.zeros(300)) is None
+
+
+class TestBiasOffsets:
+    def test_modes_select_their_factors(self):
+        df = pd.DataFrame({"gc_corr_fact": [2.0] * 4, "otr_gc_corr_fact": [3.0] * 4})
+        assert list(bias_offsets(df, "all")) == [6.0] * 4
+        assert list(bias_offsets(df, "gc")) == [2.0] * 4
+        assert list(bias_offsets(df, "otr")) == [3.0] * 4
+        assert list(bias_offsets(df, "none")) == [1.0] * 4
+
+    def test_missing_or_invalid_factors_fall_back_to_one(self):
+        assert list(bias_offsets(pd.DataFrame(index=range(3)), "all")) == [1.0] * 3
+        df = pd.DataFrame({"gc_corr_fact": [2.0, 0.0, np.nan, -1.0]})
+        assert list(bias_offsets(df, "gc")) == [2.0, 1.0, 1.0, 1.0]
+
+
+def test_offsets_shift_the_emission_mean_not_the_data():
+    """E[count | CN=k] = k * mu * offset, so a scaled offset scales the peak."""
+    counts = np.arange(0, 400, dtype=float)
+    plain = log_emission_with_offsets(counts, np.ones_like(counts), mu=100.0,
+                                      size=50.0, n_states=3, error_rate=0.15)
+    doubled = log_emission_with_offsets(counts, np.full_like(counts, 2.0), mu=100.0,
+                                        size=50.0, n_states=3, error_rate=0.15)
+    def mode(mu, size):
+        # abs=1 because the mode formula can land on an exact integer, where
+        # two adjacent counts tie and argmax simply takes the first.
+        return pytest.approx(np.floor(mu * (size - 1) / size), abs=1)
+
+    assert int(np.argmax(plain[:, 1])) == mode(100.0, 50.0)
+    # Doubling the offset doubles where state 1 expects to sit.
+    assert int(np.argmax(doubled[:, 1])) == mode(200.0, 50.0)
+    # State index is still copy number: state 2 peaks at twice state 1, with
+    # `size` scaled alongside so variance stays proportional to copy number.
+    assert int(np.argmax(plain[:, 2])) == mode(200.0, 100.0)
+
+
 def _flat_frame_with_repeat_spike(n=300, spike_at=slice(150, 155), depth=100.0):
     """Flat single-copy coverage with a repeat pile-up standing 6x above it.
 
@@ -204,15 +320,6 @@ def test_repeat_windows_still_get_a_call_and_keep_their_flag(tmp_path):
     assert "is_redundant" in result.columns
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="run_HMM still estimates the emission variance with np.var over every "
-           "window, so the 6x spike inflates var/mean to 37.8 and flattens the "
-           "emissions that should call it: 5 windows total +45.1 nats against a "
-           "+49.9 transition cost. Passed before only because the decode took a "
-           "per-window argmax rather than a path. Remove this marker with the "
-           "censored negative-binomial fit.",
-)
 def test_uncensored_frame_still_calls_the_amplification(tmp_path):
     # Same spike, not flagged as repeat: it is real signal and must be called.
     df = _flat_frame_with_repeat_spike()

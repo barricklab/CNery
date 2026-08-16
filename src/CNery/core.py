@@ -9,7 +9,8 @@ import seaborn as sns
 from scipy import stats
 from scipy import ndimage
 import matplotlib as mplt
-from scipy.stats import geom
+from scipy.stats import geom, nbinom
+from scipy.optimize import minimize
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -1064,13 +1065,232 @@ def solve_pr(mean, variance):
     p = 1 - (mean/variance)
     return p, r
 
+def calculate_logprob(p, r, obs):
+    # log probabilities under a negative binomial (Poisson family), to account for
+    # a wide dispersion of coverage data points given noisy data and high copy
+    # number possibilities (amplifications). gammaln allows the calculation
+    # without computational over-flow.
+    return (gammaln(r + obs) - gammaln(obs + 1) - gammaln(r)
+            + obs * np.log(p) + r * np.log(1 - p))
+
+
 def calculate_prob(p, r, obs):
-    # probabilities calculated by assuming negative binomial distribution (Poisson family), to account for 
-    # a wide dispersion of coverage data points given noisy data and high copy number possibilities (amplifications)
-    # gammaln function allows for calculation of log probabilities without computational over-flow. 
-    
-    probs = np.exp(gammaln(r + obs) - gammaln(obs + 1) - gammaln(r) + obs * np.log(p) + r * np.log(1 - p))
-    return probs
+    return np.exp(calculate_logprob(p, r, obs))
+
+
+def _nb_logpmf_mu(counts, mu, size):
+    """NB log pmf in the (mu, size) parameterisation breseq and R use."""
+    mu = np.asarray(mu, dtype=float)
+    return calculate_logprob(mu / (size + mu), size, counts)
+
+
+def _censor_bounds(values, lo_mult=0.5, hi_mult=1.5):
+    """breseq's censoring window: fixed multiples either side of the mode.
+
+    Ports `fit_censored_negative_binomial` in breseq's coverage_distribution.cpp:
+    the mode is the peak of a 5-point centred moving average of the histogram,
+    searched upward from `max(mean / 4, 1)` so a deletion spike near zero cannot
+    win it, and the window is `[floor(lo_mult * mode), ceil(hi_mult * mode)]`.
+
+    Low side removes deletions; high side removes amplifications and any repeat
+    pile-up that survived window censoring. Single pass, no re-fit loop.
+
+    Returns (lo, hi), or (None, None) if the histogram is degenerate.
+    """
+    v = np.asarray(values, dtype=int)
+    v = v[v >= 1]                      # as in breseq, the histogram has no zero bin
+    if v.size == 0:
+        return None, None
+
+    n_bins = int(v.max())
+    hist = np.bincount(v, minlength=n_bins + 1).astype(float)
+    total = hist[1:].sum()
+    if total <= 0:
+        return None, None
+    mean = float((np.arange(n_bins + 1) * hist).sum() / total)
+
+    if n_bins >= 5:
+        smoothed = np.convolve(hist, np.full(5, 0.2), mode="same")
+        valid = np.zeros(n_bins + 1, dtype=bool)
+        valid[3:n_bins - 1] = True     # undefined within 2 bins of either end
+    else:
+        smoothed = hist
+        valid = np.ones(n_bins + 1, dtype=bool)
+        valid[0] = False
+
+    valid[:max(int(mean / 4.0), 1)] = False
+    if not valid.any():
+        return None, None
+    mode = int(np.argmax(np.where(valid, smoothed, -np.inf)))
+
+    lo = max(int(np.floor(lo_mult * mode)), 1)
+    hi = min(int(np.ceil(hi_mult * mode)), n_bins)
+    if lo >= hi:
+        return None, None
+    return lo, hi
+
+
+def fit_censored_negative_binomial(counts, offsets=None, min_windows=30,
+                                   lo_mult=0.5, hi_mult=1.5, n_offset_bins=64):
+    """(mu, size) of the SINGLE-COPY count distribution, or None if degenerate.
+
+    `counts` are raw window depths and `offsets` the multiplicative GC/OTR bias
+    factors, so E[count_i] = mu * offsets[i] at copy number 1. The bias belongs
+    here, in the mean, rather than being divided out of the data: dividing a
+    count by f scales its variance by 1/f^2, which a single global variance
+    cannot represent, and rounding after dividing inflates the quantisation
+    error of exactly the low-coverage windows that can least afford it.
+
+    Censoring is breseq's (see _censor_bounds) and is what makes this measure
+    WITHIN-state dispersion. np.var over every window measures the spread of a
+    mixture -- deletions at 0x, amplifications at 2-3x -- so it reports BETWEEN
+    -state variance and over-disperses every state at once. On REL606 at
+    -w 100 -s 100 that is var/mean 6.0 where the within-state value is 2.6, and
+    it costs ~13 nats per window of CN2-vs-CN1 evidence at 2.5x coverage: more
+    than the entire budget of a two-window event.
+
+    Unlike breseq, the objective is the truncated likelihood rather than least
+    squares on a renormalised histogram -- breseq's choice is a concession to
+    its thousands of coarse-grained per-base bins. The fitted `size` is
+    therefore not numerically comparable to breseq's `nbinom_size_parameter`,
+    which is also fitted to unique-only PER-BASE counts rather than per-window
+    medians.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = (np.ones_like(counts) if offsets is None
+               else np.asarray(offsets, dtype=float))
+
+    usable = (np.isfinite(counts) & np.isfinite(offsets)
+              & (offsets > 0) & (counts >= 0))
+    counts, offsets = counts[usable], offsets[usable]
+    if counts.size < min_windows:
+        return None
+
+    # Offsets only matter up to a constant -- it trades off exactly against mu --
+    # so normalise, which makes mu the single-copy depth at a typical window and
+    # makes the fit independent of how apply_otr_correction scales its no-bias
+    # fallback (a constant equal to the mean, not 1.0).
+    offsets = offsets / np.median(offsets)
+
+    ratio = np.rint(counts / offsets).astype(int)
+    lo, hi = _censor_bounds(ratio, lo_mult, hi_mult)
+    if lo is None:
+        return None
+
+    keep = (ratio >= lo) & (ratio <= hi)
+    if keep.sum() < min_windows:
+        return None
+
+    kept_counts = np.rint(counts[keep]).astype(int)
+    kept_offsets = offsets[keep]
+    kept_ratio = ratio[keep]
+
+    # A negative binomial cannot represent under-dispersed data: the MLE would
+    # drive size off to infinity against the optimiser bound. Synthetic frames
+    # with Gaussian noise land here, and so does a perfectly flat one. Fall back
+    # to moments plus the historical `var = mean * (1 + 1e-3)` guard -- but
+    # taken over the CENSORED subset, so an amplification cannot inflate the
+    # dispersion that is supposed to detect it.
+    kept_mean = float(kept_ratio.mean())
+    kept_var = float(kept_ratio.var())
+    if kept_var <= kept_mean:
+        if kept_mean <= 0:
+            return None
+        guarded_var = kept_mean * (1.0 + 1e-3)
+        return kept_mean, kept_mean * kept_mean / (guarded_var - kept_mean)
+
+    # Collapse to (offset bin, count) cells so each objective evaluation costs
+    # thousands of gammaln calls rather than tens of thousands -- the same
+    # histogram trick breseq uses, extended to the offset dimension.
+    edges = np.linspace(kept_offsets.min(), kept_offsets.max(), n_offset_bins + 1)
+    obin = np.clip(np.digitize(kept_offsets, edges[1:-1]), 0, n_offset_bins - 1)
+    bin_offset = np.array([
+        kept_offsets[obin == b].mean() if np.any(obin == b) else np.nan
+        for b in range(n_offset_bins)
+    ])
+    live = np.isfinite(bin_offset)
+    bin_offset = bin_offset[live]
+    obin = np.searchsorted(np.flatnonzero(live), obin)
+
+    cell_key = obin.astype(np.int64) * (kept_counts.max() + 1) + kept_counts
+    uniq_key, cell_weight = np.unique(cell_key, return_counts=True)
+    cell_obin, cell_count = np.divmod(uniq_key, kept_counts.max() + 1)
+    cell_offset = bin_offset[cell_obin]
+    cell_weight = cell_weight.astype(float)
+
+    bin_weight = np.bincount(cell_obin, weights=cell_weight,
+                             minlength=bin_offset.size)
+
+    def neg_log_likelihood(params):
+        mu, size = np.exp(params)
+        if not (np.isfinite(mu) and np.isfinite(size)) or mu <= 0 or size <= 0:
+            return 1e12
+        ll = float((cell_weight * _nb_logpmf_mu(cell_count, mu * cell_offset, size)).sum())
+        # Conditioning on the censoring window: the bounds are on the ratio, so
+        # per window they are [lo * offset, hi * offset].
+        bin_mu = mu * bin_offset
+        prob = size / (size + bin_mu)
+        mass = (nbinom.cdf(np.floor(hi * bin_offset), size, prob)
+                - nbinom.cdf(np.ceil(lo * bin_offset) - 1, size, prob))
+        if not np.all(mass > 0) or not np.isfinite(ll):
+            return 1e12
+        return -(ll - float((bin_weight * np.log(mass)).sum()))
+
+    mu0 = kept_mean
+    size0 = mu0 * mu0 / max(kept_var - mu0, 1e-6)
+
+    best, best_score = None, np.inf
+    for mu_try in (mu0, 0.5 * (lo + hi), float(hi), float(lo)):
+        for size_try in (size0, 1e3, 1e1, 1e-1):
+            if mu_try <= 0 or size_try <= 0:
+                continue
+            result = minimize(neg_log_likelihood, np.log([mu_try, size_try]),
+                              method="Nelder-Mead",
+                              options=dict(xatol=1e-6, fatol=1e-6, maxiter=2000))
+            if not result.success and not np.isfinite(result.fun):
+                continue
+            if result.fun < best_score:
+                best_score, best = result.fun, np.exp(result.x)
+
+    if best is None or best_score >= 1e12:
+        return None
+
+    mu, size = float(best[0]), float(best[1])
+    if not (np.isfinite(mu) and np.isfinite(size)) or mu <= 0 or size <= 0:
+        return None
+
+    # breseq rejects a fit whose mass mostly falls outside the fitting window.
+    prob = size / (size + mu)
+    included = float(nbinom.cdf(hi, size, prob) - nbinom.cdf(lo - 1, size, prob))
+    if included < 0.01:
+        return None
+
+    return mu, size
+
+
+def log_emission_with_offsets(counts, offsets, mu, size, n_states, error_rate):
+    """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
+
+    State index == copy number: row 0 is the geometric zero state, and row k is
+    NegBinom(mu = k * mu * offset_i, size = k * size). Scaling `size` with the
+    state alongside the mean keeps variance proportional to copy number, which
+    is what the old `variance * (state + 1)` did -- the offsets are the change
+    here, not the across-state behaviour.
+
+    A per-window matrix replaces the old (state, count) lookup table because
+    the offsets vary per window, which no shared table can express. It also
+    removes the table's `absmax` ceiling and the read-count clipping that fed it.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+
+    out = np.empty((counts.size, n_states + 1), dtype=float)
+    out[:, 0] = geom.logpmf(counts + 1, 1 - error_rate)
+    for state in range(1, n_states + 1):
+        out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state * size)
+
+    out[~np.isfinite(out)] = -np.inf
+    return out
 
 #Emission Matrix
 def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
@@ -1250,13 +1470,51 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
     return _segments_from_path(path, win_st, win_end, chr_length)
 
 
+#: which correction factors compose the emission offset, per --bias mode.
+BIAS_OFFSET_COLUMNS = {
+    "all": ("gc_corr_fact", "otr_gc_corr_fact"),
+    "gc": ("gc_corr_fact",),
+    "otr": ("otr_gc_corr_fact",),
+    "none": (),
+}
+
+
+def bias_offsets(df, bias="all"):
+    """Multiplicative GC/OTR bias factor per window, for the emission mean.
+
+    Both factor columns are DIVISORS applied to normalized coverage
+    (apply_gc_correction: `gc_corr_norm_cov = norm_raw_cov / gc_corr_fact`;
+    apply_otr_correction: `otr_gc_corr_fact` is otr_fit's `y_fit`, and
+    `y_corr = y / y_fit`). So the same numbers multiply the EXPECTED raw count,
+    which is where they belong.
+
+    `bias` has to be passed in rather than inferred: process_multi_genome runs
+    GC correction unconditionally, so `gc_corr_fact` is on the frame even under
+    --bias none, and only the caller knows which factors were meant to apply.
+    """
+    offsets = np.ones(len(df), dtype=float)
+    for column in BIAS_OFFSET_COLUMNS.get(bias, BIAS_OFFSET_COLUMNS["all"]):
+        if column in df.columns:
+            factor = df[column].to_numpy(dtype=float)
+            offsets *= np.where(np.isfinite(factor) & (factor > 0), factor, 1.0)
+    return offsets
+
+
 def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
-            max_copy_number=100, min_called_windows=100):
+            max_copy_number=100, min_called_windows=100, bias="all"):
     """
     Viterbi copy-number calling.
 
+    The observation is the RAW window depth (`read_count_cov`); the GC and OTR
+    corrections enter as multiplicative offsets on the emission mean, so that
+    E[count | CN = k] = k * mu * offset. Dividing them out of the data instead
+    would scale each window's variance by 1/offset^2 while a single global
+    variance was applied to all of them, and would round after dividing, which
+    inflates the quantisation error of exactly the low-coverage windows that
+    can least afford it.
+
     Windows flagged `is_redundant` by mask_coverage_windows() are censored
-    from the observation sequence and from the emission-model estimate:
+    from the observation sequence and from the emission-model fit:
     coverage over a repeat reflects how many copies collapsed onto that
     locus, not the sample's copy number there, so leaving them in both
     inflates the variance -- pushing `n_states` up until pile-ups get their
@@ -1271,7 +1529,11 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
     `min_called_windows` is a floor: if censoring would leave fewer windows
     than this, every window is used instead. That keeps small references and
     the synthetic test fixtures -- which carry no `is_redundant` column at
-    all -- behaving exactly as before.
+    all -- behaving exactly as before. It governs the OBSERVATION SEQUENCE
+    only: the emission fit excludes every window with any redundant coverage
+    unconditionally, because a window that merely clips the edge of an IS
+    element sits at 1.2-1.4x, inside the fit's censoring window, where it would
+    inflate the dispersion precisely where sharpness matters most.
     """
 
     saveloc = os.path.join(output, "CNV_csv")
@@ -1295,33 +1557,58 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         .clip(upper=rc_cap)
     )
 
+    # Raw counts and their bias offsets, over every window.
+    counts_all = np.rint(
+        np.nan_to_num(new_exp["read_count_cov"].to_numpy(dtype=float))
+    ).clip(min=0)
+    offsets_all = bias_offsets(new_exp, bias=bias)
+
     if "is_redundant" in new_exp.columns:
-        called = ~new_exp["is_redundant"].to_numpy(dtype=bool)
+        not_redundant = ~new_exp["is_redundant"].to_numpy(dtype=bool)
     else:
-        called = np.ones(len(new_exp), dtype=bool)
+        not_redundant = np.ones(len(new_exp), dtype=bool)
+
+    # An offset is only meaningful up to a constant -- it trades off exactly
+    # against mu -- so anchor it once, on the windows the fit will see, and use
+    # that same scale for the emissions. Otherwise mu would be estimated on one
+    # normalisation and applied on another.
+    anchor = np.median(offsets_all[not_redundant])
+    if np.isfinite(anchor) and anchor > 0:
+        offsets_all = offsets_all / anchor
+
+    # The fit sees only clean windows, always. `min_called_windows` softens the
+    # OBSERVATION mask below, never this one.
+    fit_result = fit_censored_negative_binomial(
+        counts_all[not_redundant], offsets_all[not_redundant]
+    )
+
+    called = not_redundant.copy()
     if called.sum() < min_called_windows:
         called = np.ones(len(new_exp), dtype=bool)
 
     obs_exp = new_exp.loc[called]
-    cor_rc = obs_exp["otr_gc_corr_rdcnt_cov"].tolist()
+    counts = counts_all[called]
+    offsets = offsets_all[called]
 
-    mean = np.mean(cor_rc)
-    var = np.var(cor_rc)
-
-    if mean > 0 and var <= mean:
-        var = mean * (1.0 + 1e-3)
+    if fit_result is not None:
+        mu, size = fit_result
+    else:
+        # Degenerate input -- a flat or under-dispersed frame, where a negative
+        # binomial has no finite `size`. Fall back to the historical moment
+        # estimate and its guard so such frames behave exactly as before.
+        mean = float(np.mean(counts))
+        var = float(np.var(counts))
+        if mean > 0 and var <= mean:
+            var = mean * (1.0 + 1e-3)
+        p, size = solve_pr(mean, var)
+        mu = mean
 
     cov_max = int(np.nan_to_num(obs_exp["otr_gc_corr_norm_cov"].max()))
     n_states = min(max(cov_max, 5), int(max_copy_number))
 
-    rc_max = int(np.max(cor_rc))
-
-    this_emission = setup_emission_matrix(
-        n_states=n_states,
-        mean=mean,
-        variance=var,
-        absmax=rc_max,
-        error_rate=error_rate,
+    this_log_emission = log_emission_with_offsets(
+        counts, offsets, mu=mu, size=size,
+        n_states=n_states, error_rate=error_rate,
     )
     this_transition = setup_transition_matrix(
         n_states,
@@ -1333,12 +1620,13 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
     # over ALL windows -- the last segment must reach it even if the final
     # window is censored.
     copy_numbers = HMM_copy_number(
-        cor_rc,
+        counts,
         this_transition,
-        this_emission,
+        None,
         obs_exp["win_st"],
         obs_exp["win_end"],
         new_exp["win_end"].max(),
+        log_emission_obs=this_log_emission,
     )
 
     brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
