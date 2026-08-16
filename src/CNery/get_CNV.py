@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .core import (
+    DEFAULT_CHANGE_RATE,
     DEFAULT_FILE_ENDINGS,
     parse_region,
     process_multi_genome,
@@ -152,6 +153,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--change-rate",
+        action="store",
+        dest="change_rate",
+        default=DEFAULT_CHANGE_RATE,
+        required=False,
+        type=float,
+        help=(
+            "Prior probability PER BASE that copy number changes. The "
+            "per-window probability is 1 - exp(-rate * step-size), so changing "
+            "-w/-s no longer changes the implied biology. Read 1/rate as the "
+            "expected segment length: the default 1e-06 is one copy-number "
+            "boundary per megabase. Larger values give more, shorter segments."
+        ),
+    )
+    parser.add_argument(
         "--bias",
         choices=["all", "none", "gc", "otr"],
         default="all",
@@ -261,7 +277,13 @@ def main():
                 f"(pooled fit)."
             )
             df_gc["otr_gc_corr_norm_cov"] = df_gc["gc_corr_norm_cov"]
-            df_cnv = run_HMM(df_gc, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_gc,
+                out_dir,
+                error_rate=options.e,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "otr":
@@ -278,13 +300,25 @@ def main():
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
-            df_cnv = run_HMM(df_otr, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_otr,
+                out_dir,
+                error_rate=options.e,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "none":
             df_none = df_b2c.copy()
             df_none["otr_gc_corr_norm_cov"] = df_none["norm_raw_cov"]
-            df_cnv = run_HMM(df_none, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_none,
+                out_dir,
+                error_rate=options.e,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "all":
@@ -304,7 +338,13 @@ def main():
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
-            df_cnv = run_HMM(df_otr, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_otr,
+                out_dir,
+                error_rate=options.e,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
 

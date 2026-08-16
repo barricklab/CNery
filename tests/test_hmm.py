@@ -15,6 +15,8 @@ from CNery.core import (
     log_emission_with_offsets,
     bias_offsets,
     robust_state_count,
+    remain_prob_for_step,
+    window_geometry,
     _log_emission_lookup,
     _default_log_start,
 )
@@ -244,6 +246,73 @@ class TestBiasOffsets:
         assert list(bias_offsets(pd.DataFrame(index=range(3)), "all")) == [1.0] * 3
         df = pd.DataFrame({"gc_corr_fact": [2.0, 0.0, np.nan, -1.0]})
         assert list(bias_offsets(df, "gc")) == [2.0, 1.0, 1.0, 1.0]
+
+
+class TestPerBaseChangeRate:
+    """The state-change prior describes the genome, not the tiling."""
+
+    def test_remain_probability_is_multiplicative_in_step(self):
+        """Crossing 2s bases must cost exactly what crossing s twice costs.
+
+        This is the whole content of "per base": it holds for a Poisson
+        boundary process and fails for any flat per-window probability.
+        """
+        rate = 1e-5
+        assert remain_prob_for_step(rate, 200) == pytest.approx(
+            remain_prob_for_step(rate, 100) ** 2, rel=1e-9
+        )
+
+    def test_a_bigger_step_makes_a_change_more_likely(self):
+        rate = 1e-5
+        assert (remain_prob_for_step(rate, 50)
+                > remain_prob_for_step(rate, 100)
+                > remain_prob_for_step(rate, 400))
+
+    def test_rate_reads_as_one_boundary_per_reciprocal_bases(self):
+        # Over 1/rate bases the chain should remain with probability 1/e.
+        assert remain_prob_for_step(1e-6, 1_000_000) == pytest.approx(
+            np.exp(-1.0), rel=1e-6
+        )
+
+    def test_geometry_is_recovered_from_the_frame(self):
+        n = 50
+        for win, step in [(200, 100), (100, 100), (1000, 500)]:
+            df = pd.DataFrame({
+                "win_st": np.arange(n) * step,
+                "win_end": np.arange(n) * step + win,
+                "win_len": win,
+            })
+            assert window_geometry(df) == (float(step), float(win))
+
+    def test_a_censored_gap_does_not_cheapen_a_transition(self, tmp_path):
+        """Pricing a wide repeat gap as a cheaper crossing would make a
+        censored repeat a cheap place to break a segment -- the failure
+        censoring them was meant to prevent."""
+        df = _flat_frame_with_repeat_spike(n=300)
+        wide = _flat_frame_with_repeat_spike(n=300, spike_at=slice(150, 190))
+
+        step_a, win_a = window_geometry(df)
+        step_b, win_b = window_geometry(wide)
+        assert (step_a, win_a) == (step_b, win_b)
+
+        # And the calls do not gain a break across the wider censored block.
+        result, _ = _run(wide, tmp_path)
+        assert set(result["prob_copy_number"].unique()) == {1}
+
+
+class TestOverlapWeighting:
+    def test_is_a_no_op_for_non_overlapping_windows(self, otr_corrected_flat, tmp_path):
+        import os
+        from CNery.core import run_HMM
+        weighted, plain = [], []
+        for flag, sink in ((True, weighted), (False, plain)):
+            out = str(tmp_path / f"ow_{flag}")
+            os.makedirs(os.path.join(out, "CNV_csv"), exist_ok=True)
+            sink.append(
+                run_HMM(otr_corrected_flat.copy(), out, overlap_weighting=flag)
+            )
+        # conftest tiles at step == window, so alpha is 1 either way.
+        assert list(weighted[0]["prob_copy_number"]) == list(plain[0]["prob_copy_number"])
 
 
 class TestRobustStateCount:

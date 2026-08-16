@@ -1337,6 +1337,47 @@ def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
     # np.savetxt("emission.csv", emission, delimiter=",")  
     return emission
 
+#: Prior probability per BASE that copy number changes. 1e-6 is one boundary per
+#: ~1 Mb, against the ~25-40 segments these genomes actually carry.
+DEFAULT_CHANGE_RATE = 1e-6
+
+
+def window_geometry(df):
+    """(step, window) in bases, recovered from the frame.
+
+    run_HMM is not given -w/-s, but preprocess() writes win_st/win_end/win_len in
+    every --bias branch and every test fixture, so the geometry is recoverable
+    without changing any signature.
+    """
+    starts = np.asarray(df["win_st"], dtype=float)
+    step = float(np.median(np.diff(starts))) if starts.size > 1 else 0.0
+
+    if "win_len" in df.columns:
+        window = float(np.median(np.asarray(df["win_len"], dtype=float)))
+    else:
+        window = float(np.median(np.asarray(df["win_end"], dtype=float) - starts))
+
+    if not (step > 0):
+        step = window if window > 0 else 1.0
+    if not (window > 0):
+        window = step
+    return step, window
+
+
+def remain_prob_for_step(change_rate, step):
+    """P(copy number does not change across `step` bases).
+
+    Boundaries are modelled as a Poisson process of rate `change_rate` per base,
+    so P(remain) = exp(-rate * step). The prior then describes the GENOME rather
+    than the tiling: `changeprob` was a flat per-window probability, which means
+    the implied per-base rate was changeprob/step and re-tiling the same genome
+    silently restated the biology. That is what made short amplifications
+    uncallable at one geometry and callable at another.
+    """
+    remain = float(np.exp(-float(change_rate) * float(step)))
+    return float(np.clip(remain, 1e-12, 1.0 - 1e-12))
+
+
 #Transition Matrix setup
 def setup_transition_matrix(n_states, remain_prob):
     #include zero state:
@@ -1526,10 +1567,22 @@ def bias_offsets(df, bias="all"):
     return offsets
 
 
-def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
-            max_copy_number=100, min_called_windows=100, bias="all"):
+def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=None,
+            max_copy_number=100, min_called_windows=100, bias="all",
+            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True):
     """
     Viterbi copy-number calling.
+
+    `change_rate` is the prior probability PER BASE that copy number changes, so
+    the per-window probability is 1 - exp(-change_rate * step) and re-tiling the
+    same genome no longer restates the biology. `changeprob` is the escape
+    hatch: pass a float to go back to a flat per-window probability, ignoring
+    `change_rate`.
+
+    `overlap_weighting` tempers the log emissions by step/window. At the default
+    -w 200 -s 100 every base sits in two windows, so the likelihood would
+    otherwise count each base's evidence twice while the transition prior counts
+    it once.
 
     The observation is the RAW window depth (`read_count_cov`); the GC and OTR
     corrections enter as multiplicative offsets on the emission mean, so that
@@ -1637,10 +1690,20 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         counts, offsets, mu=mu, size=size,
         n_states=n_states, error_rate=error_rate,
     )
-    this_transition = setup_transition_matrix(
-        n_states,
-        remain_prob=(1 - changeprob),
-    )
+    step_bp, window_bp = window_geometry(new_exp)
+
+    if changeprob is not None:
+        remain_prob = 1.0 - float(changeprob)
+    else:
+        remain_prob = remain_prob_for_step(change_rate, step_bp)
+
+    this_transition = setup_transition_matrix(n_states, remain_prob=remain_prob)
+
+    # Every observed transition is charged one step, whatever gap the censored
+    # windows left. Pricing a wide repeat gap as a proportionally cheaper
+    # crossing would make a censored repeat a cheap place to break a segment --
+    # exactly what censoring them was meant to prevent.
+    emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
 
     # HMM_copy_number indexes win_st/win_end positionally, so the censored
     # subset can be passed straight through. chr_length stays the genome end
@@ -1654,6 +1717,7 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         obs_exp["win_end"],
         new_exp["win_end"].max(),
         log_emission_obs=this_log_emission,
+        emission_weight=emission_weight,
     )
 
     brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")

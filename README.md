@@ -10,6 +10,9 @@ Recent updates (latest commits):
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
 - **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
+- **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
+  number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
+  Read `1/rate` as the expected segment length.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
 
@@ -284,7 +287,8 @@ Each coverage table produces its own set of outputs, named with the sequence ID 
 $ CNery -h
 
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
-             [-w W] [-s S] [-f F] [-e E] [--bias {all,none,gc,otr}]
+             [-w W] [-s S] [-f F] [-e E] [--change-rate CHANGE_RATE]
+             [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -333,6 +337,14 @@ options:
   -e, --error-rate E    Approximate error rate in sequencing read coverage /
                         reference alignment. Widens the negative-binomial
                         emission distributions in the HMM. Default: 0.15.
+  --change-rate CHANGE_RATE
+                        Prior probability PER BASE that copy number changes.
+                        The per-window probability is 1 - exp(-rate * step-
+                        size), so changing -w/-s no longer changes the
+                        implied biology. Read 1/rate as the expected segment
+                        length: the default 1e-06 is one copy-number boundary
+                        per megabase. Larger values give more, shorter
+                        segments.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'
