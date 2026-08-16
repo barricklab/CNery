@@ -1268,6 +1268,32 @@ def fit_censored_negative_binomial(counts, offsets=None, min_windows=30,
     return mu, size
 
 
+def robust_state_count(counts, offsets, mu, min_states=5, max_states=100, support=3):
+    """How many copy-number states the model needs, ignoring lone spikes.
+
+    Taking `int(max(coverage))` lets a SINGLE outlier window set the state space
+    for the whole genome. That is not just wasted work: with a flat off-diagonal
+    the cost of every state change carries -log(n_states), so one window at 40x
+    would make calling a duplication ~1.3 nats dearer everywhere.
+
+    A state that no segment ever occupies costs sensitivity and buys nothing --
+    a one-window excursion cannot pay for its own entry and exit regardless --
+    so the ceiling comes from a `support`-window rolling median. A real
+    high-copy segment spans several windows and survives it; a spike does not.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+    if mu <= 0 or counts.size == 0:
+        return int(min_states)
+
+    ratio = np.nan_to_num(counts / (mu * np.where(offsets > 0, offsets, 1.0)))
+    if ratio.size >= support:
+        ratio = ndimage.median_filter(ratio, size=support, mode="nearest")
+
+    needed = int(np.ceil(np.nan_to_num(ratio.max())))
+    return int(min(max(needed, int(min_states)), int(max_states)))
+
+
 def log_emission_with_offsets(counts, offsets, mu, size, n_states, error_rate):
     """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
 
@@ -1603,8 +1629,9 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         p, size = solve_pr(mean, var)
         mu = mean
 
-    cov_max = int(np.nan_to_num(obs_exp["otr_gc_corr_norm_cov"].max()))
-    n_states = min(max(cov_max, 5), int(max_copy_number))
+    n_states = robust_state_count(
+        counts, offsets, mu, min_states=5, max_states=int(max_copy_number)
+    )
 
     this_log_emission = log_emission_with_offsets(
         counts, offsets, mu=mu, size=size,

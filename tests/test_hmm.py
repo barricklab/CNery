@@ -14,6 +14,7 @@ from CNery.core import (
     fit_censored_negative_binomial,
     log_emission_with_offsets,
     bias_offsets,
+    robust_state_count,
     _log_emission_lookup,
     _default_log_start,
 )
@@ -243,6 +244,35 @@ class TestBiasOffsets:
         assert list(bias_offsets(pd.DataFrame(index=range(3)), "all")) == [1.0] * 3
         df = pd.DataFrame({"gc_corr_fact": [2.0, 0.0, np.nan, -1.0]})
         assert list(bias_offsets(df, "gc")) == [2.0, 1.0, 1.0, 1.0]
+
+
+class TestRobustStateCount:
+    """One outlier window must not size the state space for a whole genome."""
+
+    def test_a_lone_spike_does_not_add_states(self):
+        counts = np.full(500, 100.0)
+        counts[250] = 4000.0            # a single 40x window
+        offsets = np.ones_like(counts)
+        assert robust_state_count(counts, offsets, mu=100.0) == 5
+
+    def test_a_sustained_high_copy_segment_does(self):
+        counts = np.full(500, 100.0)
+        counts[250:260] = 1000.0        # a real 10x segment
+        offsets = np.ones_like(counts)
+        assert robust_state_count(counts, offsets, mu=100.0) == 10
+
+    def test_offsets_are_divided_out_before_counting(self):
+        """A high-bias window is expected to be deep; that is not extra copies."""
+        counts = np.full(500, 100.0)
+        offsets = np.ones(500)
+        counts[100:120] = 300.0
+        offsets[100:120] = 3.0
+        assert robust_state_count(counts, offsets, mu=100.0) == 5
+
+    def test_respects_the_max_copy_number_cap(self):
+        counts = np.full(500, 100.0)
+        counts[100:120] = 100000.0
+        assert robust_state_count(counts, np.ones(500), mu=100.0, max_states=12) == 12
 
 
 def test_offsets_shift_the_emission_mean_not_the_data():
