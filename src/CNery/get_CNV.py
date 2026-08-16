@@ -105,11 +105,14 @@ def main():
         action="store",
         dest="w",
         required=False,
-        default=200,
+        default=100,
         type=int,
         help=(
             "Define window length to parse through the genome and calculate "
-            "coverage and GC statistics."
+            "coverage and GC statistics. Default: 100. Wider windows smooth "
+            "the coverage but lose short events: the window statistic is a "
+            "per-base median, whose precision grows sublinearly with width, so "
+            "-w is a resolution knob."
         ),
     )
 
@@ -124,7 +127,10 @@ def main():
         help=(
             "Define step size (<= window size) for each progression of the "
             "window across the genome sequence. Set step-size=window-size "
-            "if non-overlapping windows."
+            "if non-overlapping windows. Default: 100, i.e. non-overlapping. "
+            "Copy-number calls are near-invariant to this: the state-change "
+            "prior is per base (see --change-rate) and overlapping windows are "
+            "down-weighted so they do not count the same bases twice."
         ),
     )
 

@@ -221,12 +221,13 @@ are rejected before `get_CNV.main` creates any output directory.
   rate of `changeprob/step`, so re-tiling the same genome silently restated the biology. Every
   observed transition is charged one `step` regardless of the gap censored windows left — pricing a
   wide repeat gap as a cheaper crossing would make a censored repeat a cheap place to break a segment.
-- Log emissions are tempered by `step/window` (`overlap_weighting`). At the default `-w 200 -s 100`
-  every base sits in two windows, so the likelihood would otherwise count each base twice while the
-  transition prior counts it once. It is a no-op when `step == window`. Note this does **not** buy
-  full `-w` invariance: the window statistic is a per-base *median*, whose precision grows sublinearly
-  with window width (fitted `size` 43 at `w=100` against 54 at `w=200`), so `-w` remains a resolution
-  knob. Short events are called most reliably at `-w 100 -s 100`.
+- Log emissions are tempered by `step/window` (`overlap_weighting`). Under `-w 200 -s 100` every
+  base sits in two windows, so the likelihood would otherwise count each base twice while the
+  transition prior counts it once. It is a no-op at the default `-w 100 -s 100`, where
+  `step == window`. Note this does **not** buy full `-w` invariance: the window statistic is a
+  per-base *median*, whose precision grows sublinearly with window width (fitted `size` 43 at
+  `w=100` against 54 at `w=200`), so `-w` remains a resolution knob. That is why the default is
+  `-w 100 -s 100`: at `-w 200` the weakest two-window events stop being callable.
 - `robust_state_count` sizes the state space from a 3-window rolling median, not `int(max(coverage))`
   — with a flat off-diagonal the switch cost carries `-log(n_states)`, so one outlier window would
   otherwise make every duplication call dearer genome-wide.

@@ -328,10 +328,19 @@ options:
   -o, --output O        output file prefix / storage location. Defaults to
                         the 'CNV_out' folder in the current dir.
   -w, --window W        Window length used to parse the genome and compute
-                        coverage and GC statistics. Default: 200.
+                        coverage and GC statistics. Default: 100. Wider
+                        windows smooth the coverage but lose short events: the
+                        window statistic is a per-base median, whose precision
+                        grows sublinearly with width, so -w is a resolution
+                        knob.
   -s, --step-size S     Step size (<= window size) for each progression of
                         the window across the genome. Set step-size = window
-                        size for non-overlapping windows. Default: 100.
+                        size for non-overlapping windows. Default: 100, i.e.
+                        non-overlapping. Copy-number calls are near-invariant
+                        to this: the state-change prior is per base (see
+                        --change-rate) and overlapping windows are
+                        down-weighted so they do not count the same bases
+                        twice.
   -f, --frag-size F     Average fragment size of the sequencing reads.
                         Default: 150.
   -e, --error-rate E    Approximate error rate in sequencing read coverage /

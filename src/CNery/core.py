@@ -326,7 +326,7 @@ def read_coverage_table(path):
     return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
-def preprocess(df, win=200, step=100, frag=350):
+def preprocess(df, win=100, step=100, frag=150):
 
     if (step > win):
         return print(
@@ -664,9 +664,9 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
 def process_multi_genome(
     coverage_inputs,
     output_prefix,
-    win=200,
+    win=100,
     step=100,
-    frag=350,
+    frag=150,
 ):
     """
     Preprocess every coverage table, pool them for GC correction, plot the pooled bias,
