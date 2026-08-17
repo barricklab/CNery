@@ -247,17 +247,13 @@ def main():
     else:
         out_dir = "CNV_out/"
 
-    out_subdirs = ["/CNV_plt", "/CNV_csv", "/GC_bias", "/OTR_corr"]
+    out_subdirs = ['/CNV_plt', '/CNV_csv', '/GC_bias', '/OTR_corr']
     for sub in out_subdirs:
         Path(out_dir + sub).mkdir(parents=True, exist_ok=True)
 
     # Origin and terminus of replication are always inferred from the coverage profile
-    # print(
-    #     "Origin/terminus of replication will be inferred from the "
-    #     "coverage profile."
-    # )
 
-    # process single or multiple genomes in a unified way
+    # process every coverage table given in one pass
     per_genome = process_multi_genome(
         coverage_inputs,
         output_prefix=out_dir,
@@ -265,12 +261,21 @@ def main():
         step=options.s,
         frag=options.f,
     )
+    # process_multi_genome already:
+    #   - reads and preprocesses each coverage table
+    #   - pools all genomes, masks redundant/deletion windows, and does
+    #     LOWESS GC correction (mask_coverage_windows -> fit_gc_bias ->
+    #     apply_gc_correction)
+    #   - plots pooled GC bias
+    #   - returns {genome_id: df_gc_corrected_per_genome}, each already
+    #     carrying is_deletion/is_redundant columns from the GC-stage mask
 
-    smpl = out_dir.strip().split("/")[-1]
+    smpl = out_dir.strip().split('/')[-1]
     print(
         "Calculating coverage and GC% across sliding windows for each "
         "reference sequence"
     )
+
     def emit_cnv_plot(df_cnv, genome_id):
         """Plot this sequence's calls, unless --region selected other sequences."""
         if regions and genome_id not in regions:
@@ -290,8 +295,8 @@ def main():
             # df_b2c already GC-corrected by pooled LOWESS
             df_gc = df_b2c.copy()
             print(
-                f"{smpl} ({genome_id}): GC bias vs coverage handled "
-                f"(pooled fit)."
+                f'{smpl} ({genome_id}): GC bias vs coverage handled '
+                f'(pooled fit).'
             )
             df_gc["otr_gc_corr_norm_cov"] = df_gc["gc_corr_norm_cov"]
             df_cnv = run_HMM(
@@ -308,12 +313,16 @@ def main():
             df_otr_in = df_b2c.copy()
             df_otr_in["gc_corr_norm_cov"] = df_otr_in["norm_raw_cov"]
             # fit_otr_bias() then apply_otr_correction() replaces the old
-            # single-call otr_correction(df_otr_in, out_dir).
+            # single-call otr_correction(df_otr_in, out_dir). df_otr_in
+            # already carries is_deletion/is_redundant from the earlier
+            # GC-stage mask_coverage_windows() call inside
+            # process_multi_genome(), so fit_otr_bias() reuses them
+            # directly rather than recomputing.
             otr_fit_result = fit_otr_bias(df_otr_in, out_dir)
             df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
             print(
-                f"{smpl} ({genome_id}): Corrected origin/terminus of "
-                f"replication (OTR) bias in coverage."
+                f'{smpl} ({genome_id}): Corrected origin/terminus of '
+                f'replication (OTR) bias in coverage.'
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
@@ -342,16 +351,16 @@ def main():
             # df_b2c already has GC correction applied
             df_gc = df_b2c.copy()
             print(
-                f"{smpl} ({genome_id}): GC bias vs coverage handled "
-                f"(pooled fit)."
+                f'{smpl} ({genome_id}): GC bias vs coverage handled '
+                f'(pooled fit).'
             )
             # Same fit -> apply split as the "otr" branch above, replacing
             # otr_correction(df_gc, out_dir).
             otr_fit_result = fit_otr_bias(df_gc, out_dir)
             df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
             print(
-                f"{smpl} ({genome_id}): Corrected origin/terminus of "
-                f"replication (OTR) bias in coverage."
+                f'{smpl} ({genome_id}): Corrected origin/terminus of '
+                f'replication (OTR) bias in coverage.'
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")

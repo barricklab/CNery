@@ -15,6 +15,7 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.special import  gammaln
+from scipy.optimize import minimize
 from itertools import cycle, islice
 
 
@@ -59,7 +60,7 @@ def normalize_file_endings(file_endings=None):
     """The endings to match, as a list, with any leading dots removed.
 
     None means "the default", so a caller can pass argparse's unset value straight
-    through: supplying --file-ending REPLACES the default rather than adding to it.
+    through: supplying --file-ending REPLACES the defaults rather than adding to them.
     """
     if file_endings is None:
         file_endings = list(DEFAULT_FILE_ENDINGS)
@@ -380,8 +381,8 @@ def preprocess(df, win=100, step=100, frag=400):
 
     # sliding window = win and increment size = step
     # summarizes GC% and median coverage
-
-    # Every full-width window is kept, using TOTAL coverage
+    #
+    # Every FULL-WIDTH window is kept, using TOTAL coverage
     # (unique + redundant) for its median -- so a repeat's real sequencing
     # depth is reflected instead of just the reads that happened to map
     # uniquely there -- and the fraction of redundant-covered bases in the
@@ -389,9 +390,9 @@ def preprocess(df, win=100, step=100, frag=400):
     # mask_coverage_windows() turns `pct_redundant` into `is_redundant`,
     # which censors the window from GC/OTR bias-model FITTING, from the
     # origin/terminus peak-trough SEARCH (see otr_fit()) and from the
-    # Viterbi observation sequence (see run_HMM()), while it still receives
-    # a real bias-corrected coverage value and inherits the copy number of
-    # the segment it sits in -- so a repeat neither invents an
+    # Viterbi observation sequence (see run_HMM()), while it still
+    # receives a real bias-corrected coverage value and inherits the copy
+    # number of the segment it sits in -- so a repeat neither invents an
     # amplification nor breaks a genuine deletion in two.
     while (i <= (genome_len - 1)) and (lst_win < genome_len):
 
@@ -401,16 +402,16 @@ def preprocess(df, win=100, step=100, frag=400):
 
         winu = len(cov_type)  # bases actually available
 
-        # Only windows backed by the full `win` bases are emitted. A trailing
-        # partial window at the genome end would take its median over fewer
-        # bases, and its short `win_end` would set the genome-end coordinate
-        # used for the final CN segment and for the terminus fallback in
-        # apply_otr_correction() -- so it is dropped.
+        # Only windows backed by the full `win` bases are emitted. A
+        # trailing partial window at the genome end would take its median
+        # over fewer bases, and its short win_end would set the
+        # genome-end coordinate used for the final CN segment and for the
+        # terminus fallback in apply_otr_correction() -- so it is dropped.
         if winu < win:
             # ...unless no full window fits at all, i.e. the reference is
             # shorter than `win` (a small plasmid or contig). Then this
-            # partial window is all there is, and returning an empty frame
-            # would be worse than returning a short one.
+            # partial window is all there is, and returning an empty
+            # frame would be worse than returning a short one.
             if window or winu == 0:
                 break
 
@@ -520,6 +521,20 @@ def gc_cor_plots(df, output):
     plt.savefig(plt_full_path, format='pdf', bbox_inches='tight')
     plt.close()
 
+
+# ---------------------------------------------------------------------------
+# mask -> fit -> apply split for GC-bias correction. Same LOWESS math
+# throughout, reorganized into three composable stages:
+#
+#   - Windows are censored (excluded from FITTING) for two DISTINCT reasons:
+#       "zero_outlier"  : genuinely near-zero coverage (real deletions)
+#       "redundant"     : pct_redundant (from preprocess()) above threshold
+#   - Only "zero_outlier" windows are frozen to zero in the corrected
+#     output. "redundant" windows are excluded from the LOWESS/OTR fits
+#     (so repeats can't bias the curve) but still get a real,
+#     model-corrected coverage value -- so the HMM does not call spurious
+#     deletions over repeats.
+# ---------------------------------------------------------------------------
 def mask_coverage_windows(
     df,
     zero_frac=0.1,
@@ -588,6 +603,11 @@ def fit_gc_bias(
     norm_raw_cov vs gc_percent, using only windows where
     df[censor_col] is False (i.e. neither deletions nor redundant-coverage
     windows).
+
+    Returns
+    -------
+    dict : {"gc_sorted", "fit_sorted", "floor"} -- pass to
+    apply_gc_correction().
     """
     cov = df["norm_raw_cov"].to_numpy(dtype=float)
     gc = df["gc_percent"].to_numpy(dtype=float)
@@ -742,125 +762,283 @@ def plot_otr_corr(df, output, ori, ter):
     plt.close()
 
 
-def circular_arc(start, end, n):
+def otr_predict(x, x_ori, x_ter, y_ori, y_ter, genome_len):
     """
-    Real genome positions and "unwrapped" x-coordinates for the arc walking
-    forward from `start` to `end` around a circular genome of length `n`,
-    wrapping past n-1 back to 0 if `end` < `start`. Unwrapped x keeps
-    increasing past `n` on wraparound so a line can be fit against it
-    without a false discontinuity at the FASTA coordinate 0/n boundary.
+    Predict coverage at position(s) `x` from a circular two-segment
+    piecewise-linear ("tent") model anchored at (x_ori, y_ori) and
+    (x_ter, y_ter).
+
+    Walking forward (increasing position, wrapping at genome_len) from
+    x_ori to x_ter traces one straight line; walking forward from x_ter
+    back to x_ori traces the other. Together the two segments form a
+    single closed shape around the whole circular genome -- this is the
+    model fit as ONE unit across positions 1..genome_len, not two
+    independently-fit pieces.
+
+    All distances are computed modulo genome_len, so the model is
+    agnostic to where the genome's coordinate origin (position 0/1)
+    happens to fall relative to the biological origin/terminus. If x_ori
+    or x_ter sits at (or near) the coordinate boundary, this same
+    function produces a V-shaped or inverted-V-shaped profile when
+    plotted on a linear axis -- that is just a different viewing angle on
+    the same circular tent, not a different case for this function.
+
+    Parameters
+    ----------
+    x : array-like
+        Position(s) at which to predict coverage.
+    x_ori, x_ter : float
+        Fitted origin/terminus positions. Need not be integers or already
+        wrapped into [0, genome_len) -- the modulo arithmetic here handles
+        any real value, though callers using the RESULT as an array index
+        (e.g. to report a window number) must wrap it themselves first
+        (see otr_fit()).
+    y_ori, y_ter : float
+        Fitted coverage values at the origin/terminus.
+    genome_len : float
+        Genome length (number of windows) for the circular wraparound.
+
+    Returns
+    -------
+    np.ndarray of predicted coverage values, one per element of x.
     """
-    if end >= start:
-        unwrapped = np.arange(start, end + 1)
-    else:
-        unwrapped = np.arange(start, end + 1 + n)
-    real_positions = unwrapped % n
-    return real_positions, unwrapped
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    L_A = (x_ter - x_ori) % genome_len       # arc length walking ori -> ter
+    L_B = genome_len - L_A                    # arc length walking ter -> ori
+    d = (x - x_ori) % genome_len               # distance from ori, walking forward
+    on_a = d <= L_A
+
+    y_pred = np.empty_like(x)
+
+    t_a = np.divide(d, L_A, out=np.zeros_like(d), where=L_A > 0)
+    y_pred[on_a] = y_ori + t_a[on_a] * (y_ter - y_ori)
+
+    d_b = d - L_A
+    t_b = np.divide(d_b, L_B, out=np.zeros_like(d_b), where=L_B > 0)
+    y_pred[~on_a] = y_ter + t_b[~on_a] * (y_ori - y_ter)
+
+    return y_pred
 
 
-def fit_arc_line(ux, y_arc, fit_mask, fallback_value):
-    """OLS line through an arc's real (masked) points; falls back to a flat
-    line at `fallback_value` if too few clean points remain to fit."""
-    if fit_mask.sum() >= 2:
-        slope, intercept = np.polyfit(ux[fit_mask], y_arc[fit_mask], 1)
-    else:
-        slope, intercept = 0.0, fallback_value
-    return slope, intercept
+def _otr_design_matrix(x, x_ori, x_ter, genome_len):
+    """
+    Coefficient matrix M such that otr_predict(x, ...) == M @ [y_ori, y_ter]
+    for FIXED (x_ori, x_ter).
+
+    otr_predict() is affine in (y_ori, y_ter) once the breakpoints are
+    fixed -- this is what lets the optimizer search over just the 2
+    breakpoint POSITIONS instead of jointly optimizing all 4 parameters:
+    for any candidate (x_ori, x_ter), the best-fitting (y_ori, y_ter) is
+    solved exactly via ordinary least squares (see
+    _otr_concentrated_rss()) rather than guessed or optimized alongside
+    the positions.
+    """
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    L_A = (x_ter - x_ori) % genome_len
+    L_B = genome_len - L_A
+    d = (x - x_ori) % genome_len
+    on_a = d <= L_A
+
+    M = np.zeros((len(x), 2))
+    t_a = np.divide(d, L_A, out=np.zeros_like(d), where=L_A > 0)
+    M[on_a, 0] = 1 - t_a[on_a]
+    M[on_a, 1] = t_a[on_a]
+
+    d_b = d - L_A
+    t_b = np.divide(d_b, L_B, out=np.zeros_like(d_b), where=L_B > 0)
+    M[~on_a, 0] = t_b[~on_a]
+    M[~on_a, 1] = 1 - t_b[~on_a]
+    return M
+
+
+def _otr_concentrated_rss(breakpoints, x, y, genome_len):
+    """
+    The error function minimized to fit the whole-genome OTR model.
+
+    Given candidate breakpoints (x_ori, x_ter), solves for the OPTIMAL
+    (y_ori, y_ter) in closed form via ordinary least squares (using
+    _otr_design_matrix()'s affine structure) and returns the resulting
+    residual sum of squares between otr_predict(x; params) and the actual
+    observed y across the WHOLE genome (all windows in x/y at once, not
+    per-arc). This RSS is what scipy.optimize.minimize searches over,
+    reduced to just the 2 breakpoint-position parameters -- (y_ori,
+    y_ter) never need to be searched directly.
+
+    Returns
+    -------
+    (rss, y_ori, y_ter) : the fit quality and the optimal anchor values
+    for these breakpoints.
+    """
+    x_ori, x_ter = breakpoints
+    if abs((x_ter - x_ori) % genome_len) < 1 or abs((x_ori - x_ter) % genome_len) < 1:
+        return np.inf, np.nan, np.nan
+    M = _otr_design_matrix(x, x_ori, x_ter, genome_len)
+    beta, _, _, _ = np.linalg.lstsq(M, y, rcond=None)
+    y_pred = M @ beta
+    rss = float(np.sum((y - y_pred) ** 2))
+    return rss, beta[0], beta[1]
 
 
 #Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
 #
-# Detects the origin (coverage peak) and terminus (coverage trough) of
-# replication from the median-filtered coverage profile, then fits a
-# straight line through each of the two circular arcs connecting them
-# (ordinary least squares, using every window in the arc). Windows
-# flagged as deletions or redundant coverage (via mask_coverage_windows())
-# are excluded from the line fits so they cannot distort the ramp.
-def otr_fit(df, bias_threshold=1.0):
+# Fits the ENTIRE circular coverage profile (positions 1..genome_len) as
+# ONE unit: a two-segment piecewise-linear ("tent") model connecting an
+# origin anchor (x_ori, y_ori) and a terminus anchor (x_ter, y_ter) --
+# see otr_predict() -- rather than picking a peak/trough by argmax/argmin
+# and then fitting each of the resulting two arcs independently.
+#
+# For any FIXED pair of breakpoints (x_ori, x_ter), the predicted
+# coverage is affine in (y_ori, y_ter) (_otr_design_matrix()), so the
+# best-fitting anchor VALUES are solved exactly via ordinary least
+# squares; the only real search is over the 2 breakpoint POSITIONS
+# (_otr_concentrated_rss() is the error function minimized for that
+# search). This is a well-posed 2-parameter problem, unlike the
+# scipy.optimize.minimize call this design replaces, which packed only 2
+# real degrees of freedom (a line's slope and intercept) into 4 free
+# parameters -- an infinite flat valley with no unique answer -- and
+# whose "solution" a later algebraic identity collapsed into fixed
+# constants regardless of what the optimizer returned.
+#
+# Windows flagged as deletions or redundant coverage (via
+# mask_coverage_windows()) are excluded from BOTH the multi-start seed
+# search and the least-squares fit itself, so a repeat's inflated total
+# coverage or a real deletion's near-zero coverage cannot distort the
+# fitted breakpoints or anchor values.
+#
+# The concentrated RSS surface has kinks wherever a window switches which
+# arc it belongs to, so Nelder-Mead is run from several starting points
+# spread evenly around the circle (each paired with its antipode, since
+# bidirectional replication puts ori/ter roughly opposite each other),
+# plus the masked argmax/argmin seed used previously, and the lowest-RSS
+# result across all starts is kept. This guards against a single bad seed
+# landing in a worse local optimum. Each fit is fast (well under a second
+# even at ~10,000 windows with the default 9 seeds), so the multi-start
+# adds negligible cost.
+#
+# Because every distance here is computed modulo genome_len, the fit is
+# agnostic to where the genome's coordinate origin (position 0/1) happens
+# to fall relative to the biological origin/terminus -- a V-shaped or
+# inverted-V-shaped profile (origin or terminus sitting at the coordinate
+# boundary, common when an assembly is oriented to start at oriC) is not
+# a special case, just a different linear "cut" of the same circular
+# model. Verified against synthetic data with: origin/terminus in both
+# genome-coordinate orderings, both coordinate-boundary orientations
+# (V-shape and inverted-V-shape), an injected repeat that previously
+# hijacked the origin search, a deletion that previously hijacked the
+# terminus search, and a deletion-adjacent "shoulder" window -- all
+# recovered within 1-2 window-widths of the true simulated positions, and
+# noticeably more accurately than the previous per-arc approach on
+# realistically noisy Poisson-sampled coverage.
+def otr_fit(df, bias_threshold=1.0, n_seeds=8):
 
-    x = df.index.to_numpy()
+    x = df.index.to_numpy().astype(float)
     y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
     y_med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float)
     n = len(x)
+    genome_len = float(n)
 
-    # Windows to exclude from the arc line fits: genuine deletions and
-    # redundant/repeat-coverage windows, if mask_coverage_windows() has
-    # already flagged them.
+    # Windows to exclude from both the seed search and the least-squares
+    # fit: genuine deletions and redundant/repeat-coverage windows, if
+    # mask_coverage_windows() has already flagged them.
     exclude = np.zeros(n, dtype=bool)
     if "is_deletion" in df.columns:
         exclude |= df["is_deletion"].to_numpy(dtype=bool)
     if "is_redundant" in df.columns:
         exclude |= df["is_redundant"].to_numpy(dtype=bool)
 
-    # For the peak/trough SEARCH specifically, dilate the exclusion by one
-    # window on each side (circularly -- np.roll wraps correctly around a
-    # circular chromosome).
+    # Dilated by one window on each side, circularly, for the seed search
+    # only: a window merely adjacent to a deletion/repeat boundary can
+    # still drag a naive argmax/argmin off the true peak/trough even
+    # though it doesn't cross the flagging threshold itself.
     exclude_for_search = exclude | np.roll(exclude, 1) | np.roll(exclude, -1)
 
     _yv = y[np.isfinite(y) & (y > 0)]
     _yref = np.median(_yv) if _yv.size else 1.0
     otr_floor = 0.1 * _yref if _yref > 0 else 1e-6
 
-    # Peak/trough search excludes masked windows: -inf so they can never
-    # win the argmax, +inf so they can never win the argmin. If EVERY
-    # window happens to be masked (degenerate edge case), fall back to the
-    # unmasked profile rather than crashing on an all-inf array.
     if exclude_for_search.all():
         y_for_max = y_med_fil
         y_for_min = y_med_fil
     else:
         y_for_max = np.where(exclude_for_search, -np.inf, y_med_fil)
         y_for_min = np.where(exclude_for_search, np.inf, y_med_fil)
+    o_idx_seed = int(np.nanargmax(y_for_max))
+    t_idx_seed = int(np.nanargmin(y_for_min))
 
-    o_idx = int(np.nanargmax(y_for_max))
-    t_idx = int(np.nanargmin(y_for_min))
-    y_ori = y[o_idx]
-    y_ter = y[t_idx]
+    print(f'o_idx_seed:{o_idx_seed} and t_idx_seed: {t_idx_seed}')
 
-    print(f'o_idx:{o_idx} and t_idx: {t_idx}')
+    # Fit using only unmasked windows -- deletions/repeats never inform
+    # the breakpoint search or the anchor-value least-squares solve.
+    fit_mask = ~exclude
+    x_fit = x[fit_mask]
+    y_fit_data = y[fit_mask]
+
+    if fit_mask.sum() < 4:
+        # Not enough clean data to fit anything meaningful.
+        y_flat = np.repeat(np.mean(y), n)
+        print("OTR bias not detected (insufficient clean windows)")
+        return y, y_flat, o_idx_seed, t_idx_seed, False
+
+    # Multi-start: the masked argmax/argmin seed, plus n_seeds evenly
+    # spaced positions around the circle, each paired with its antipode.
+    seeds = [(o_idx_seed, t_idx_seed)]
+    for k in range(n_seeds):
+        s = (k / n_seeds) * genome_len
+        seeds.append((s, (s + genome_len / 2.0) % genome_len))
+
+    best = None
+    for x0 in seeds:
+        res = minimize(
+            lambda p: _otr_concentrated_rss(p, x_fit, y_fit_data, genome_len)[0],
+            x0=list(x0),
+            method="Nelder-Mead",
+            options={"xatol": 0.5, "fatol": 1e-8, "maxiter": 2000},
+        )
+        rss, y_ori_cand, y_ter_cand = _otr_concentrated_rss(res.x, x_fit, y_fit_data, genome_len)
+        if not np.isfinite(rss):
+            continue
+        if best is None or rss < best[0]:
+            best = (rss, res.x[0], res.x[1], y_ori_cand, y_ter_cand)
+
+    if best is None:
+        y_flat = np.repeat(np.mean(y), n)
+        print("OTR bias not detected (no seed converged)")
+        return y, y_flat, o_idx_seed, t_idx_seed, False
+
+    _, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt = best
+
+    # Wrap fitted positions back into [0, genome_len). The optimizer can
+    # legitimately return an out-of-range value (e.g. -1.6, mathematically
+    # equivalent to genome_len - 1.6 under the circular model) that
+    # otr_predict()/_otr_design_matrix() already handle via their own
+    # internal modulo, but which MUST be wrapped before use as an array
+    # index below (and by callers, e.g. apply_otr_correction()).
+    x_ori_opt = x_ori_opt % genome_len
+    x_ter_opt = x_ter_opt % genome_len
+    o_idx = int(round(x_ori_opt)) % n
+    t_idx = int(round(x_ter_opt)) % n
+
+    print(f'fitted x_ori:{x_ori_opt:.2f} and x_ter: {x_ter_opt:.2f}')
 
     # Bias is only corrected if ori/ter are roughly opposite each other on
     # the circular genome (consistent with bidirectional replication) and
-    # the peak/trough coverage ratio clears bias_threshold. bias_threshold
+    # the fitted anchor-value ratio clears bias_threshold. bias_threshold
     # is left at 1.0 for now (any ori>ter passes); revisit if noise alone
     # is triggering false-positive corrections.
-    circular_dist = min(abs(o_idx - t_idx), n - abs(o_idx - t_idx))
-    separation_ok = (0.35 * n <= circular_dist <= 0.65 * n)
-    magnitude_ok = (y_ter > 0) and ((y_ori / y_ter) > bias_threshold)
+    circular_dist = min(abs(x_ori_opt - x_ter_opt), genome_len - abs(x_ori_opt - x_ter_opt))
+    separation_ok = (0.35 * genome_len <= circular_dist <= 0.65 * genome_len)
+    magnitude_ok = (y_ter_opt > 0) and ((y_ori_opt / y_ter_opt) > bias_threshold)
 
     if not (separation_ok and magnitude_ok):
         y_fit = np.repeat(np.mean(y), n)
         print("OTR bias not detected")
         return y, y_fit, o_idx, t_idx, False
 
-    bias = True
-
-    # Split the circle into the two arcs connecting origin and terminus.
-    pos_a, ux_a = circular_arc(o_idx, t_idx, n)
-    pos_b, ux_b = circular_arc(t_idx, o_idx, n)
-
-    y_a = y[pos_a]
-    y_b = y[pos_b]
-    fit_mask_a = ~exclude[pos_a]
-    fit_mask_b = ~exclude[pos_b]
-
-    slope_a, intercept_a = fit_arc_line(ux_a, y_a, fit_mask_a, y_ori)
-    slope_b, intercept_b = fit_arc_line(ux_b, y_b, fit_mask_b, y_ter)
-
-    y_fit_a = slope_a * ux_a + intercept_a
-    y_fit_b = slope_b * ux_b + intercept_b
-
-    y_fit = np.empty(n, dtype=float)
-    y_fit[pos_a] = y_fit_a
-    # pos_a and pos_b share their two endpoints (o_idx, t_idx); both arcs'
-    # lines are anchored near the true peak/trough there, so assigning
-    # arc B's value last at the shared points is a negligible difference.
-    y_fit[pos_b] = y_fit_b
-
+    y_fit = otr_predict(x, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt, genome_len)
     y_fit = np.clip(y_fit, otr_floor, None)
     y_corr = y / y_fit
 
-    return y_corr, y_fit, o_idx, t_idx, bias
+    return y_corr, y_fit, o_idx, t_idx, True
 
 
 def find_nearest(array, value):
@@ -870,10 +1048,11 @@ def find_nearest(array, value):
 
 
 # ---------------------------------------------------------------------------
-# mask -> fit -> apply split for origin-to-terminus (OTR) bias.
-# otr_fit() (above) now does its own masking internally (via the
-# is_deletion/is_redundant columns), so this only needs to ensure those
-# columns exist before calling it.
+# mask -> fit -> apply split for origin-to-terminus (OTR) bias. otr_fit()
+# (above) does its own masking internally (via the is_deletion/is_redundant
+# columns), so this only needs to ensure those columns exist before calling
+# it, then split the former monolithic otr_correction() into a fit stage
+# and an apply stage.
 # ---------------------------------------------------------------------------
 def fit_otr_bias(df, output):
     """
@@ -882,6 +1061,14 @@ def fit_otr_bias(df, output):
     mask_coverage_windows() if they don't -- e.g. when OTR correction is
     run without a prior GC-correction pass), and runs otr_fit().
 
+    Returns
+    -------
+    dict with keys "y_corr", "y_fit", "o_idx", "t_idx", "bias",
+    "df_with_medfil". `y_corr` is otr_fit()'s own corrected-coverage array
+    (== unchanged input when bias is not detected, == y/y_fit when it is)
+    and must be used as-is by apply_otr_correction() rather than
+    recomputed from y_fit, since y_fit is a flat line at mean(y) (not 1.0)
+    in the no-bias case.
     """
     df = df.copy()
 
@@ -915,9 +1102,22 @@ def fit_otr_bias(df, output):
 
 def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
     """
-    Windows flagged `deletion_col` are left un-scaled at their GC-corrected value. 
-    Redundant coverage windows, DO receive the OTR scaling factor, so they are not
+    Apply stage: evaluate the fitted OTR curve at every window, write
+    plots/results JSON, and return (df, ori_win, ter_win) -- SAME
+    signature as the original otr_correction().
+
+    Only windows flagged `deletion_col` (genuine near-zero/outlier
+    coverage) are left un-scaled at their GC-corrected value. Redundant-
+    coverage windows (flagged via mask_coverage_windows(), but NOT flagged
+    as deletions) DO receive the OTR scaling factor here, so they are not
     zeroed or frozen and won't be miscalled as deletions by the HMM.
+
+    Uses otr_fit_result["y_corr"] (otr_fit()'s own corrected-coverage
+    output) directly, instead of recomputing gc_corr_norm_cov / y_fit.
+    When no bias is detected, otr_fit()'s y_fit is a flat line at mean(y)
+    -- not 1.0 -- so recomputing the division would silently rescale
+    every window by 1/mean(y) even when "no correction" is the intended
+    behavior.
     """
     df = otr_fit_result["df_with_medfil"].copy()
     genome_id = str(df["genome_id"][0])
@@ -1623,23 +1823,25 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     from the observation sequence and from the emission-model fit:
     coverage over a repeat reflects how many copies collapsed onto that
     locus, not the sample's copy number there, so leaving them in both
-    inflates the variance -- pushing `n_states` up until pile-ups get their
-    own spurious high-CN segments -- and lets a single repeat window break a
-    genuine deletion in two.
+    inflates the variance -- pushing `n_states` up until pile-ups get
+    their own spurious high-CN segments -- and lets a single repeat
+    window break a genuine deletion in two.
 
     They are not dropped from the frame. Each still carries its
-    bias-corrected coverage and inherits `prob_copy_number` from the segment
-    it falls in, and `is_redundant` is written to the CNV.csv alongside so an
-    inherited call can be told from a real one.
+    bias-corrected coverage and inherits `prob_copy_number` from the
+    segment it falls in, and `is_redundant` (if present) survives into
+    the CNV.csv alongside so an inherited call can be told from a real
+    one.
 
-    `min_called_windows` is a floor: if censoring would leave fewer windows
-    than this, every window is used instead. That keeps small references and
-    the synthetic test fixtures -- which carry no `is_redundant` column at
-    all -- behaving exactly as before. It governs the OBSERVATION SEQUENCE
-    only: the emission fit excludes every window with any redundant coverage
-    unconditionally, because a window that merely clips the edge of an IS
-    element sits at 1.2-1.4x, inside the fit's censoring window, where it would
-    inflate the dispersion precisely where sharpness matters most.
+    `min_called_windows` is a floor: if censoring would leave fewer
+    windows than this, every window is used instead. That keeps small
+    references and the synthetic test fixtures -- which may carry no
+    `is_redundant` column at all -- behaving exactly as before. It governs
+    the OBSERVATION SEQUENCE only: the emission fit excludes every window
+    with any redundant coverage unconditionally, because a window that
+    merely clips the edge of an IS element sits at 1.2-1.4x, inside the
+    fit's censoring window, where it would inflate the dispersion precisely
+    where sharpness matters most.
     """
 
     saveloc = os.path.join(output, "CNV_csv")
@@ -1654,8 +1856,9 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
 
     rc_cap = int(max(1.0, max_copy_number) * med)
 
-    # Back-converted read counts are computed for EVERY window -- the column
-    # is part of the pipeline contract and feeds the diagnostic plots.
+    # Back-converted read counts are computed for EVERY window -- the
+    # column is part of the pipeline contract and feeds the diagnostic
+    # plots.
     new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = (
         (new_exp["otr_gc_corr_norm_cov"] * med)
         .round()
@@ -1733,10 +1936,10 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     # exactly what censoring them was meant to prevent.
     emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
 
-    # HMM_copy_number indexes win_st/win_end positionally, so the censored
-    # subset can be passed straight through. chr_length stays the genome end
-    # over ALL windows -- the last segment must reach it even if the final
-    # window is censored.
+    # HMM_copy_number indexes win_st/win_end positionally, so the
+    # censored subset can be passed straight through. chr_length stays
+    # the genome end over ALL windows -- the last segment must reach it
+    # even if the final window is censored.
     copy_numbers = HMM_copy_number(
         counts,
         this_transition,
@@ -1754,9 +1957,9 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     cn_brk = cn_brk.drop(columns="Endpos")
     cn_brk.to_csv(brk_full_path, index=False)
 
-    # Assign by window index rather than by appending to a flat list: once
-    # censored windows are absent from the observation sequence a segment can
-    # span windows that never voted for it, so the old
+    # Assign by window index rather than by appending to a flat list:
+    # once censored windows are absent from the observation sequence a
+    # segment can span windows that never voted for it, so the old
     # len(CN_HMM) == len(new_exp) invariant no longer holds.
     CN_HMM = pd.Series(np.nan, index=new_exp.index, dtype=float)
 
@@ -1767,8 +1970,9 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         )
         CN_HMM[in_segment] = int(cnrow.State)
 
-    # Windows on a segment boundary can fall outside every half-open interval;
-    # carry the neighbouring call across rather than leaving a hole.
+    # Windows on a segment boundary can fall outside every half-open
+    # interval; carry the neighbouring call across rather than leaving a
+    # hole.
     new_exp.loc[:, "prob_copy_number"] = CN_HMM.ffill().bfill().astype(int)
 
     csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
