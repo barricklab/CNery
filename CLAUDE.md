@@ -110,6 +110,8 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `read_count_cov` | `preprocess` | median total (unique + redundant) coverage in the window |
 | `norm_raw_cov` | `preprocess` | `read_count_cov` / its median |
 | `pct_redundant` | `preprocess` | fraction of the window's bases overlapping repeat coverage |
+| `gc_skew` | `preprocess` | `(G-C)/(G+C)` over the window's `ref_base` letters |
+| `cum_gc_skew` | `preprocess` | running sum of `gc_skew`, mean-subtracted first |
 | `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
 | `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
 | `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
@@ -196,9 +198,29 @@ are rejected before `get_CNV.main` creates any output directory.
   `n_states + 1` square/rows. The negative binomial (not Poisson) is intentional: coverage is
   overdispersed, and `run_HMM` nudges `var` above `mean` when a synthetic-flat input would otherwise
   make `solve_pr` divide by a non-positive number.
-- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
-  `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
-  functions in `core.py` assume they already exist.
+- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created
+  once in `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
+  functions in `core.py` assume they already exist. `write_gc_skew_results` and `plot_gc_skew` are
+  the exceptions, making their own like `apply_otr_correction` does.
+- `predict_ori_ter_from_skew` (`core.py`) **does not censor** `is_deletion` / `is_redundant`
+  windows, unlike every other fit stage. GC skew is a property of the *reference sequence*, and a
+  deletion in the sample does not change the reference's base composition. Because
+  `cum_gc_skew` is a running sum, dropping a window would not merely omit it — it would displace
+  every point after it.
+- `cum_gc_skew` subtracts the mean skew before cumulating (`preprocess`). That is **not cosmetic
+  detrending**: it forces the sum to end at exactly zero, which is what makes `argmin`/`argmax`
+  independent of where the reference's coordinate 1 falls. Rotating the start by `r` windows then
+  maps the curve to `C'(k) = C((r+k) mod n) - C(r)`, a constant offset. Without it the sum ends at
+  `n * mean(skew) != 0`, the wraparound adds a linear ramp, and a circularly permuted copy of the
+  same genome predicts a different origin — which `TestGCSkewOriginTerminus` in
+  `tests/test_authentic.py` checks against the `REL606_2314906bp_shift` dataset.
+- Overlapping windows (`step < win`) count each base `win/step` times over in `cum_gc_skew`. That
+  is one uniform factor across every window, so it rescales the curve without moving either
+  extremum; no stride weighting is applied.
+- The GC-skew ori/ter is **computed and reported but deliberately not consumed** — OTR correction
+  and the HMM still use `otr_fit`'s coverage-derived estimate. Worth knowing before that changes:
+  `otr_fit` places ori/ter 30–33% apart on all three authentic datasets and so fails its own
+  35–65% gate, while the skew estimate puts them 49.0% apart and passes.
 
 ## Testing conventions
 

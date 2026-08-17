@@ -1,0 +1,12 @@
+{
+    "Origin (bp)": 3885501,
+    "Terminus (bp)": 1526001,
+    "Origin window index": 7771,
+    "Terminus window index": 3052,
+    "Windows": 9258,
+    "Separation (fraction of genome)": 0.4903,
+    "Cumulative skew amplitude": 151.2949,
+    "Replichore skew t-statistic": 34.77,
+    "Prediction confident": true,
+    "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+}

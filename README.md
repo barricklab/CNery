@@ -8,7 +8,8 @@ Recent updates (latest commits):
 - **CSV or TSV, full or `--total-only`** — all four shapes of table are read without being declared. The delimiter is detected from the file's own header row, and the column schema from its column names. `--total-only` tables are the recommended input: they carry three coverage columns instead of eight, so they are markedly smaller, and CNery loses nothing by using them.
 - **Files and folders on the command line** — name coverage tables directly, or name folders and let `CNery` find them by file ending (`--file-ending`, defaults `coverage.csv`, `coverage.tsv` and `coverage.tab`). Files and folders can be mixed in one command.
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
-- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
+- **Cumulative GC skew origin/terminus prediction** — `CNery` now also locates the replication origin and terminus from the reference's own cumulative GC skew ([Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593)), independently of read depth. Reported in `GC_skew/` as a marked-up plot and a JSON summary; nothing downstream consumes it yet.
+- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
@@ -273,8 +274,36 @@ Given an output folder `CNV_out/`, `CNery` writes:
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
 - `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, and the origin-to-terminus ratio.
+- `CNV_out/GC_skew/` — per-reference cumulative GC-skew plots with the predicted origin and terminus marked, and a JSON summary (`*_gc_skew_results.json`).
 
 Each coverage table produces its own set of outputs, named with the sequence ID derived from its file name. The GC-bias plot is the exception: one pooled fit covers every table in the run.
+
+### Origin and terminus from GC skew
+
+Bacterial genomes are G-rich on the leading strand and C-rich on the lagging strand, so the sign of the GC skew `(G−C)/(G+C)` flips at the two points where the replication strands switch. Summing the skew along the genome turns those sign changes into extrema: following [Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593), the cumulative curve reaches its **minimum over the replication origin** and its **maximum at the terminus**.
+
+`CNery` computes this from the coverage table's `ref_base` column — no FASTA and no read depth involved — and writes the result for every reference, in all four `--bias` modes:
+
+```json
+{
+    "Origin (bp)": 3885501,
+    "Terminus (bp)": 1526001,
+    "Origin window index": 7771,
+    "Terminus window index": 3052,
+    "Windows": 9258,
+    "Separation (fraction of genome)": 0.4903,
+    "Cumulative skew amplitude": 151.2949,
+    "Replichore skew t-statistic": 34.77,
+    "Prediction confident": true,
+    "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+}
+```
+
+`Prediction confident` is false when the genome is too short to support the inference, when the two extrema are not roughly antipodal (35–65% of the genome apart, as bidirectional replication implies), or when the two replichores' skew does not separate convincingly. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
+
+Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers. And it is invariant to circular permutation of the reference: a genome whose coordinates start elsewhere predicts the same locus.
+
+These values are **not yet used** for anything. Bias correction and copy-number calling still use the origin and terminus that `--bias otr` infers from the coverage profile.
 
 ---
 

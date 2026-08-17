@@ -349,11 +349,19 @@ def preprocess(df, win=200, step=100, frag=350):
         )
     )
 
+    # Prefix sums of the G and C counts along the reference, so each window's
+    # base composition is two array lookups instead of another pass of the
+    # per-window Python string work gc_percent already pays for.
+    bases = genome.to_numpy()
+    cum_g = np.concatenate(([0], np.cumsum(bases == 'G')))
+    cum_c = np.concatenate(([0], np.cumsum(bases == 'C')))
+
     fragseq = []
     fragment = []
     winseq = []
     seq = []
     gcp_s = []
+    gc_skew_s = []
     window = []
     win_end = []
     window_med_cov = []
@@ -414,6 +422,20 @@ def preprocess(df, win=200, step=100, frag=350):
         pct_redundant_s.insert(i, pct_redundant)
         winseq = genome[i:i + winu]
         seq.insert(i, ''.join(str(element) for element in winseq))
+
+        # GC skew (G-C)/(G+C) over the WINDOW, not over the fragment gc_percent
+        # uses. gc_percent is fragment-widened because it models a property of
+        # the sequencing chemistry; skew is a property of the genome's
+        # replication strand asymmetry, so it has to line up with win_st/win_end.
+        # A window holding neither G nor C carries no strand information at all,
+        # so it contributes 0 rather than dividing by zero. Non-ACGT characters
+        # count as neither, matching gc_percent's exact-uppercase membership test
+        # above -- a soft-masked (lowercase) reference is silently ignored by both.
+        g_count = int(cum_g[i + winu] - cum_g[i])
+        c_count = int(cum_c[i + winu] - cum_c[i])
+        gc_total = g_count + c_count
+        gc_skew_s.insert(i, ((g_count - c_count) / gc_total) if gc_total else 0.0)
+
         window.insert(i, i)
         win_end.insert(i, i + winu)
         lst_win = win_end[(len(win_end) - 1)]
@@ -455,6 +477,26 @@ def preprocess(df, win=200, step=100, frag=350):
     df_gc["norm_raw_cov"] = (
         df_gc["read_count_cov"] / df_gc["read_count_cov"].median()
     )
+
+    # Cumulative GC skew (Grigoriev 1998, NAR 26:2286): the running sum of the
+    # per-window skew bottoms out over the replication origin and peaks at the
+    # terminus. See predict_ori_ter_from_skew().
+    #
+    # The MEAN IS SUBTRACTED FIRST, and that is load-bearing rather than
+    # cosmetic. It forces the running sum to return to exactly zero at the last
+    # window, which is what makes argmin/argmax independent of where the
+    # reference's coordinate 1 happens to fall: rotating the start by r windows
+    # then maps the curve to C'(k) = C((r+k) mod n) - C(r), a constant offset,
+    # so both extrema stay on the same genomic locus. Without it the sum ends at
+    # n * mean(skew) != 0, the wraparound adds a linear ramp, and a circularly
+    # permuted reference of the SAME genome predicts a different origin.
+    #
+    # Overlapping windows (step < win) count each base win/step times over, but
+    # that is a single uniform factor on every window, so it rescales the curve
+    # without moving either extremum. No stride weighting is needed.
+    skew = np.asarray(gc_skew_s, dtype=float)
+    df_gc["gc_skew"] = skew
+    df_gc["cum_gc_skew"] = np.cumsum(skew - skew.mean()) if skew.size else skew
 
     return df_gc
 
@@ -966,6 +1008,170 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
         json.dump(results, f, indent=4)
 
     return df, xori, xter
+
+
+# ---------------------------------------------------------------------------
+# Origin/terminus from cumulative GC skew.
+#
+# An independent estimate of the same two coordinates otr_fit() reads off the
+# coverage profile, derived from the reference sequence instead of from read
+# depth. Grigoriev 1998 (NAR 26:2286): the cumulative sum of (G-C)/(G+C)
+# "reaches its global maximum at the E.coli terminus, while the minimum resides
+# over the replication origin".
+#
+# Nothing downstream consumes these values yet -- they are reported in their own
+# JSON and marked on their own plot, and OTR correction and the HMM are
+# unchanged. Worth knowing before wiring them in: on all three authentic
+# datasets otr_fit()'s coverage-based ori/ter land 30-33% apart and so fail its
+# 35-65% separation gate, while the skew estimate puts them 49% apart.
+# ---------------------------------------------------------------------------
+GC_SKEW_METHOD = "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+
+
+def predict_ori_ter_from_skew(
+    df,
+    win=None,
+    step=None,
+    min_windows=50,
+    sep_lo=0.35,
+    sep_hi=0.65,
+    min_t=5.0,
+):
+    """
+    Locate the replication origin and terminus on the cumulative GC skew curve:
+    origin = its global minimum, terminus = its global maximum.
+
+    Deliberately does NOT censor is_deletion / is_redundant windows, unlike
+    fit_gc_bias(), fit_otr_bias() and run_HMM(). GC skew is a property of the
+    REFERENCE SEQUENCE -- a deletion in the sample does not change the
+    reference's base composition -- and because the curve is a running sum,
+    dropping windows would not merely omit them, it would displace every point
+    after them. Please don't "fix" this.
+
+    The returned values are always the measured ones. The gate sets
+    `confident`; it never suppresses a coordinate, so a rejected prediction
+    stays diagnosable.
+    """
+    n = len(df)
+    if n == 0:
+        raise ValueError(
+            "cannot predict origin/terminus from an empty window frame."
+        )
+
+    skew = df["gc_skew"].to_numpy(dtype=float)
+    cum = df["cum_gc_skew"].to_numpy(dtype=float)
+    win_st = df["win_st"].to_numpy()
+
+    o_idx = int(np.argmin(cum))
+    t_idx = int(np.argmax(cum))
+
+    circular_dist = min(abs(o_idx - t_idx), n - abs(o_idx - t_idx))
+    separation = circular_dist / n if n else 0.0
+    amplitude = float(cum.max() - cum.min())
+
+    # Split the circle into the two replichores at the origin and terminus, and
+    # ask whether their mean skew really differs in sign. Overlapping windows
+    # are not independent observations, so the effective sample size is deflated
+    # by the win/step overlap factor -- otherwise t inflates with nothing but a
+    # smaller --step-size.
+    idx = np.arange(n)
+    arm_a = ((idx - o_idx) % n) <= ((t_idx - o_idx) % n)
+    a, b = skew[arm_a], skew[~arm_a]
+    overlap = (win / step) if (win and step) else 1.0
+
+    t_stat = 0.0
+    if a.size > 1 and b.size > 1:
+        pooled_var = (
+            (a.size - 1) * a.var(ddof=1) + (b.size - 1) * b.var(ddof=1)
+        ) / (n - 2)
+        eff_a, eff_b = a.size / overlap, b.size / overlap
+        denom = np.sqrt(pooled_var * (1 / eff_a + 1 / eff_b))
+        if denom > 0:
+            t_stat = float((a.mean() - b.mean()) / denom)
+
+    opposite_signs = bool(a.size and b.size and (a.mean() * b.mean() < 0))
+    confident = bool(
+        n >= min_windows
+        and sep_lo <= separation <= sep_hi
+        and opposite_signs
+        and abs(t_stat) >= min_t
+    )
+
+    return {
+        "Origin (bp)": int(win_st[o_idx]),
+        "Terminus (bp)": int(win_st[t_idx]),
+        "Origin window index": o_idx,
+        "Terminus window index": t_idx,
+        "Windows": n,
+        "Separation (fraction of genome)": round(separation, 4),
+        "Cumulative skew amplitude": round(amplitude, 4),
+        "Replichore skew t-statistic": round(t_stat, 2),
+        "Prediction confident": confident,
+        "Prediction method": GC_SKEW_METHOD,
+    }
+
+
+def write_gc_skew_results(result, output, genome_id):
+    """Write one reference's skew prediction to GC_skew/<name>_gc_skew_results.json.
+
+    Makes its own directory, as apply_otr_correction() does, so callers and
+    tests need not pre-create it.
+    """
+    samplename = output.strip().split("/")[-1] + str(genome_id)
+    savedir = os.path.join(output, "GC_skew")
+    os.makedirs(savedir, exist_ok=True)
+
+    path = os.path.join(savedir, f"{samplename}_gc_skew_results.json")
+    with open(path, "w") as fh:
+        # allow_nan=False: the OTR writer emits bare NaN, which json.load
+        # tolerates but is not valid RFC JSON. Every value here is finite, so
+        # this stays strict -- and fails loudly if that ever stops being true.
+        json.dump(result, fh, indent=4, allow_nan=False)
+    return path
+
+
+def plot_gc_skew(df, output, result):
+    """Cumulative GC skew across the reference, with the predicted ori/ter marked."""
+    genome_id = str(df["genome_id"].iloc[0])
+    samplename = output.strip().split("/")[-1] + genome_id
+    savedir = os.path.join(output, "GC_skew")
+    os.makedirs(savedir, exist_ok=True)
+
+    ori = result["Origin (bp)"]
+    ter = result["Terminus (bp)"]
+    confident = result["Prediction confident"]
+
+    plt.figure(figsize=(10, 8))
+    plt.plot(df["win_st"], df["cum_gc_skew"], color="purple",
+             label="Cumulative GC skew")
+    plt.axhline(0, color="gray", linewidth=0.8)
+
+    # A rejected prediction is far easier to diagnose as a picture than as a
+    # boolean, so the extrema are always drawn -- the title carries the verdict.
+    plt.axvline(x=ori, color="r", linestyle=":", label=f"Origin: {ori}")
+    plt.axvline(x=ter, color="b", linestyle=":", label=f"Terminus: {ter}")
+    plt.scatter(
+        [ori, ter],
+        [df["cum_gc_skew"].min(), df["cum_gc_skew"].max()],
+        color=["r", "b"], s=60, zorder=3,
+    )
+
+    verdict = "confident" if confident else "LOW CONFIDENCE"
+    plt.xlabel("Window (Genomic position)")
+    plt.ylabel("Cumulative GC skew  (running sum of (G-C)/(G+C))")
+    plt.title(
+        f"{samplename}_Cumulative GC skew\n"
+        f"separation {result['Separation (fraction of genome)']:.1%} of genome, "
+        f"t={result['Replichore skew t-statistic']} -- {verdict}"
+    )
+    plt.legend(loc="upper right")
+
+    plt_full_path = os.path.join(
+        savedir, "%s_GC_skew.pdf" % samplename.replace(" ", "_")
+    )
+    plt.savefig(plt_full_path, format="pdf", bbox_inches="tight")
+    plt.close()
+    return plt_full_path
 
 
 def plot_copy(df_cnv, pltstart, pltend, output):

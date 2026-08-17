@@ -41,10 +41,14 @@ from CNery.core import (
     coverage_table_path,
     fit_otr_bias,
     genome_id_from_path,
+    plot_gc_skew,
+    predict_ori_ter_from_skew,
     preprocess,
     process_multi_genome,
+    read_coverage_table,
     resolve_coverage_inputs,
     run_HMM,
+    write_gc_skew_results,
 )
 from data._fetch import load_registry
 
@@ -99,7 +103,7 @@ def pipeline(dataset_dir, tmp_path_factory):
     name, path = dataset_dir
     spec = DATASETS[name]
     out = tmp_path_factory.mktemp(f"out_{name}")
-    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr"):
+    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
 
     per_genome = process_multi_genome(
@@ -113,8 +117,15 @@ def pipeline(dataset_dir, tmp_path_factory):
     # call inside process_multi_genome()'s GC stage, so fit_otr_bias() reuses them.
     df_otr, ori, ter = apply_otr_correction(fit_otr_bias(df_gc, str(out)), str(out))
     df_cnv = run_HMM(df_otr, str(out))
+
+    # Independent of everything above -- it reads only ref_base -- but produced
+    # here so the artifacts land in the same output tree as the rest.
+    skew = predict_ori_ter_from_skew(df_gc, win=WIN, step=STEP)
+    write_gc_skew_results(skew, str(out), spec.seq_id)
+    plot_gc_skew(df_gc, str(out), skew)
+
     return {"name": name, "spec": spec, "out": out,
-            "gc": df_gc, "otr": df_otr, "cnv": df_cnv}
+            "gc": df_gc, "otr": df_otr, "cnv": df_cnv, "skew": skew}
 
 
 def _produced(pipeline, subdir, suffix):
@@ -306,6 +317,10 @@ class TestOriginTerminus:
     expected; three independent samples landing at 30-33% points at the seed compressing
     the separation rather than at three unlucky datasets.
 
+    TestGCSkewOriginTerminus below is the independent cross-check on that reading: the
+    sequence-derived estimate puts the two 49.0% apart on the same three datasets, which is
+    the antipodal arrangement the coverage seed is failing to recover.
+
     These assertions fail if detection starts OR stops happening -- either is a real change
     worth noticing while this area is under development.
     """
@@ -342,6 +357,113 @@ class TestOriginTerminus:
             _golden(pipeline["name"], "_otr_results.json"),
             regenerate_goldens, compare,
         )
+
+
+# --------------------------------------------------------------------------- GC skew
+
+
+# Coordinate rotation baked into the p1_50k_shift reference, and named in its
+# sequence ID (REL606_2314906bp_shift): adding it to a coordinate in that
+# reference gives the same locus in the two unshifted REL606 references.
+SHIFT_BP = 2_314_906
+SHIFTED = "ltee_ara_p1_50k_shift"
+UNSHIFTED = ["ltee_ara_m3_38k", "ltee_ara_m3_32k_2rg"]
+
+
+def _circular_delta(a, b, length=GENOME_LEN):
+    d = abs(a - b) % length
+    return min(d, length - d)
+
+
+@pytest.fixture(scope="session")
+def skew_by_dataset():
+    """Skew prediction for every dataset, for the cross-dataset comparisons.
+
+    Needs only preprocess(), not the bias-correction pipeline -- which is the
+    point of several of the assertions below.
+    """
+    from conftest import _dataset_or_skip
+
+    out = {}
+    for name, spec in DATASETS.items():
+        path = _dataset_or_skip(name)
+        df = preprocess(
+            read_coverage_table(coverage_table_path(str(path), spec.seq_id)),
+            win=WIN, step=STEP, frag=FRAG,
+        )
+        out[name] = predict_ori_ter_from_skew(df, win=WIN, step=STEP)
+    return out
+
+
+@pytest.mark.parametrize("dataset_dir", ALL, indirect=True)
+class TestGCSkewArtifacts:
+    def test_json_and_plot_are_written(self, pipeline):
+        assert os.path.exists(_produced(pipeline, "GC_skew", "_gc_skew_results.json"))
+        assert os.path.exists(_produced(pipeline, "GC_skew", "_GC_skew.pdf"))
+
+    def test_prediction_is_confident_on_real_data(self, pipeline):
+        # The whole point of the method: it succeeds on the three datasets where
+        # the coverage-based estimate does not (see TestOriginTerminus).
+        assert pipeline["skew"]["Prediction confident"] is True
+
+    def test_separation_clears_the_band_coverage_fails(self, pipeline):
+        # otr_fit's seed puts these at 30-33%; the skew estimate puts them at 49%.
+        assert 0.35 <= pipeline["skew"]["Separation (fraction of genome)"] <= 0.65
+
+    def test_skew_json_matches_golden(self, pipeline, regenerate_goldens):
+        from conftest import golden_compare
+
+        def compare(got_path, want_path):
+            with open(got_path) as fh:
+                got = json.load(fh)
+            with open(want_path) as fh:
+                want = json.load(fh)
+            # Integer coordinates and the verdict only. The floats (separation,
+            # amplitude, t) are left out deliberately -- they are summary
+            # statistics that drift with library versions, and the structural
+            # facts are what a reviewer needs to see change.
+            for key in ("Origin (bp)", "Terminus (bp)",
+                        "Origin window index", "Terminus window index",
+                        "Windows", "Prediction confident"):
+                assert got[key] == want[key], key
+
+        golden_compare(
+            _produced(pipeline, "GC_skew", "_gc_skew_results.json"),
+            _golden(pipeline["name"], "_gc_skew_results.json"),
+            regenerate_goldens, compare,
+        )
+
+
+class TestGCSkewOriginTerminus:
+    """The prediction tracks the reference sequence, not the sample or its coordinates.
+
+    Two independent properties, and the three datasets happen to test both. The
+    two unshifted datasets are different LTEE clones (Ara-3 at 32k and 38k
+    generations) against the same reference, so any dependence on read depth
+    would split them. The third carries the same REL606 sequence rotated by
+    2,314,906 bp, so any dependence on where coordinate 1 falls would move it --
+    which is exactly what subtracting the mean before cumulating prevents.
+    """
+
+    def test_different_samples_same_reference_agree_exactly(self, skew_by_dataset):
+        a, b = (skew_by_dataset[n] for n in UNSHIFTED)
+        assert a["Origin (bp)"] == b["Origin (bp)"]
+        assert a["Terminus (bp)"] == b["Terminus (bp)"]
+
+    @pytest.mark.parametrize("key", ["Origin (bp)", "Terminus (bp)"])
+    def test_permuted_reference_predicts_the_same_locus(self, skew_by_dataset, key):
+        mapped = skew_by_dataset[SHIFTED][key] + SHIFT_BP
+        reference = skew_by_dataset[UNSHIFTED[0]][key]
+        delta = _circular_delta(mapped, reference)
+        assert delta <= WIN, (
+            f"{key}: rotated reference maps to {mapped % GENOME_LEN}, "
+            f"unrotated says {reference} ({delta} bp apart)"
+        )
+
+    def test_origin_and_terminus_are_near_antipodal(self, skew_by_dataset):
+        for name, result in skew_by_dataset.items():
+            gap = _circular_delta(result["Origin (bp)"], result["Terminus (bp)"])
+            assert 0.35 <= gap / GENOME_LEN <= 0.65, name
 
 
 # --------------------------------------------------------------------------- copy number
