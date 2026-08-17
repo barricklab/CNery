@@ -56,14 +56,19 @@ from CNery.core import (
     TOTAL_ONLY_COLUMNS,
     _detect_delimiter,
     _read_coverage_table,
+    _skew_block_length,
     apply_otr_correction,
     fit_otr_bias,
     genome_id_from_path,
+    plot_gc_skew,
+    predict_ori_ter_from_skew,
     preprocess,
     process_multi_genome,
+    read_coverage_table,
     relative_copy_numbers,
     resolve_coverage_inputs,
     run_HMM,
+    write_gc_skew_results,
 )
 from data._fetch import load_registry
 
@@ -90,6 +95,7 @@ class Sequence:
     expected_cn: int = 1         # modal copy number run_HMM actually calls
     otr_detected: bool = False   # does otr_fit find a replication gradient here?
     otr_tightens: bool = True    # ...and is the gradient strong enough to help?
+    skew_confident: bool = True  # does the cumulative GC skew clear its own gate?
     has_deletions: bool = True  # any window at or below 10% of the median
     has_repeats: bool = True    # any window carrying redundant coverage
 
@@ -143,8 +149,17 @@ DATASETS = {
          # wash: windows within 20% of single-copy go 91.8% -> 91.5%, IQR 0.130 -> 0.136.
          # Contrast p5_75k_exp at ratio 2.05 (53% -> 95%). Recorded rather than asserted
          # away -- a weak gradient that neither helps nor harms is the honest reading.
-         Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False),
-         Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False)),
+         # Neither plasmid clears the GC-skew gate, which is the expected answer:
+         # a plasmid has no bidirectional replication origin, so there is no sign
+         # change for the cumulative curve to turn on. Both are rejected by the
+         # bootstrap (p = 0.36 and 0.44) rather than by their size -- plasmid_1
+         # even lands inside the 35-65% separation band at 0.444, so separation
+         # alone would pass it, and both get an adequate 21 and 16 blocks, so the
+         # rejection is on evidence rather than on having too little data.
+         Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False,
+                  skew_confident=False),
+         Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False,
+                  skew_confident=False)),
         0, 4, 4, schema="total_only", ending="coverage.csv"),
     "adp1_mgd06_lb": Spec(
         (Sequence("ADP1-ISx", 3_592_307),), 0, 4, 4, schema="total_only"),
@@ -213,7 +228,7 @@ _PIPELINES = {}
 
 def _run_pipeline(name, path, out):
     """process_multi_genome once, then OTR + HMM per sequence, mirroring get_CNV.main()."""
-    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr"):
+    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
 
     per_genome = process_multi_genome(
@@ -235,7 +250,16 @@ def _run_pipeline(name, path, out):
             fit_otr_bias(df_gc, str(out)), str(out),
             relative_copy_number=relative_cn[seq_id],
         )
-        frames[seq_id] = {"gc": df_gc, "otr": df_otr, "cnv": run_HMM(df_otr, str(out))}
+
+        # Independent of everything above -- it reads only ref_base -- but run
+        # here so the artifacts land in the same output tree as the rest, and
+        # ahead of nothing, exactly as get_CNV.main() places it.
+        skew = predict_ori_ter_from_skew(df_gc, win=WIN, step=STEP)
+        write_gc_skew_results(skew, str(out), seq_id)
+        plot_gc_skew(df_gc, str(out), skew)
+
+        frames[seq_id] = {"gc": df_gc, "otr": df_otr,
+                          "cnv": run_HMM(df_otr, str(out)), "skew": skew}
 
     return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
 
@@ -497,6 +521,12 @@ class TestOriginTerminus:
     stationary-phase Ara-3 samples sit at 31.6% and 14.2% separation and cannot clear the
     gate at all.
 
+    TestGCSkewOriginTerminus is the independent cross-check on that reading. The
+    sequence-derived estimate puts ori/ter ~49% apart on every REL606 sequence regardless
+    of growth phase, since it never looks at coverage -- which says the stationary-phase
+    failures above are a property of the coverage SIGNAL (no active forks to leave a
+    gradient), not of the genome or of the fit.
+
     These assertions fail if detection starts OR stops happening anywhere -- either is a
     real change worth noticing.
     """
@@ -588,6 +618,147 @@ class TestOriginTerminus:
             _golden(seq["name"], seq["seq_id"], "_otr_results.json"),
             regenerate_goldens, compare,
         )
+
+
+# --------------------------------------------------------------------------- GC skew
+
+
+# Coordinate rotation baked into the p1_50k_shift reference, and named in its
+# sequence ID (REL606_2314906bp_shift): adding it to a coordinate in that
+# reference gives the same locus in the unrotated REL606 references.
+SHIFT_BP = 2_314_906
+SHIFTED = "ltee_ara_p1_50k_shift"
+
+#: Every dataset whose reference is REL606 in its published orientation. Three
+#: different clones across two growth phases, which is what makes
+#: test_same_reference_agrees_exactly a real test rather than a tautology.
+UNSHIFTED = ["ltee_ara_m3_38k", "ltee_ara_m3_32k_2rg", "ltee_ara_p5_75k_exp"]
+
+
+def _circular_delta(a, b, length=REL606):
+    d = abs(a - b) % length
+    return min(d, length - d)
+
+
+@pytest.fixture(scope="session")
+def skew_by_sequence():
+    """{(dataset, seq_id): prediction} for every sequence in every dataset.
+
+    Built from preprocess() alone rather than from the `pipeline` fixture: the
+    cross-dataset comparisons below are about the prediction being a function of
+    the reference and nothing else, so they should not run through the
+    bias-correction stages at all.
+    """
+    from conftest import _dataset_or_skip
+
+    out = {}
+    for name, spec in DATASETS.items():
+        path = _dataset_or_skip(name)
+        for seq_id, table in _tables(path, name).items():
+            df = preprocess(read_coverage_table(table),
+                            win=WIN, step=STEP, frag=FRAG)
+            out[(name, seq_id)] = predict_ori_ter_from_skew(df, win=WIN, step=STEP)
+    return out
+
+
+@per_sequence
+class TestGCSkewArtifacts:
+    def test_json_and_plot_are_written(self, seq):
+        for suffix in ("_gc_skew_results.json", "_GC_skew.pdf"):
+            assert os.path.exists(
+                _produced(seq["out"], seq["seq_id"], "GC_skew", suffix)
+            ), suffix
+
+    def test_confidence_matches_the_spec(self, seq):
+        # Recorded per sequence rather than blanket-asserted, for the same reason
+        # otr_detected is: a plasmid has no replication origin, so there is no
+        # sign change for the cumulative curve to turn on.
+        assert seq["skew"]["Prediction confident"] is seq["seq"].skew_confident
+
+    def test_confident_predictions_are_near_antipodal(self, seq):
+        if not seq["seq"].skew_confident:
+            pytest.skip("no confident skew prediction on this sequence")
+        assert 0.35 <= seq["skew"]["Separation (fraction of genome)"] <= 0.65
+
+    def test_p_value_agrees_with_the_verdict(self, seq):
+        # Every chromosome exhausts the bootstrap and reads back its floor of
+        # 1/(B+1); neither plasmid comes close (0.36 and 0.44). Asserted as a
+        # band rather than exactly, since p is a Monte Carlo estimate.
+        p = seq["skew"]["Replichore skew p-value"]
+        floor = 1 / (seq["skew"]["Bootstrap surrogates"] + 1)
+        if seq["seq"].skew_confident:
+            assert p == pytest.approx(floor, rel=0.01), "expected p at its floor"
+        else:
+            assert p > 0.1, "a sequence with no origin should be nowhere near significant"
+
+    def test_plasmids_are_rejected_on_evidence_not_on_size(self, seq):
+        # The bootstrap replaced a minimum-window gate, so it matters that the
+        # plasmids fail for the right reason. Both get an adequate number of
+        # blocks (21 and 16) and still land at p > 0.1 -- they are rejected
+        # because there is no replichore structure, not because they are short.
+        if seq["seq"].skew_confident:
+            pytest.skip("this sequence has a confident prediction")
+        n = seq["skew"]["Windows"]
+        assert n / _skew_block_length(n) >= 10, "too few blocks to conclude anything"
+
+    def test_skew_json_matches_golden(self, seq, regenerate_goldens):
+        from conftest import golden_compare
+
+        def compare(got_path, want_path):
+            with open(got_path) as fh:
+                got = json.load(fh)
+            with open(want_path) as fh:
+                want = json.load(fh)
+            # Integer coordinates and the verdict only. The floats (separation,
+            # amplitude, t) are left out deliberately -- they are summary
+            # statistics that drift with library versions, and the structural
+            # facts are what a reviewer needs to see change.
+            for key in ("Origin (bp)", "Terminus (bp)",
+                        "Origin window index", "Terminus window index",
+                        "Windows", "Bootstrap surrogates", "Prediction confident"):
+                assert got[key] == want[key], key
+
+        golden_compare(
+            _produced(seq["out"], seq["seq_id"], "GC_skew", "_gc_skew_results.json"),
+            _golden(seq["name"], seq["seq_id"], "_gc_skew_results.json"),
+            regenerate_goldens, compare,
+        )
+
+
+class TestGCSkewOriginTerminus:
+    """The prediction is a function of the reference sequence and nothing else.
+
+    That the SAMPLE cannot matter is true by construction -- the estimate reads
+    only `ref_base` -- and the synthetic tier pins it directly at two depths
+    (test_gc_skew.py::test_prediction_is_independent_of_coverage_depth). What is
+    worth checking on real tables is narrower: that the sequence CNery recovers
+    is the same one no matter how the table around it is SHAPED. The three
+    unrotated REL606 datasets differ in schema (strand-split vs --total-only),
+    in read-group column count (0, 1, 2) and in footer length (4, 7, 10), so a
+    parsing change that shifted ref_base by a row would split them.
+
+    The rotated dataset tests the other property: the same sequence cut at a
+    different coordinate must still predict the same locus, which is what
+    subtracting the mean before cumulating buys.
+    """
+
+    def test_same_reference_agrees_exactly(self, skew_by_sequence):
+        results = [skew_by_sequence[(n, "REL606")] for n in UNSHIFTED]
+        first = results[0]
+        for other, name in zip(results[1:], UNSHIFTED[1:]):
+            assert other["Origin (bp)"] == first["Origin (bp)"], name
+            assert other["Terminus (bp)"] == first["Terminus (bp)"], name
+
+    @pytest.mark.parametrize("key", ["Origin (bp)", "Terminus (bp)"])
+    def test_permuted_reference_predicts_the_same_locus(self, skew_by_sequence, key):
+        mapped = skew_by_sequence[(SHIFTED, "REL606_2314906bp_shift")][key] + SHIFT_BP
+        reference = skew_by_sequence[(UNSHIFTED[0], "REL606")][key]
+        delta = _circular_delta(mapped, reference)
+        assert delta <= WIN, (
+            f"{key}: rotated reference maps to {mapped % REL606}, "
+            f"unrotated says {reference} ({delta} bp apart)"
+        )
+
 
 
 # --------------------------------------------------------------------------- copy number

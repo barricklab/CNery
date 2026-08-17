@@ -363,11 +363,19 @@ def preprocess(df, win=100, step=100, frag=400):
     else:
         genome_cyc = []
 
+    # Prefix sums of the G and C counts along the reference, so each window's
+    # base composition is two array lookups instead of another pass of the
+    # per-window Python string work gc_percent already pays for.
+    bases = genome.to_numpy()
+    cum_g = np.concatenate(([0], np.cumsum(bases == 'G')))
+    cum_c = np.concatenate(([0], np.cumsum(bases == 'C')))
+
     fragseq = []
     fragment = []
     winseq = []
     seq = []
     gcp_s = []
+    gc_skew_s = []
     window = []
     win_end = []
     window_med_cov = []
@@ -428,6 +436,20 @@ def preprocess(df, win=100, step=100, frag=400):
         pct_redundant_s.insert(i, pct_redundant)
         winseq = genome[i:i + winu]
         seq.insert(i, ''.join(str(element) for element in winseq))
+
+        # GC skew (G-C)/(G+C) over the WINDOW, not over the fragment gc_percent
+        # uses. gc_percent is fragment-widened because it models a property of
+        # the sequencing chemistry; skew is a property of the genome's
+        # replication strand asymmetry, so it has to line up with win_st/win_end.
+        # A window holding neither G nor C carries no strand information at all,
+        # so it contributes 0 rather than dividing by zero. Non-ACGT characters
+        # count as neither, matching the exact-uppercase membership test gc_percent
+        # uses below -- a soft-masked (lowercase) reference is ignored by both.
+        g_count = int(cum_g[i + winu] - cum_g[i])
+        c_count = int(cum_c[i + winu] - cum_c[i])
+        gc_total = g_count + c_count
+        gc_skew_s.insert(i, ((g_count - c_count) / gc_total) if gc_total else 0.0)
+
         window.insert(i, i)
         win_end.insert(i, i + winu)
         lst_win = win_end[(len(win_end) - 1)]
@@ -460,6 +482,26 @@ def preprocess(df, win=100, step=100, frag=400):
     df_gc["norm_raw_cov"] = (
         df_gc["read_count_cov"] / df_gc["read_count_cov"].median()
     )
+
+    # Cumulative GC skew (Grigoriev 1998, NAR 26:2286): the running sum of the
+    # per-window skew bottoms out over the replication origin and peaks at the
+    # terminus. See predict_ori_ter_from_skew().
+    #
+    # The MEAN IS SUBTRACTED FIRST, and that is load-bearing rather than
+    # cosmetic. It forces the running sum to return to exactly zero at the last
+    # window, which is what makes argmin/argmax independent of where the
+    # reference's coordinate 1 happens to fall: rotating the start by r windows
+    # then maps the curve to C'(k) = C((r+k) mod n) - C(r), a constant offset,
+    # so both extrema stay on the same genomic locus. Without it the sum ends at
+    # n * mean(skew) != 0, the wraparound adds a linear ramp, and a circularly
+    # permuted reference of the SAME genome predicts a different origin.
+    #
+    # Overlapping windows (step < win) count each base win/step times over, but
+    # that is a single uniform factor on every window, so it rescales the curve
+    # without moving either extremum. No stride weighting is needed.
+    skew = np.asarray(gc_skew_s, dtype=float)
+    df_gc["gc_skew"] = skew
+    df_gc["cum_gc_skew"] = np.cumsum(skew - skew.mean()) if skew.size else skew
 
     return df_gc
 
@@ -1257,6 +1299,299 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         json.dump({k: _json_safe(v) for k, v in results.items()}, f, indent=4)
 
     return df, xori, xter
+
+
+# ---------------------------------------------------------------------------
+# Origin/terminus from cumulative GC skew.
+#
+# An independent estimate of the same two coordinates otr_fit() reads off the
+# coverage profile, derived from the reference sequence instead of from read
+# depth. Grigoriev 1998 (NAR 26:2286): the cumulative sum of (G-C)/(G+C)
+# "reaches its global maximum at the E.coli terminus, while the minimum resides
+# over the replication origin".
+#
+# Nothing downstream consumes these values yet -- they are reported in their own
+# JSON and marked on their own plot, and OTR correction and the HMM are
+# unchanged. Worth knowing before wiring them in: the two methods disagree about
+# which sequences even have a usable origin, and that is expected. otr_fit needs
+# an active replication gradient in the COVERAGE, so it fires on exponential-phase
+# samples and not on stationary-phase ones; the skew estimate reads the sequence
+# and returns the same answer either way.
+# ---------------------------------------------------------------------------
+GC_SKEW_METHOD = "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+
+#: Circular block bootstrap defaults. 1000 surrogates costs ~0.14 s on a 4.6 Mb
+#: genome against ~4.4 s for preprocess(), and resolves p down to 1/1001.
+DEFAULT_SKEW_SURROGATES = 1000
+#: Blocks the resample aims for. What actually governs the p-value is the NUMBER
+#: of blocks, not their length: with fewer than ~20, reshuffling them frequently
+#: reassembles a two-arm pattern by chance and the test loses all power. Measured
+#: on a synthetic switch -- at 24 blocks p sits at its floor, at 12 it is 0.004,
+#: at 6 it is 0.035, and at 3 it is 0.041 whatever the block length.
+SKEW_TARGET_BLOCKS = 20
+#: Bounds on block length in WINDOWS. At least 10 so a block still carries the
+#: local compositional autocorrelation (which decays by lag ~10) rather than
+#: shuffling it away; at most 200 because nothing is gained past that and long
+#: blocks only cost blocks.
+SKEW_MIN_BLOCK, SKEW_MAX_BLOCK = 10, 200
+
+
+def _skew_block_length(n, block=None):
+    """Block length for the circular bootstrap, in windows.
+
+    Adaptive by default: aim for SKEW_TARGET_BLOCKS blocks, bounded so a block
+    is never shorter than the local autocorrelation nor pointlessly long. Short
+    sequences cannot satisfy both constraints at once -- that is a real
+    statement about how little evidence they carry, not a defect to tune away.
+    """
+    if block is None:
+        block = n // SKEW_TARGET_BLOCKS
+        block = int(np.clip(block, SKEW_MIN_BLOCK, SKEW_MAX_BLOCK))
+    return int(max(1, min(block, n // 2)))
+
+
+def _replichore_t(skew, o_idx, t_idx, overlap):
+    """Pooled two-sample t between the two arcs ori->ter and ter->ori.
+
+    Overlapping windows are not independent observations, so the effective
+    sample size is deflated by the win/step overlap factor -- otherwise t grows
+    as sqrt(win/step) from nothing but a smaller --step-size, and the same
+    genome scores differently at different resolutions.
+
+    Returns (t, mean_a, mean_b). Note this is an effect SIZE, not a test
+    statistic with a usable null: skew is spatially autocorrelated, so t's
+    magnitude is inflated by an unknown factor and must not be read as a
+    p-value. That is what _skew_bootstrap_p() is for.
+    """
+    n = skew.size
+    idx = np.arange(n)
+    arm_a = ((idx - o_idx) % n) <= ((t_idx - o_idx) % n)
+    a, b = skew[arm_a], skew[~arm_a]
+    if a.size < 2 or b.size < 2:
+        return 0.0, 0.0, 0.0
+
+    pooled_var = (
+        (a.size - 1) * a.var(ddof=1) + (b.size - 1) * b.var(ddof=1)
+    ) / (n - 2)
+    eff_a, eff_b = a.size / overlap, b.size / overlap
+    denom = np.sqrt(pooled_var * (1 / eff_a + 1 / eff_b))
+    t = 0.0 if denom <= 0 else float((a.mean() - b.mean()) / denom)
+    return t, float(a.mean()), float(b.mean())
+
+
+def _skew_score(skew, overlap):
+    """|t| for the best-fitting ori/ter on this skew series.
+
+    The WHOLE procedure -- locate the extrema, then score the arms -- because
+    the breakpoints are chosen by looking at the data. A null that held them
+    fixed would ignore that selection and be far too easy to beat.
+    """
+    cum = np.cumsum(skew - skew.mean())
+    o_idx = int(np.argmin(cum))
+    t_idx = int(np.argmax(cum))
+    return abs(_replichore_t(skew, o_idx, t_idx, overlap)[0])
+
+
+def _skew_bootstrap_p(skew, observed_t, overlap, n_surrogates, block, seed):
+    """Circular block bootstrap p-value for the replichore split.
+
+    The null is "a sequence with this much LOCAL skew autocorrelation but no
+    single origin/terminus". Resampling whole blocks preserves the short-range
+    structure; reshuffling their order destroys the long-range two-arm pattern.
+    Circular because the genome is, so there are no edge effects to correct.
+
+    Returns (p, surrogates_used). p is (#{surrogate >= observed} + 1) / (B + 1),
+    so it is FLOORED at 1/(B+1) and never zero -- a real chromosome exhausts
+    every surrogate and reads back exactly that floor. Report it as an upper
+    bound, not as a measurement.
+
+    `seed` is fixed by default so a given input always gives the same p and the
+    golden files stay stable.
+    """
+    n = skew.size
+    if n < 8:
+        return 1.0, 0
+    block = _skew_block_length(n, block)
+
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block))
+    offsets = np.arange(block)
+
+    at_least = 0
+    # Chunked so the index matrix stays small regardless of n_surrogates.
+    chunk = max(1, min(250, n_surrogates))
+    done = 0
+    while done < n_surrogates:
+        size = min(chunk, n_surrogates - done)
+        starts = rng.integers(0, n, size=(size, n_blocks))
+        idx = (starts[:, :, None] + offsets[None, None, :])
+        idx = idx.reshape(size, n_blocks * block)[:, :n] % n
+        for row in idx:
+            if _skew_score(skew[row], overlap) >= observed_t:
+                at_least += 1
+        done += size
+
+    return (at_least + 1) / (n_surrogates + 1), n_surrogates
+
+
+def predict_ori_ter_from_skew(
+    df,
+    win=None,
+    step=None,
+    sep_lo=0.35,
+    sep_hi=0.65,
+    max_p=0.01,
+    n_surrogates=DEFAULT_SKEW_SURROGATES,
+    block=None,
+    seed=0,
+):
+    """
+    Locate the replication origin and terminus on the cumulative GC skew curve:
+    origin = its global minimum, terminus = its global maximum.
+
+    Deliberately does NOT censor is_deletion / is_redundant windows, unlike
+    fit_gc_bias(), fit_otr_bias() and run_HMM(). GC skew is a property of the
+    REFERENCE SEQUENCE -- a deletion in the sample does not change the
+    reference's base composition -- and because the curve is a running sum,
+    dropping windows would not merely omit them, it would displace every point
+    after them. Please don't "fix" this.
+
+    Confidence is two conditions: the extrema must be roughly antipodal
+    (`sep_lo`..`sep_hi`, the same band otr_fit uses) and the replichore split
+    must survive a circular block bootstrap at `max_p`. There is deliberately
+    NO minimum window count -- the bootstrap subsumes it, since a short
+    sequence cannot reach significance on its own, and one arbitrary constant
+    is better than two.
+
+    The returned values are always the measured ones. The gate sets
+    `confident`; it never suppresses a coordinate, so a rejected prediction
+    stays diagnosable.
+    """
+    n = len(df)
+    if n == 0:
+        raise ValueError(
+            "cannot predict origin/terminus from an empty window frame."
+        )
+
+    skew = df["gc_skew"].to_numpy(dtype=float)
+    cum = df["cum_gc_skew"].to_numpy(dtype=float)
+    win_st = df["win_st"].to_numpy()
+
+    o_idx = int(np.argmin(cum))
+    t_idx = int(np.argmax(cum))
+
+    circular_dist = min(abs(o_idx - t_idx), n - abs(o_idx - t_idx))
+    separation = circular_dist / n if n else 0.0
+    amplitude = float(cum.max() - cum.min())
+
+    # Split the circle into the two replichores at the origin and terminus and
+    # ask whether their mean skew really differs in sign.
+    overlap = (win / step) if (win and step) else 1.0
+    t_stat, mean_a, mean_b = _replichore_t(skew, o_idx, t_idx, overlap)
+    opposite_signs = bool(mean_a * mean_b < 0)
+
+    p_value, surrogates = _skew_bootstrap_p(
+        skew, abs(t_stat), overlap, n_surrogates, block, seed
+    )
+
+    confident = bool(
+        sep_lo <= separation <= sep_hi
+        and opposite_signs
+        and p_value <= max_p
+    )
+
+    return {
+        "Origin (bp)": int(win_st[o_idx]),
+        "Terminus (bp)": int(win_st[t_idx]),
+        "Origin window index": o_idx,
+        "Terminus window index": t_idx,
+        "Windows": n,
+        "Separation (fraction of genome)": round(separation, 4),
+        "Cumulative skew amplitude": round(amplitude, 4),
+        "Replichore skew t-statistic": round(t_stat, 2),
+        "Replichore skew p-value": round(p_value, 5),
+        # Reported so the p-value's floor of 1/(B+1) is legible from the file
+        # alone: a chromosome exhausts every surrogate and reads back exactly
+        # that floor, which is an upper bound rather than a measurement.
+        "Bootstrap surrogates": surrogates,
+        "Prediction confident": confident,
+        "Prediction method": GC_SKEW_METHOD,
+    }
+
+
+def write_gc_skew_results(result, output, genome_id):
+    """Write one reference's skew prediction to GC_skew/<name>_gc_skew_results.json.
+
+    Makes its own directory, as apply_otr_correction() does, so callers and
+    tests need not pre-create it.
+    """
+    samplename = output.strip().split("/")[-1] + str(genome_id)
+    savedir = os.path.join(output, "GC_skew")
+    os.makedirs(savedir, exist_ok=True)
+
+    path = os.path.join(savedir, f"{samplename}_gc_skew_results.json")
+    with open(path, "w") as fh:
+        # allow_nan=False: the OTR writer emits bare NaN, which json.load
+        # tolerates but is not valid RFC JSON. Every value here is finite, so
+        # this stays strict -- and fails loudly if that ever stops being true.
+        json.dump(result, fh, indent=4, allow_nan=False)
+    return path
+
+
+def plot_gc_skew(df, output, result):
+    """Cumulative GC skew across the reference, with the predicted ori/ter marked."""
+    genome_id = str(df["genome_id"].iloc[0])
+    samplename = output.strip().split("/")[-1] + genome_id
+    savedir = os.path.join(output, "GC_skew")
+    os.makedirs(savedir, exist_ok=True)
+
+    ori = result["Origin (bp)"]
+    ter = result["Terminus (bp)"]
+    confident = result["Prediction confident"]
+
+    plt.figure(figsize=(10, 8))
+    plt.plot(df["win_st"], df["cum_gc_skew"], color="purple",
+             label="Cumulative GC skew")
+    plt.axhline(0, color="gray", linewidth=0.8)
+
+    # A rejected prediction is far easier to diagnose as a picture than as a
+    # boolean, so the extrema are always drawn -- the title carries the verdict.
+    plt.axvline(x=ori, color="r", linestyle=":", label=f"Origin: {ori}")
+    plt.axvline(x=ter, color="b", linestyle=":", label=f"Terminus: {ter}")
+    plt.scatter(
+        [ori, ter],
+        [df["cum_gc_skew"].min(), df["cum_gc_skew"].max()],
+        color=["r", "b"], s=60, zorder=3,
+    )
+
+    verdict = "confident" if confident else "LOW CONFIDENCE"
+
+    # p is floored at 1/(B+1), so a chromosome that beat every surrogate is shown
+    # as "<floor" rather than as an exact figure it cannot support.
+    surrogates = result.get("Bootstrap surrogates") or 0
+    p_value = result["Replichore skew p-value"]
+    if surrogates and p_value <= (1 / (surrogates + 1)) * 1.01:
+        # Shown as 1/B rather than the exact 1/(B+1) floor: still a true bound,
+        # and it reads as "p<0.001" instead of "p<0.000999".
+        p_text = f"p<{1 / surrogates:.3g}"
+    else:
+        p_text = f"p={p_value:.3g}"
+
+    plt.xlabel("Window (Genomic position)")
+    plt.ylabel("Cumulative GC skew  (running sum of (G-C)/(G+C))")
+    plt.title(
+        f"{samplename}_Cumulative GC skew\n"
+        f"separation {result['Separation (fraction of genome)']:.1%} of genome, "
+        f"t={result['Replichore skew t-statistic']}, {p_text} -- {verdict}"
+    )
+    plt.legend(loc="upper right")
+
+    plt_full_path = os.path.join(
+        savedir, "%s_GC_skew.pdf" % samplename.replace(" ", "_")
+    )
+    plt.savefig(plt_full_path, format="pdf", bbox_inches="tight")
+    plt.close()
+    return plt_full_path
 
 
 def plot_copy(df_cnv, pltstart, pltend, output):

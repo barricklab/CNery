@@ -110,6 +110,8 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `read_count_cov` | `preprocess` | median total (unique + redundant) coverage in the window |
 | `norm_raw_cov` | `preprocess` | `read_count_cov` / its median |
 | `pct_redundant` | `preprocess` | fraction of the window's bases overlapping repeat coverage |
+| `gc_skew` | `preprocess` | `(G-C)/(G+C)` over the window's `ref_base` letters |
+| `cum_gc_skew` | `preprocess` | running sum of `gc_skew`, mean-subtracted first |
 | `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
 | `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
 | `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
@@ -257,9 +259,62 @@ are rejected before `get_CNV.main` creates any output directory.
   breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
   so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
   three columns and the assert is fatal.
-- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
-  `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
-  functions in `core.py` assume they already exist.
+- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created
+  once in `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
+  functions in `core.py` assume they already exist. `write_gc_skew_results` and `plot_gc_skew` are
+  the exceptions, making their own like `apply_otr_correction` does.
+- `predict_ori_ter_from_skew` (`core.py`) **does not censor** `is_deletion` / `is_redundant`
+  windows, unlike every other fit stage. GC skew is a property of the *reference sequence*, and a
+  deletion in the sample does not change the reference's base composition. Because `cum_gc_skew`
+  is a running sum, dropping a window would not merely omit it — it would displace every point
+  after it.
+- `cum_gc_skew` subtracts the mean skew before cumulating (`preprocess`). That is **not cosmetic
+  detrending**: it forces the sum to end at exactly zero, which is what makes `argmin`/`argmax`
+  independent of where the reference's coordinate 1 falls. Rotating the start by `r` windows then
+  maps the curve to `C'(k) = C((r+k) mod n) - C(r)`, a constant offset. Without it the sum ends at
+  `n * mean(skew) != 0`, the wraparound adds a linear ramp, and a circularly permuted copy of the
+  same genome predicts a different origin — which `TestGCSkewOriginTerminus` in
+  `tests/test_authentic.py` checks against the `REL606_2314906bp_shift` dataset.
+- Overlapping windows (`step < win`) count each base `win/step` times over in `cum_gc_skew`. That
+  is one uniform factor across every window, so it rescales the curve without moving either
+  extremum; no stride weighting is applied.
+- The skew estimate's confidence gate is **two conditions**: ori/ter 35–65% apart (the same band
+  `otr_fit` uses), and a circular block bootstrap p-value at or below 0.01. There is deliberately
+  **no minimum window count** — the bootstrap subsumes it, since a short sequence cannot reach
+  significance on its own, and one arbitrary constant beats two. `Sequence.skew_confident` in
+  `tests/test_authentic.py` records which sequences pass.
+- **The t-statistic is an effect size, not a test statistic.** Skew is spatially autocorrelated
+  (REL606's ACF is still 0.22 at lag 10), so t's magnitude is inflated by an unknown factor and
+  `t = 34.8` emphatically does not mean `p ≈ 1e-250`. `_replichore_t` deflates the effective sample
+  size by the `win/step` overlap factor, which stops t growing as `sqrt(win/step)` from nothing but
+  a finer stride — but that fixes double-counting only, not the autocorrelation. The p-value is
+  what carries inferential weight; t is retained because it is the readable effect size.
+- `_skew_bootstrap_p` re-runs the **whole** procedure — extrema search included — on every
+  surrogate. The breakpoints are chosen by looking at the data, so a null holding them fixed would
+  ignore that selection and be far too easy to beat.
+- **What governs the bootstrap's power is the NUMBER of blocks, not their length.** Measured on a
+  synthetic switch: 24 blocks puts p at its floor, 12 gives 0.004, 6 gives 0.035 and 3 gives 0.041,
+  whatever the block length. Hence `_skew_block_length` targets `SKEW_TARGET_BLOCKS = 20` and
+  adapts to `n`, rather than taking a fixed length. Bounded to 10–200 windows: at least the local
+  autocorrelation length, and past 200 nothing is gained while blocks are lost.
+- **p is floored at `1/(B+1)` and is an upper bound, not a measurement.** Every real chromosome
+  exhausts all 1000 surrogates and reads back exactly 0.001. `"Bootstrap surrogates"` is in the
+  JSON so that floor is legible from the file alone. Resolving further means `B ≈ 1e6` at ~90 s per
+  sequence, to say something already obvious.
+- The gate sets a flag; it never suppresses a coordinate. `GC_skew/*_gc_skew_results.json` always
+  carries the measured origin, terminus, separation, amplitude, t and p, so a rejected prediction
+  can be diagnosed from the file and the plot. Contrast the OTR JSON, which discards its
+  coordinates behind `"Not detected"`. Like that file it is written with `allow_nan=False` and
+  stays strict RFC JSON — every value in it is finite by construction, and the assertion is
+  deliberate.
+- The bootstrap is seeded (`seed=0`) so a given input always gives the same p and the goldens stay
+  stable. It costs ~0.15 s on a 4.6 Mb genome against ~4 s for `preprocess`, so roughly 3%.
+- The GC-skew ori/ter is **computed and reported but deliberately not consumed** — OTR correction
+  and the HMM still use `otr_fit`'s coverage-derived estimate. The two disagree about which
+  sequences even have a usable origin, and that is the expected reading rather than a bug: `otr_fit`
+  needs an active replication gradient in the *coverage*, so it fires on exponential-phase
+  `ltee_ara_p5_75k_exp` and not on the stationary-phase Ara-3 samples, while the skew estimate
+  returns the same ~49%-separated pair for every REL606 sample regardless.
 
 ## Testing conventions
 

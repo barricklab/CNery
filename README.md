@@ -8,7 +8,8 @@ Recent updates (latest commits):
 - **CSV or TSV, full or `--total-only`** — all four shapes of table are read without being declared. The delimiter is detected from the file's own header row, and the column schema from its column names. `--total-only` tables are the recommended input: they carry three coverage columns instead of eight, so they are markedly smaller, and CNery loses nothing by using them.
 - **Files and folders on the command line** — name coverage tables directly, or name folders and let `CNery` find them by file ending (`--file-ending`, defaults `coverage.csv`, `coverage.tsv` and `coverage.tab`). Files and folders can be mixed in one command.
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
-- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
+- **Cumulative GC skew origin/terminus prediction** — `CNery` now also locates the replication origin and terminus from the reference's own cumulative GC skew ([Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593)), independently of read depth. Reported in `GC_skew/` as a marked-up plot and a JSON summary; nothing downstream consumes it yet.
+- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
 - **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
   number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
@@ -278,8 +279,53 @@ Given an output folder `CNV_out/`, `CNery` writes:
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
 
   `"Relative copy number"` is that sequence's coverage relative to the longest sequence in the run, which reads exactly `1.0`. It is not rounded to an integer: a plasmid at `2.95` is a measurement, and it is the only place plasmid copy number is reported — `prob_copy_number` in the CSVs is called per reference, so a uniformly multi-copy plasmid comes out as `1` there.
+- `CNV_out/GC_skew/` — per-reference cumulative GC-skew plots with the predicted origin and terminus marked, and a JSON summary (`*_gc_skew_results.json`).
 
 Each coverage table produces its own set of outputs, named with the sequence ID derived from its file name. The GC-bias plot is the exception: one pooled fit covers every table in the run.
+
+### Origin and terminus from GC skew
+
+Bacterial genomes are G-rich on the leading strand and C-rich on the lagging strand, so the sign of the GC skew `(G−C)/(G+C)` flips at the two points where the replication strands switch. Summing the skew along the genome turns those sign changes into extrema: following [Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593), the cumulative curve reaches its **minimum over the replication origin** and its **maximum at the terminus**.
+
+`CNery` computes this from the coverage table's `ref_base` column — no FASTA and no read depth involved — and writes the result for every reference, in all four `--bias` modes:
+
+```json
+{
+    "Origin (bp)": 3885501,
+    "Terminus (bp)": 1526001,
+    "Origin window index": 7771,
+    "Terminus window index": 3052,
+    "Windows": 9258,
+    "Separation (fraction of genome)": 0.4903,
+    "Cumulative skew amplitude": 151.2949,
+    "Replichore skew t-statistic": 34.77,
+    "Replichore skew p-value": 0.001,
+    "Bootstrap surrogates": 1000,
+    "Prediction confident": true,
+    "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+}
+```
+
+`Prediction confident` requires two things: the two extrema roughly antipodal (35–65% of the sequence apart, as bidirectional replication implies), and a p-value of 0.01 or better. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
+
+#### How the p-value is computed, and how to read it
+
+Adjacent windows are not independent — genome composition varies on scales far longer than one window — so an ordinary *t*-test would badly overstate significance. `Replichore skew t-statistic` is therefore reported as an **effect size only**; its magnitude is inflated by an unknown factor and should not be converted to a p-value.
+
+The p-value instead comes from a **circular block bootstrap**. Contiguous blocks of windows are resampled with replacement around the circle, which preserves local autocorrelation while destroying the long-range two-arm pattern being tested for; the null is "a sequence that wobbles like this one but has no single origin". The full procedure — locating the extrema, then scoring the two arms — is re-run on every surrogate, so choosing the breakpoints by looking at the data is paid for rather than ignored.
+
+Two things to know when reading it:
+
+- **It is floored at `1/(B+1)`.** A real chromosome beats all 1,000 surrogates and reads back exactly `0.001`. That is an upper bound, not a measurement — read it as "p < 0.001". `Bootstrap surrogates` is reported so the floor is visible.
+- **Block length adapts to sequence length.** What governs power is the number of blocks rather than their size, so CNery targets ~20 blocks, bounded to 10–200 windows each. Sequences too short to give both long-enough and numerous-enough blocks simply do not reach significance, which is an honest reflection of how little evidence they carry.
+
+The bootstrap is seeded, so repeated runs on the same input give the same p. It adds roughly 3% to the per-sequence cost (~0.15 s on a 4.6 Mb genome).
+
+Expect `false` on plasmids. They have no bidirectional replication origin, so there is no sign change for the cumulative curve to turn on, and the two extrema you get back are noise — the two in the test data land at `p` = 0.36 and 0.44. That is the intended answer, not a failure, and chromosomes in the same run are unaffected since the prediction is made per reference.
+
+Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers, whatever their depth or growth phase. And it is invariant to circular permutation: a reference whose coordinates start elsewhere predicts the same locus.
+
+These values are **not yet used** for anything. Bias correction and copy-number calling still use the origin and terminus that `--bias otr` infers from the coverage profile.
 
 ---
 

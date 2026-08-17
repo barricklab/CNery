@@ -14,6 +14,9 @@ from .core import (
     fit_otr_bias,
     apply_otr_correction,
     plot_otr_corr,
+    predict_ori_ter_from_skew,
+    write_gc_skew_results,
+    plot_gc_skew,
     run_HMM,
     plot_copy,
 )
@@ -248,7 +251,7 @@ def main():
     else:
         out_dir = "CNV_out/"
 
-    out_subdirs = ['/CNV_plt', '/CNV_csv', '/GC_bias', '/OTR_corr']
+    out_subdirs = ['/CNV_plt', '/CNV_csv', '/GC_bias', '/OTR_corr', '/GC_skew']
     for sub in out_subdirs:
         Path(out_dir + sub).mkdir(parents=True, exist_ok=True)
 
@@ -296,6 +299,28 @@ def main():
 
     for genome_id, df_b2c in per_genome.items():
         print(f"Processing genome: {genome_id}")
+
+        # Origin/terminus from the reference's own cumulative GC skew. This sits
+        # ahead of the --bias branch on purpose: it reads only the sequence, so
+        # unlike the coverage-derived OTR results it is available in all four
+        # modes, including the ones that never call apply_otr_correction(). It is
+        # reported only -- nothing below consumes it.
+        skew_result = predict_ori_ter_from_skew(
+            df_b2c, win=options.w, step=options.s
+        )
+        write_gc_skew_results(skew_result, out_dir, genome_id)
+        plot_gc_skew(df_b2c, out_dir, skew_result)
+        if skew_result["Prediction confident"]:
+            print(
+                f"{smpl} ({genome_id}): GC skew predicts origin "
+                f"{skew_result['Origin (bp)']}, terminus "
+                f"{skew_result['Terminus (bp)']}."
+            )
+        else:
+            print(
+                f"{smpl} ({genome_id}): GC skew origin/terminus prediction is "
+                f"low confidence; see GC_skew/ for the values and curve."
+            )
 
         if options.bias == "gc":
             # df_b2c already GC-corrected by pooled LOWESS
