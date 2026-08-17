@@ -9,11 +9,13 @@ import seaborn as sns
 from scipy import stats
 from scipy import ndimage
 import matplotlib as mplt
-from scipy.stats import geom
+from scipy.stats import geom, nbinom
+from scipy.optimize import minimize
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.special import  gammaln
+from scipy.optimize import minimize
 from itertools import cycle, islice
 
 
@@ -58,7 +60,7 @@ def normalize_file_endings(file_endings=None):
     """The endings to match, as a list, with any leading dots removed.
 
     None means "the default", so a caller can pass argparse's unset value straight
-    through: supplying --file-ending REPLACES the default rather than adding to it.
+    through: supplying --file-ending REPLACES the defaults rather than adding to them.
     """
     if file_endings is None:
         file_endings = list(DEFAULT_FILE_ENDINGS)
@@ -325,7 +327,7 @@ def read_coverage_table(path):
     return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
-def preprocess(df, win=200, step=100, frag=350):
+def preprocess(df, win=100, step=100, frag=400):
 
     if (step > win):
         return print(
@@ -341,13 +343,25 @@ def preprocess(df, win=200, step=100, frag=350):
     start_coord = int(df_b2c.index[0])
     genome = df_b2c['ref_base']
     genome_len = len(genome)
-    genome_cyc = list(
-        islice(
-            cycle(genome),
-            int(genome_len * 0.75),
-            genome_len + int(genome_len * 1.25)
+    # GC% is measured over max(frag, win) bases centred on each window, because
+    # GC bias acts at the scale of the sequenced fragment rather than at
+    # whatever window size was asked for. `gc_pad` is what that costs on each
+    # side of the window.
+    gc_pad = max((max(int(frag), win) - win) // 2, 0)
+
+    # The reference is circular, so windows near either end draw their padding
+    # from the other end. Carry exactly `gc_pad` bases of wrap-around either
+    # side -- no more, and never less: this used to be a fixed +/-25% of the
+    # genome, which is both larger than needed on a chromosome and too small
+    # whenever the fragment exceeds half the reference, where it silently
+    # produced an out-of-range slice.
+    if genome_len:
+        gc_start = (-gc_pad) % genome_len
+        genome_cyc = list(
+            islice(cycle(genome), gc_start, gc_start + genome_len + 2 * gc_pad)
         )
-    )
+    else:
+        genome_cyc = []
 
     # Prefix sums of the G and C counts along the reference, so each window's
     # base composition is two array lookups instead of another pass of the
@@ -375,8 +389,8 @@ def preprocess(df, win=200, step=100, frag=350):
 
     # sliding window = win and increment size = step
     # summarizes GC% and median coverage
-
-    # Every full-width window is kept, using TOTAL coverage
+    #
+    # Every FULL-WIDTH window is kept, using TOTAL coverage
     # (unique + redundant) for its median -- so a repeat's real sequencing
     # depth is reflected instead of just the reads that happened to map
     # uniquely there -- and the fraction of redundant-covered bases in the
@@ -384,9 +398,9 @@ def preprocess(df, win=200, step=100, frag=350):
     # mask_coverage_windows() turns `pct_redundant` into `is_redundant`,
     # which censors the window from GC/OTR bias-model FITTING, from the
     # origin/terminus peak-trough SEARCH (see otr_fit()) and from the
-    # Viterbi observation sequence (see run_HMM()), while it still receives
-    # a real bias-corrected coverage value and inherits the copy number of
-    # the segment it sits in -- so a repeat neither invents an
+    # Viterbi observation sequence (see run_HMM()), while it still
+    # receives a real bias-corrected coverage value and inherits the copy
+    # number of the segment it sits in -- so a repeat neither invents an
     # amplification nor breaks a genuine deletion in two.
     while (i <= (genome_len - 1)) and (lst_win < genome_len):
 
@@ -396,16 +410,16 @@ def preprocess(df, win=200, step=100, frag=350):
 
         winu = len(cov_type)  # bases actually available
 
-        # Only windows backed by the full `win` bases are emitted. A trailing
-        # partial window at the genome end would take its median over fewer
-        # bases, and its short `win_end` would set the genome-end coordinate
-        # used for the final CN segment and for the terminus fallback in
-        # apply_otr_correction() -- so it is dropped.
+        # Only windows backed by the full `win` bases are emitted. A
+        # trailing partial window at the genome end would take its median
+        # over fewer bases, and its short win_end would set the
+        # genome-end coordinate used for the final CN segment and for the
+        # terminus fallback in apply_otr_correction() -- so it is dropped.
         if winu < win:
             # ...unless no full window fits at all, i.e. the reference is
             # shorter than `win` (a small plasmid or contig). Then this
-            # partial window is all there is, and returning an empty frame
-            # would be worse than returning a short one.
+            # partial window is all there is, and returning an empty
+            # frame would be worse than returning a short one.
             if window or winu == 0:
                 break
 
@@ -429,8 +443,8 @@ def preprocess(df, win=200, step=100, frag=350):
         # replication strand asymmetry, so it has to line up with win_st/win_end.
         # A window holding neither G nor C carries no strand information at all,
         # so it contributes 0 rather than dividing by zero. Non-ACGT characters
-        # count as neither, matching gc_percent's exact-uppercase membership test
-        # above -- a soft-masked (lowercase) reference is silently ignored by both.
+        # count as neither, matching the exact-uppercase membership test gc_percent
+        # uses below -- a soft-masked (lowercase) reference is ignored by both.
         g_count = int(cum_g[i + winu] - cum_g[i])
         c_count = int(cum_c[i + winu] - cum_c[i])
         gc_total = g_count + c_count
@@ -439,29 +453,20 @@ def preprocess(df, win=200, step=100, frag=350):
         window.insert(i, i)
         win_end.insert(i, i + winu)
         lst_win = win_end[(len(win_end) - 1)]
-        i_off = i + int(genome_len * 0.25)
+        # genome_cyc[gc_pad] is genome[0], so this is where window i starts in it.
+        i_off = i + gc_pad
 
-        # If fragment size is greater than the window size calculate the
-        # GC% of the entire fragment covering the coverage window
-        if (frag > win):
-            diff = int((frag - win) / 2)
-            fragseq = genome_cyc[(i_off - diff):((i_off + win) + diff)]
-            fragment.insert(i, ''.join(str(element) for element in fragseq))
-            gcc = ''.join([nucleotide for nucleotide in fragseq
-                           if nucleotide in ['C', 'G']])
-            gccp = (len(gcc) / len(fragseq))
-            gcp_s.insert(i, gccp)
-        # Otherwise use the length of the window to calculate the GC%
-        else:
-            diff = int((win - frag) / 2)
-            fragseq = list(
-                genome_cyc[i_off - diff:(i_off + win) + diff]
-            )
-            fragment.insert(i, ''.join(str(element) for element in fragseq))
-            gcc = ''.join([nucleotide for nucleotide in fragseq
-                           if nucleotide in ['C', 'G']])
-            gccp = (len(gcc) / len(fragseq))
-            gcp_s.insert(i, gccp)
+        # One span, always max(frag, win). This was two branches: `frag > win`
+        # spanned frag, correctly, but the `frag <= win` branch spanned
+        # `2 * win - frag` where its own comment said it used the window length
+        # -- so at -w 200 -f 150 it measured GC over 250 bases, neither the
+        # window nor the fragment.
+        fragseq = genome_cyc[(i_off - gc_pad):((i_off + win) + gc_pad)]
+        fragment.insert(i, ''.join(str(element) for element in fragseq))
+        gcc = ''.join([nucleotide for nucleotide in fragseq
+                       if nucleotide in ['C', 'G']])
+        gccp = (len(gcc) / len(fragseq))
+        gcp_s.insert(i, gccp)
 
         i = i + step
 
@@ -558,6 +563,20 @@ def gc_cor_plots(df, output):
     plt.savefig(plt_full_path, format='pdf', bbox_inches='tight')
     plt.close()
 
+
+# ---------------------------------------------------------------------------
+# mask -> fit -> apply split for GC-bias correction. Same LOWESS math
+# throughout, reorganized into three composable stages:
+#
+#   - Windows are censored (excluded from FITTING) for two DISTINCT reasons:
+#       "zero_outlier"  : genuinely near-zero coverage (real deletions)
+#       "redundant"     : pct_redundant (from preprocess()) above threshold
+#   - Only "zero_outlier" windows are frozen to zero in the corrected
+#     output. "redundant" windows are excluded from the LOWESS/OTR fits
+#     (so repeats can't bias the curve) but still get a real,
+#     model-corrected coverage value -- so the HMM does not call spurious
+#     deletions over repeats.
+# ---------------------------------------------------------------------------
 def mask_coverage_windows(
     df,
     zero_frac=0.1,
@@ -626,6 +645,11 @@ def fit_gc_bias(
     norm_raw_cov vs gc_percent, using only windows where
     df[censor_col] is False (i.e. neither deletions nor redundant-coverage
     windows).
+
+    Returns
+    -------
+    dict : {"gc_sorted", "fit_sorted", "floor"} -- pass to
+    apply_gc_correction().
     """
     cov = df["norm_raw_cov"].to_numpy(dtype=float)
     gc = df["gc_percent"].to_numpy(dtype=float)
@@ -675,6 +699,11 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
     at EVERY window's GC% (both fit-eligible and censored windows) and
     divide raw normalized coverage by it.
 
+    `relative_copy_number` is this sequence's copies relative to the longest one
+    in the run (see relative_copy_numbers()); it is written straight into the
+    results JSON. The default of 1.0 is the honest answer for a caller holding a
+    single frame -- it is its own longest sequence.
+
     Only windows flagged `deletion_col` (genuine near-zero/outlier
     coverage) are frozen at zero. Redundant-coverage windows (censored
     from fitting but NOT flagged as deletions) still get a real corrected
@@ -705,9 +734,9 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
 def process_multi_genome(
     coverage_inputs,
     output_prefix,
-    win=200,
+    win=100,
     step=100,
-    frag=350,
+    frag=400,
 ):
     """
     Preprocess every coverage table, pool them for GC correction, plot the pooled bias,
@@ -780,125 +809,296 @@ def plot_otr_corr(df, output, ori, ter):
     plt.close()
 
 
-def circular_arc(start, end, n):
+def otr_predict(x, x_ori, x_ter, y_ori, y_ter, genome_len):
     """
-    Real genome positions and "unwrapped" x-coordinates for the arc walking
-    forward from `start` to `end` around a circular genome of length `n`,
-    wrapping past n-1 back to 0 if `end` < `start`. Unwrapped x keeps
-    increasing past `n` on wraparound so a line can be fit against it
-    without a false discontinuity at the FASTA coordinate 0/n boundary.
+    Predict coverage at position(s) `x` from a circular two-segment
+    piecewise-linear ("tent") model anchored at (x_ori, y_ori) and
+    (x_ter, y_ter).
+
+    Walking forward (increasing position, wrapping at genome_len) from
+    x_ori to x_ter traces one straight line; walking forward from x_ter
+    back to x_ori traces the other. Together the two segments form a
+    single closed shape around the whole circular genome -- this is the
+    model fit as ONE unit across positions 1..genome_len, not two
+    independently-fit pieces.
+
+    All distances are computed modulo genome_len, so the model is
+    agnostic to where the genome's coordinate origin (position 0/1)
+    happens to fall relative to the biological origin/terminus. If x_ori
+    or x_ter sits at (or near) the coordinate boundary, this same
+    function produces a V-shaped or inverted-V-shaped profile when
+    plotted on a linear axis -- that is just a different viewing angle on
+    the same circular tent, not a different case for this function.
+
+    Parameters
+    ----------
+    x : array-like
+        Position(s) at which to predict coverage.
+    x_ori, x_ter : float
+        Fitted origin/terminus positions. Need not be integers or already
+        wrapped into [0, genome_len) -- the modulo arithmetic here handles
+        any real value, though callers using the RESULT as an array index
+        (e.g. to report a window number) must wrap it themselves first
+        (see otr_fit()).
+    y_ori, y_ter : float
+        Fitted coverage values at the origin/terminus.
+    genome_len : float
+        Genome length (number of windows) for the circular wraparound.
+
+    Returns
+    -------
+    np.ndarray of predicted coverage values, one per element of x.
     """
-    if end >= start:
-        unwrapped = np.arange(start, end + 1)
-    else:
-        unwrapped = np.arange(start, end + 1 + n)
-    real_positions = unwrapped % n
-    return real_positions, unwrapped
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    L_A = (x_ter - x_ori) % genome_len       # arc length walking ori -> ter
+    L_B = genome_len - L_A                    # arc length walking ter -> ori
+    d = (x - x_ori) % genome_len               # distance from ori, walking forward
+    on_a = d <= L_A
+
+    y_pred = np.empty_like(x)
+
+    t_a = np.divide(d, L_A, out=np.zeros_like(d), where=L_A > 0)
+    y_pred[on_a] = y_ori + t_a[on_a] * (y_ter - y_ori)
+
+    d_b = d - L_A
+    t_b = np.divide(d_b, L_B, out=np.zeros_like(d_b), where=L_B > 0)
+    y_pred[~on_a] = y_ter + t_b[~on_a] * (y_ori - y_ter)
+
+    return y_pred
 
 
-def fit_arc_line(ux, y_arc, fit_mask, fallback_value):
-    """OLS line through an arc's real (masked) points; falls back to a flat
-    line at `fallback_value` if too few clean points remain to fit."""
-    if fit_mask.sum() >= 2:
-        slope, intercept = np.polyfit(ux[fit_mask], y_arc[fit_mask], 1)
-    else:
-        slope, intercept = 0.0, fallback_value
-    return slope, intercept
+def _otr_design_matrix(x, x_ori, x_ter, genome_len):
+    """
+    Coefficient matrix M such that otr_predict(x, ...) == M @ [y_ori, y_ter]
+    for FIXED (x_ori, x_ter).
+
+    otr_predict() is affine in (y_ori, y_ter) once the breakpoints are
+    fixed -- this is what lets the optimizer search over just the 2
+    breakpoint POSITIONS instead of jointly optimizing all 4 parameters:
+    for any candidate (x_ori, x_ter), the best-fitting (y_ori, y_ter) is
+    solved exactly via ordinary least squares (see
+    _otr_concentrated_rss()) rather than guessed or optimized alongside
+    the positions.
+    """
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    L_A = (x_ter - x_ori) % genome_len
+    L_B = genome_len - L_A
+    d = (x - x_ori) % genome_len
+    on_a = d <= L_A
+
+    M = np.zeros((len(x), 2))
+    t_a = np.divide(d, L_A, out=np.zeros_like(d), where=L_A > 0)
+    M[on_a, 0] = 1 - t_a[on_a]
+    M[on_a, 1] = t_a[on_a]
+
+    d_b = d - L_A
+    t_b = np.divide(d_b, L_B, out=np.zeros_like(d_b), where=L_B > 0)
+    M[~on_a, 0] = t_b[~on_a]
+    M[~on_a, 1] = 1 - t_b[~on_a]
+    return M
+
+
+def _otr_concentrated_rss(breakpoints, x, y, genome_len):
+    """
+    The error function minimized to fit the whole-genome OTR model.
+
+    Given candidate breakpoints (x_ori, x_ter), solves for the OPTIMAL
+    (y_ori, y_ter) in closed form via ordinary least squares (using
+    _otr_design_matrix()'s affine structure) and returns the resulting
+    residual sum of squares between otr_predict(x; params) and the actual
+    observed y across the WHOLE genome (all windows in x/y at once, not
+    per-arc). This RSS is what scipy.optimize.minimize searches over,
+    reduced to just the 2 breakpoint-position parameters -- (y_ori,
+    y_ter) never need to be searched directly.
+
+    Returns
+    -------
+    (rss, y_ori, y_ter) : the fit quality and the optimal anchor values
+    for these breakpoints.
+    """
+    x_ori, x_ter = breakpoints
+    if abs((x_ter - x_ori) % genome_len) < 1 or abs((x_ori - x_ter) % genome_len) < 1:
+        return np.inf, np.nan, np.nan
+    M = _otr_design_matrix(x, x_ori, x_ter, genome_len)
+    beta, _, _, _ = np.linalg.lstsq(M, y, rcond=None)
+    y_pred = M @ beta
+    rss = float(np.sum((y - y_pred) ** 2))
+    return rss, beta[0], beta[1]
 
 
 #Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
 #
-# Detects the origin (coverage peak) and terminus (coverage trough) of
-# replication from the median-filtered coverage profile, then fits a
-# straight line through each of the two circular arcs connecting them
-# (ordinary least squares, using every window in the arc). Windows
-# flagged as deletions or redundant coverage (via mask_coverage_windows())
-# are excluded from the line fits so they cannot distort the ramp.
-def otr_fit(df, bias_threshold=1.0):
+# Fits the ENTIRE circular coverage profile (positions 1..genome_len) as
+# ONE unit: a two-segment piecewise-linear ("tent") model connecting an
+# origin anchor (x_ori, y_ori) and a terminus anchor (x_ter, y_ter) --
+# see otr_predict() -- rather than picking a peak/trough by argmax/argmin
+# and then fitting each of the resulting two arcs independently.
+#
+# For any FIXED pair of breakpoints (x_ori, x_ter), the predicted
+# coverage is affine in (y_ori, y_ter) (_otr_design_matrix()), so the
+# best-fitting anchor VALUES are solved exactly via ordinary least
+# squares; the only real search is over the 2 breakpoint POSITIONS
+# (_otr_concentrated_rss() is the error function minimized for that
+# search). This is a well-posed 2-parameter problem, unlike the
+# scipy.optimize.minimize call this design replaces, which packed only 2
+# real degrees of freedom (a line's slope and intercept) into 4 free
+# parameters -- an infinite flat valley with no unique answer -- and
+# whose "solution" a later algebraic identity collapsed into fixed
+# constants regardless of what the optimizer returned.
+#
+# Windows flagged as deletions or redundant coverage (via
+# mask_coverage_windows()) are excluded from BOTH the multi-start seed
+# search and the least-squares fit itself, so a repeat's inflated total
+# coverage or a real deletion's near-zero coverage cannot distort the
+# fitted breakpoints or anchor values.
+#
+# The concentrated RSS surface has kinks wherever a window switches which
+# arc it belongs to, so Nelder-Mead is run from several starting points
+# spread evenly around the circle (each paired with its antipode, since
+# bidirectional replication puts ori/ter roughly opposite each other),
+# plus the masked argmax/argmin seed used previously, and the lowest-RSS
+# result across all starts is kept. This guards against a single bad seed
+# landing in a worse local optimum. Each fit is fast (well under a second
+# even at ~10,000 windows with the default 9 seeds), so the multi-start
+# adds negligible cost.
+#
+# Because every distance here is computed modulo genome_len, the fit is
+# agnostic to where the genome's coordinate origin (position 0/1) happens
+# to fall relative to the biological origin/terminus -- a V-shaped or
+# inverted-V-shaped profile (origin or terminus sitting at the coordinate
+# boundary, common when an assembly is oriented to start at oriC) is not
+# a special case, just a different linear "cut" of the same circular
+# model. Verified against synthetic data with: origin/terminus in both
+# genome-coordinate orderings, both coordinate-boundary orientations
+# (V-shape and inverted-V-shape), an injected repeat that previously
+# hijacked the origin search, a deletion that previously hijacked the
+# terminus search, and a deletion-adjacent "shoulder" window -- all
+# recovered within 1-2 window-widths of the true simulated positions, and
+# noticeably more accurately than the previous per-arc approach on
+# realistically noisy Poisson-sampled coverage.
+def otr_fit(df, bias_threshold=1.0, n_seeds=8):
 
-    x = df.index.to_numpy()
+    x = df.index.to_numpy().astype(float)
     y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
     y_med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float)
     n = len(x)
+    genome_len = float(n)
 
-    # Windows to exclude from the arc line fits: genuine deletions and
-    # redundant/repeat-coverage windows, if mask_coverage_windows() has
-    # already flagged them.
+    # Windows to exclude from both the seed search and the least-squares
+    # fit: genuine deletions and redundant/repeat-coverage windows, if
+    # mask_coverage_windows() has already flagged them.
     exclude = np.zeros(n, dtype=bool)
     if "is_deletion" in df.columns:
         exclude |= df["is_deletion"].to_numpy(dtype=bool)
     if "is_redundant" in df.columns:
         exclude |= df["is_redundant"].to_numpy(dtype=bool)
 
-    # For the peak/trough SEARCH specifically, dilate the exclusion by one
-    # window on each side (circularly -- np.roll wraps correctly around a
-    # circular chromosome).
+    # Dilated by one window on each side, circularly, for the seed search
+    # only: a window merely adjacent to a deletion/repeat boundary can
+    # still drag a naive argmax/argmin off the true peak/trough even
+    # though it doesn't cross the flagging threshold itself.
     exclude_for_search = exclude | np.roll(exclude, 1) | np.roll(exclude, -1)
 
     _yv = y[np.isfinite(y) & (y > 0)]
     _yref = np.median(_yv) if _yv.size else 1.0
     otr_floor = 0.1 * _yref if _yref > 0 else 1e-6
 
-    # Peak/trough search excludes masked windows: -inf so they can never
-    # win the argmax, +inf so they can never win the argmin. If EVERY
-    # window happens to be masked (degenerate edge case), fall back to the
-    # unmasked profile rather than crashing on an all-inf array.
     if exclude_for_search.all():
         y_for_max = y_med_fil
         y_for_min = y_med_fil
     else:
         y_for_max = np.where(exclude_for_search, -np.inf, y_med_fil)
         y_for_min = np.where(exclude_for_search, np.inf, y_med_fil)
+    o_idx_seed = int(np.nanargmax(y_for_max))
+    t_idx_seed = int(np.nanargmin(y_for_min))
 
-    o_idx = int(np.nanargmax(y_for_max))
-    t_idx = int(np.nanargmin(y_for_min))
-    y_ori = y[o_idx]
-    y_ter = y[t_idx]
+    print(f'o_idx_seed:{o_idx_seed} and t_idx_seed: {t_idx_seed}')
 
-    print(f'o_idx:{o_idx} and t_idx: {t_idx}')
+    # Fit using only unmasked windows -- deletions/repeats never inform
+    # the breakpoint search or the anchor-value least-squares solve.
+    fit_mask = ~exclude
+    x_fit = x[fit_mask]
+    y_fit_data = y[fit_mask]
+
+    if fit_mask.sum() < 4:
+        # Not enough clean data to fit anything meaningful.
+        y_flat = np.repeat(np.mean(y), n)
+        print("OTR bias not detected (insufficient clean windows)")
+        return y, y_flat, o_idx_seed, t_idx_seed, False
+
+    # Multi-start: the masked argmax/argmin seed, plus n_seeds evenly
+    # spaced positions around the circle, each paired with its antipode.
+    seeds = [(o_idx_seed, t_idx_seed)]
+    for k in range(n_seeds):
+        s = (k / n_seeds) * genome_len
+        seeds.append((s, (s + genome_len / 2.0) % genome_len))
+
+    best = None
+    for x0 in seeds:
+        res = minimize(
+            lambda p: _otr_concentrated_rss(p, x_fit, y_fit_data, genome_len)[0],
+            x0=list(x0),
+            method="Nelder-Mead",
+            options={"xatol": 0.5, "fatol": 1e-8, "maxiter": 2000},
+        )
+        rss, y_ori_cand, y_ter_cand = _otr_concentrated_rss(res.x, x_fit, y_fit_data, genome_len)
+        if not np.isfinite(rss):
+            continue
+        if best is None or rss < best[0]:
+            best = (rss, res.x[0], res.x[1], y_ori_cand, y_ter_cand)
+
+    if best is None:
+        y_flat = np.repeat(np.mean(y), n)
+        print("OTR bias not detected (no seed converged)")
+        return y, y_flat, o_idx_seed, t_idx_seed, False
+
+    _, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt = best
+
+    # Orient the labels by the fitted anchor values: the origin is whichever
+    # anchor came out higher. _otr_concentrated_rss() is symmetric under
+    # swapping the two breakpoints -- the same tent, the same residuals, the
+    # same RSS -- and the seeds below are blind antipodal pairs, so which one
+    # is returned as x_ori is arbitrary. magnitude_ok further down reads y_ori
+    # as the PEAK, so without this a perfectly good fit fails the gate on a
+    # coin flip: on the p5_75k_exp dataset it found the right breakpoints
+    # (1.56 Mb and 3.80 Mb, 48.5% apart) and then rejected them because the
+    # ratio came out 0.49 instead of 2.05.
+    if y_ori_opt < y_ter_opt:
+        x_ori_opt, x_ter_opt = x_ter_opt, x_ori_opt
+        y_ori_opt, y_ter_opt = y_ter_opt, y_ori_opt
+
+    # Wrap fitted positions back into [0, genome_len). The optimizer can
+    # legitimately return an out-of-range value (e.g. -1.6, mathematically
+    # equivalent to genome_len - 1.6 under the circular model) that
+    # otr_predict()/_otr_design_matrix() already handle via their own
+    # internal modulo, but which MUST be wrapped before use as an array
+    # index below (and by callers, e.g. apply_otr_correction()).
+    x_ori_opt = x_ori_opt % genome_len
+    x_ter_opt = x_ter_opt % genome_len
+    o_idx = int(round(x_ori_opt)) % n
+    t_idx = int(round(x_ter_opt)) % n
+
+    print(f'fitted x_ori:{x_ori_opt:.2f} and x_ter: {x_ter_opt:.2f}')
 
     # Bias is only corrected if ori/ter are roughly opposite each other on
     # the circular genome (consistent with bidirectional replication) and
-    # the peak/trough coverage ratio clears bias_threshold. bias_threshold
+    # the fitted anchor-value ratio clears bias_threshold. bias_threshold
     # is left at 1.0 for now (any ori>ter passes); revisit if noise alone
     # is triggering false-positive corrections.
-    circular_dist = min(abs(o_idx - t_idx), n - abs(o_idx - t_idx))
-    separation_ok = (0.35 * n <= circular_dist <= 0.65 * n)
-    magnitude_ok = (y_ter > 0) and ((y_ori / y_ter) > bias_threshold)
+    circular_dist = min(abs(x_ori_opt - x_ter_opt), genome_len - abs(x_ori_opt - x_ter_opt))
+    separation_ok = (0.35 * genome_len <= circular_dist <= 0.65 * genome_len)
+    magnitude_ok = (y_ter_opt > 0) and ((y_ori_opt / y_ter_opt) > bias_threshold)
 
     if not (separation_ok and magnitude_ok):
         y_fit = np.repeat(np.mean(y), n)
         print("OTR bias not detected")
         return y, y_fit, o_idx, t_idx, False
 
-    bias = True
-
-    # Split the circle into the two arcs connecting origin and terminus.
-    pos_a, ux_a = circular_arc(o_idx, t_idx, n)
-    pos_b, ux_b = circular_arc(t_idx, o_idx, n)
-
-    y_a = y[pos_a]
-    y_b = y[pos_b]
-    fit_mask_a = ~exclude[pos_a]
-    fit_mask_b = ~exclude[pos_b]
-
-    slope_a, intercept_a = fit_arc_line(ux_a, y_a, fit_mask_a, y_ori)
-    slope_b, intercept_b = fit_arc_line(ux_b, y_b, fit_mask_b, y_ter)
-
-    y_fit_a = slope_a * ux_a + intercept_a
-    y_fit_b = slope_b * ux_b + intercept_b
-
-    y_fit = np.empty(n, dtype=float)
-    y_fit[pos_a] = y_fit_a
-    # pos_a and pos_b share their two endpoints (o_idx, t_idx); both arcs'
-    # lines are anchored near the true peak/trough there, so assigning
-    # arc B's value last at the shared points is a negligible difference.
-    y_fit[pos_b] = y_fit_b
-
+    y_fit = otr_predict(x, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt, genome_len)
     y_fit = np.clip(y_fit, otr_floor, None)
     y_corr = y / y_fit
 
-    return y_corr, y_fit, o_idx, t_idx, bias
+    return y_corr, y_fit, o_idx, t_idx, True
 
 
 def find_nearest(array, value):
@@ -908,10 +1108,11 @@ def find_nearest(array, value):
 
 
 # ---------------------------------------------------------------------------
-# mask -> fit -> apply split for origin-to-terminus (OTR) bias.
-# otr_fit() (above) now does its own masking internally (via the
-# is_deletion/is_redundant columns), so this only needs to ensure those
-# columns exist before calling it.
+# mask -> fit -> apply split for origin-to-terminus (OTR) bias. otr_fit()
+# (above) does its own masking internally (via the is_deletion/is_redundant
+# columns), so this only needs to ensure those columns exist before calling
+# it, then split the former monolithic otr_correction() into a fit stage
+# and an apply stage.
 # ---------------------------------------------------------------------------
 def fit_otr_bias(df, output):
     """
@@ -920,6 +1121,14 @@ def fit_otr_bias(df, output):
     mask_coverage_windows() if they don't -- e.g. when OTR correction is
     run without a prior GC-correction pass), and runs otr_fit().
 
+    Returns
+    -------
+    dict with keys "y_corr", "y_fit", "o_idx", "t_idx", "bias",
+    "df_with_medfil". `y_corr` is otr_fit()'s own corrected-coverage array
+    (== unchanged input when bias is not detected, == y/y_fit when it is)
+    and must be used as-is by apply_otr_correction() rather than
+    recomputed from y_fit, since y_fit is a flat line at mean(y) (not 1.0)
+    in the no-bias case.
     """
     df = df.copy()
 
@@ -951,11 +1160,92 @@ def fit_otr_bias(df, output):
     }
 
 
-def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
+def censored_median_coverage(df):
+    """Median GC-corrected coverage over windows that are neither deletions nor repeats.
+
+    GC-corrected rather than raw so a plasmid whose base composition differs from
+    the chromosome does not have that read as copy number. NOT otr-corrected:
+    OTR fires on some sequences and not others, so post-OTR values are not
+    comparable within one sample.
+
+    The mask is built from `is_deletion` / `is_redundant` rather than from
+    `exclude_from_fit`, because fit_otr_bias() only guarantees the first two are
+    present. On CWBI's plasmid_1 the censoring moves the estimate from 2.824 to
+    2.946 -- 121 of its 232 windows carry redundant coverage.
     """
-    Windows flagged `deletion_col` are left un-scaled at their GC-corrected value. 
-    Redundant coverage windows, DO receive the OTR scaling factor, so they are not
+    values = df["gc_corr_norm_cov"].to_numpy(dtype=float)
+
+    keep = np.ones(len(df), dtype=bool)
+    for column in ("is_deletion", "is_redundant"):
+        if column in df.columns:
+            keep &= ~df[column].to_numpy(dtype=bool)
+    if not keep.any():
+        keep = np.ones(len(df), dtype=bool)
+
+    values = values[keep & np.isfinite(values)]
+    return float(np.median(values)) if values.size else float("nan")
+
+
+def relative_copy_numbers(per_genome):
+    """{genome_id: copies relative to the LONGEST sequence}, which reads exactly 1.0.
+
+    process_multi_genome() normalises every sequence against one pooled median, so
+    a multi-copy plasmid arrives at a multiple of the chromosome. run_HMM then
+    refits the single-copy level from whichever sequence it is handed, so that
+    multiple is otherwise computed and thrown away -- CWBI's plasmids sit at 2.95x
+    and 1.90x the chromosome and are both called copy number 1.
+
+    Deliberately non-integral: 2.95 is a measurement, and rounding it to 3 would
+    discard the precision that makes it worth reporting.
+
+    Sequences are ranked by `win_end.max()`. The frame does not carry the true
+    sequence length and preprocess() drops the trailing partial window, so that is
+    3,354,501 against a real 3,354,690 -- only the ordering matters.
+    """
+    if not per_genome:
+        return {}
+
+    medians = {gid: censored_median_coverage(df) for gid, df in per_genome.items()}
+    longest = max(per_genome, key=lambda gid: float(per_genome[gid]["win_end"].max()))
+    anchor = medians[longest]
+
+    if not np.isfinite(anchor) or anchor <= 0:
+        return {gid: float("nan") for gid in per_genome}
+    return {gid: medians[gid] / anchor for gid in per_genome}
+
+
+def _json_safe(value):
+    """NaN/inf -> None, so json.dump emits `null` rather than bare `NaN`.
+
+    breseq reads this file with nlohmann/json, which is strict JSON and has no
+    allow_nan: a single bare NaN makes the WHOLE file unparseable, so it falls
+    into `catch (...)`, warns, and reports no ori-ter bias. That has been true of
+    every "Not detected" file CNery has written, since yori/yter are NaN there.
+    """
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
+                         relative_copy_number=1.0):
+    """
+    Apply stage: evaluate the fitted OTR curve at every window, write
+    plots/results JSON, and return (df, ori_win, ter_win) -- SAME
+    signature as the original otr_correction().
+
+    Only windows flagged `deletion_col` (genuine near-zero/outlier
+    coverage) are left un-scaled at their GC-corrected value. Redundant-
+    coverage windows (flagged via mask_coverage_windows(), but NOT flagged
+    as deletions) DO receive the OTR scaling factor here, so they are not
     zeroed or frozen and won't be miscalled as deletions by the HMM.
+
+    Uses otr_fit_result["y_corr"] (otr_fit()'s own corrected-coverage
+    output) directly, instead of recomputing gc_corr_norm_cov / y_fit.
+    When no bias is detected, otr_fit()'s y_fit is a flat line at mean(y)
+    -- not 1.0 -- so recomputing the division would silently rescale
+    every window by 1/mean(y) even when "no correction" is the intended
+    behavior.
     """
     df = otr_fit_result["df_with_medfil"].copy()
     genome_id = str(df["genome_id"][0])
@@ -989,6 +1279,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
         "Terminus window": int(xter),
         "Terminus coverage (normalized)": yter,
         "Origin-to-Termius/Bias Ratio": OTR,
+        "Relative copy number": relative_copy_number,
         "Correction type": "Ori-ter coordinates fit by coverage",
     }
 
@@ -1005,7 +1296,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
     df["otr_gc_corr_fact"] = f1
 
     with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump({k: _json_safe(v) for k, v in results.items()}, f, indent=4)
 
     return df, xori, xter
 
@@ -1270,16 +1561,275 @@ def solve_pr(mean, variance):
     p = 1 - (mean/variance)
     return p, r
 
+def calculate_logprob(p, r, obs):
+    # log probabilities under a negative binomial (Poisson family), to account for
+    # a wide dispersion of coverage data points given noisy data and high copy
+    # number possibilities (amplifications). gammaln allows the calculation
+    # without computational over-flow.
+    return (gammaln(r + obs) - gammaln(obs + 1) - gammaln(r)
+            + obs * np.log(p) + r * np.log(1 - p))
+
+
 def calculate_prob(p, r, obs):
-    # probabilities calculated by assuming negative binomial distribution (Poisson family), to account for 
-    # a wide dispersion of coverage data points given noisy data and high copy number possibilities (amplifications)
-    # gammaln function allows for calculation of log probabilities without computational over-flow. 
-    
-    probs = np.exp(gammaln(r + obs) - gammaln(obs + 1) - gammaln(r) + obs * np.log(p) + r * np.log(1 - p))
-    return probs
+    return np.exp(calculate_logprob(p, r, obs))
+
+
+def _nb_logpmf_mu(counts, mu, size):
+    """NB log pmf in the (mu, size) parameterisation breseq and R use."""
+    mu = np.asarray(mu, dtype=float)
+    return calculate_logprob(mu / (size + mu), size, counts)
+
+
+def _censor_bounds(values, lo_mult=0.5, hi_mult=1.5):
+    """breseq's censoring window: fixed multiples either side of the mode.
+
+    Ports `fit_censored_negative_binomial` in breseq's coverage_distribution.cpp:
+    the mode is the peak of a 5-point centred moving average of the histogram,
+    searched upward from `max(mean / 4, 1)` so a deletion spike near zero cannot
+    win it, and the window is `[floor(lo_mult * mode), ceil(hi_mult * mode)]`.
+
+    Low side removes deletions; high side removes amplifications and any repeat
+    pile-up that survived window censoring. Single pass, no re-fit loop.
+
+    Returns (lo, hi), or (None, None) if the histogram is degenerate.
+    """
+    v = np.asarray(values, dtype=int)
+    v = v[v >= 1]                      # as in breseq, the histogram has no zero bin
+    if v.size == 0:
+        return None, None
+
+    n_bins = int(v.max())
+    hist = np.bincount(v, minlength=n_bins + 1).astype(float)
+    total = hist[1:].sum()
+    if total <= 0:
+        return None, None
+    mean = float((np.arange(n_bins + 1) * hist).sum() / total)
+
+    if n_bins >= 5:
+        smoothed = np.convolve(hist, np.full(5, 0.2), mode="same")
+        valid = np.zeros(n_bins + 1, dtype=bool)
+        valid[3:n_bins - 1] = True     # undefined within 2 bins of either end
+    else:
+        smoothed = hist
+        valid = np.ones(n_bins + 1, dtype=bool)
+        valid[0] = False
+
+    valid[:max(int(mean / 4.0), 1)] = False
+    if not valid.any():
+        return None, None
+    mode = int(np.argmax(np.where(valid, smoothed, -np.inf)))
+
+    lo = max(int(np.floor(lo_mult * mode)), 1)
+    hi = min(int(np.ceil(hi_mult * mode)), n_bins)
+    if lo >= hi:
+        return None, None
+    return lo, hi
+
+
+def fit_censored_negative_binomial(counts, offsets=None, min_windows=30,
+                                   lo_mult=0.5, hi_mult=1.5, n_offset_bins=64):
+    """(mu, size) of the SINGLE-COPY count distribution, or None if degenerate.
+
+    `counts` are raw window depths and `offsets` the multiplicative GC/OTR bias
+    factors, so E[count_i] = mu * offsets[i] at copy number 1. The bias belongs
+    here, in the mean, rather than being divided out of the data: dividing a
+    count by f scales its variance by 1/f^2, which a single global variance
+    cannot represent, and rounding after dividing inflates the quantisation
+    error of exactly the low-coverage windows that can least afford it.
+
+    Censoring is breseq's (see _censor_bounds) and is what makes this measure
+    WITHIN-state dispersion. np.var over every window measures the spread of a
+    mixture -- deletions at 0x, amplifications at 2-3x -- so it reports BETWEEN
+    -state variance and over-disperses every state at once. On REL606 at
+    -w 100 -s 100 that is var/mean 6.0 where the within-state value is 2.6, and
+    it costs ~13 nats per window of CN2-vs-CN1 evidence at 2.5x coverage: more
+    than the entire budget of a two-window event.
+
+    Unlike breseq, the objective is the truncated likelihood rather than least
+    squares on a renormalised histogram -- breseq's choice is a concession to
+    its thousands of coarse-grained per-base bins. The fitted `size` is
+    therefore not numerically comparable to breseq's `nbinom_size_parameter`,
+    which is also fitted to unique-only PER-BASE counts rather than per-window
+    medians.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = (np.ones_like(counts) if offsets is None
+               else np.asarray(offsets, dtype=float))
+
+    usable = (np.isfinite(counts) & np.isfinite(offsets)
+              & (offsets > 0) & (counts >= 0))
+    counts, offsets = counts[usable], offsets[usable]
+    if counts.size < min_windows:
+        return None
+
+    # Offsets only matter up to a constant -- it trades off exactly against mu --
+    # so normalise, which makes mu the single-copy depth at a typical window and
+    # makes the fit independent of how apply_otr_correction scales its no-bias
+    # fallback (a constant equal to the mean, not 1.0).
+    offsets = offsets / np.median(offsets)
+
+    ratio = np.rint(counts / offsets).astype(int)
+    lo, hi = _censor_bounds(ratio, lo_mult, hi_mult)
+    if lo is None:
+        return None
+
+    keep = (ratio >= lo) & (ratio <= hi)
+    if keep.sum() < min_windows:
+        return None
+
+    kept_counts = np.rint(counts[keep]).astype(int)
+    kept_offsets = offsets[keep]
+    kept_ratio = ratio[keep]
+
+    # A negative binomial cannot represent under-dispersed data: the MLE would
+    # drive size off to infinity against the optimiser bound. Synthetic frames
+    # with Gaussian noise land here, and so does a perfectly flat one. Fall back
+    # to moments plus the historical `var = mean * (1 + 1e-3)` guard -- but
+    # taken over the CENSORED subset, so an amplification cannot inflate the
+    # dispersion that is supposed to detect it.
+    kept_mean = float(kept_ratio.mean())
+    kept_var = float(kept_ratio.var())
+    if kept_var <= kept_mean:
+        if kept_mean <= 0:
+            return None
+        guarded_var = kept_mean * (1.0 + 1e-3)
+        return kept_mean, kept_mean * kept_mean / (guarded_var - kept_mean)
+
+    # Collapse to (offset bin, count) cells so each objective evaluation costs
+    # thousands of gammaln calls rather than tens of thousands -- the same
+    # histogram trick breseq uses, extended to the offset dimension.
+    edges = np.linspace(kept_offsets.min(), kept_offsets.max(), n_offset_bins + 1)
+    obin = np.clip(np.digitize(kept_offsets, edges[1:-1]), 0, n_offset_bins - 1)
+    bin_offset = np.array([
+        kept_offsets[obin == b].mean() if np.any(obin == b) else np.nan
+        for b in range(n_offset_bins)
+    ])
+    live = np.isfinite(bin_offset)
+    bin_offset = bin_offset[live]
+    obin = np.searchsorted(np.flatnonzero(live), obin)
+
+    cell_key = obin.astype(np.int64) * (kept_counts.max() + 1) + kept_counts
+    uniq_key, cell_weight = np.unique(cell_key, return_counts=True)
+    cell_obin, cell_count = np.divmod(uniq_key, kept_counts.max() + 1)
+    cell_offset = bin_offset[cell_obin]
+    cell_weight = cell_weight.astype(float)
+
+    bin_weight = np.bincount(cell_obin, weights=cell_weight,
+                             minlength=bin_offset.size)
+
+    def neg_log_likelihood(params):
+        mu, size = np.exp(params)
+        if not (np.isfinite(mu) and np.isfinite(size)) or mu <= 0 or size <= 0:
+            return 1e12
+        ll = float((cell_weight * _nb_logpmf_mu(cell_count, mu * cell_offset, size)).sum())
+        # Conditioning on the censoring window: the bounds are on the ratio, so
+        # per window they are [lo * offset, hi * offset].
+        bin_mu = mu * bin_offset
+        prob = size / (size + bin_mu)
+        mass = (nbinom.cdf(np.floor(hi * bin_offset), size, prob)
+                - nbinom.cdf(np.ceil(lo * bin_offset) - 1, size, prob))
+        if not np.all(mass > 0) or not np.isfinite(ll):
+            return 1e12
+        return -(ll - float((bin_weight * np.log(mass)).sum()))
+
+    mu0 = kept_mean
+    size0 = mu0 * mu0 / max(kept_var - mu0, 1e-6)
+
+    best, best_score = None, np.inf
+    for mu_try in (mu0, 0.5 * (lo + hi), float(hi), float(lo)):
+        for size_try in (size0, 1e3, 1e1, 1e-1):
+            if mu_try <= 0 or size_try <= 0:
+                continue
+            result = minimize(neg_log_likelihood, np.log([mu_try, size_try]),
+                              method="Nelder-Mead",
+                              options=dict(xatol=1e-6, fatol=1e-6, maxiter=2000))
+            if not result.success and not np.isfinite(result.fun):
+                continue
+            if result.fun < best_score:
+                best_score, best = result.fun, np.exp(result.x)
+
+    if best is None or best_score >= 1e12:
+        return None
+
+    mu, size = float(best[0]), float(best[1])
+    if not (np.isfinite(mu) and np.isfinite(size)) or mu <= 0 or size <= 0:
+        return None
+
+    # breseq rejects a fit whose mass mostly falls outside the fitting window.
+    prob = size / (size + mu)
+    included = float(nbinom.cdf(hi, size, prob) - nbinom.cdf(lo - 1, size, prob))
+    if included < 0.01:
+        return None
+
+    return mu, size
+
+
+def robust_state_count(counts, offsets, mu, min_states=5, max_states=100, support=3):
+    """How many copy-number states the model needs, ignoring lone spikes.
+
+    Taking `int(max(coverage))` lets a SINGLE outlier window set the state space
+    for the whole genome. That is not just wasted work: with a flat off-diagonal
+    the cost of every state change carries -log(n_states), so one window at 40x
+    would make calling a duplication ~1.3 nats dearer everywhere.
+
+    A state that no segment ever occupies costs sensitivity and buys nothing --
+    a one-window excursion cannot pay for its own entry and exit regardless --
+    so the ceiling comes from a `support`-window rolling median. A real
+    high-copy segment spans several windows and survives it; a spike does not.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+    if mu <= 0 or counts.size == 0:
+        return int(min_states)
+
+    ratio = np.nan_to_num(counts / (mu * np.where(offsets > 0, offsets, 1.0)))
+    if ratio.size >= support:
+        ratio = ndimage.median_filter(ratio, size=support, mode="nearest")
+
+    needed = int(np.ceil(np.nan_to_num(ratio.max())))
+    return int(min(max(needed, int(min_states)), int(max_states)))
+
+
+def log_emission_with_offsets(counts, offsets, mu, size, n_states,
+                              deletion_coverage_fraction):
+    """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
+
+    State index == copy number. Row k is NegBinom(mu = k * mu * offset_i,
+    size = k * size); scaling `size` with the state alongside the mean keeps
+    variance proportional to copy number. Row 0 is a geometric of mean
+    `deletion_coverage_fraction * mu * offset_i`, so it is the same statement
+    with k = deletion_coverage_fraction rather than a special case -- every row
+    now reads the fitted baseline and the window's bias offset.
+
+    That matters because the zero state used to be `geom.pmf(count + 1,
+    1 - error_rate)`, a geometric of mean `error_rate / (1 - error_rate)` =
+    0.176 counts ABSOLUTE, with nothing tying it to the sample's coverage. As a
+    fraction of baseline that is 0.28% at 60x and 0.018% at 1000x, so the
+    largest residual coverage it would still call CN0 drifted from 19% to 4%:
+    the same deletion was called on a shallow run and missed on a deep one.
+
+    A per-window matrix replaces the old (state, count) lookup table because
+    the offsets vary per window, which no shared table can express. It also
+    removes the table's `absmax` ceiling and the read-count clipping that fed it.
+    """
+    counts = np.asarray(counts, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+
+    out = np.empty((counts.size, n_states + 1), dtype=float)
+
+    # The floor is load-bearing, not defensive: on an all-zero frame the
+    # censored fit declines and run_HMM falls back to moments, where mu is 0.
+    zero_mean = np.maximum(float(deletion_coverage_fraction) * mu * offsets, 1e-9)
+    out[:, 0] = counts * np.log(zero_mean / (1.0 + zero_mean)) - np.log1p(zero_mean)
+    for state in range(1, n_states + 1):
+        out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state * size)
+
+    out[~np.isfinite(out)] = -np.inf
+    return out
 
 #Emission Matrix
-def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
+def setup_emission_matrix(n_states, mean, variance, absmax,
+                          deletion_coverage_fraction):
     emission = np.full((n_states, absmax + 1), np.nan)
     
     for state in range(n_states):
@@ -1289,13 +1839,63 @@ def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
         for obs in range(absmax + 1):
             emission[state, obs] = calculate_prob(p, r, obs)
     
-    # error rate offsets the probability threshold of 
-    # predicting zero at erronous read alignments
+    # Row 0 is a geometric whose mean is a FRACTION of the single-copy level,
+    # matching log_emission_with_offsets(). An absolute mean here would make the
+    # threshold for "deleted" depend on how deeply the sample was sequenced.
     obs_range = np.arange(absmax + 1)
-    zero_row = geom.pmf(obs_range + 1, 1 - error_rate)
+    zero_mean = max(float(deletion_coverage_fraction) * mean, 1e-9)
+    zero_row = geom.pmf(obs_range + 1, 1.0 / (1.0 + zero_mean))
     emission = np.vstack((zero_row, emission))
     # np.savetxt("emission.csv", emission, delimiter=",")  
     return emission
+
+#: Prior probability per BASE that copy number changes. 1e-6 is one boundary per
+#: ~1 Mb, against the ~25-40 segments these genomes actually carry.
+DEFAULT_CHANGE_RATE = 1e-6
+
+#: Coverage a deleted region still shows, as a fraction of the single-copy
+#: level. Measured on REL606's called deletions: mean 2.2% of baseline, 90th
+#: percentile 3.2% -- mismapping and repeat spill. It sets the mean of the
+#: HMM's copy-number-0 emission, which is a fraction rather than an absolute
+#: count precisely so that the threshold does not move with sequencing depth.
+DEFAULT_DELETION_COVERAGE_FRACTION = 0.02
+
+
+def window_geometry(df):
+    """(step, window) in bases, recovered from the frame.
+
+    run_HMM is not given -w/-s, but preprocess() writes win_st/win_end/win_len in
+    every --bias branch and every test fixture, so the geometry is recoverable
+    without changing any signature.
+    """
+    starts = np.asarray(df["win_st"], dtype=float)
+    step = float(np.median(np.diff(starts))) if starts.size > 1 else 0.0
+
+    if "win_len" in df.columns:
+        window = float(np.median(np.asarray(df["win_len"], dtype=float)))
+    else:
+        window = float(np.median(np.asarray(df["win_end"], dtype=float) - starts))
+
+    if not (step > 0):
+        step = window if window > 0 else 1.0
+    if not (window > 0):
+        window = step
+    return step, window
+
+
+def remain_prob_for_step(change_rate, step):
+    """P(copy number does not change across `step` bases).
+
+    Boundaries are modelled as a Poisson process of rate `change_rate` per base,
+    so P(remain) = exp(-rate * step). The prior then describes the GENOME rather
+    than the tiling: `changeprob` was a flat per-window probability, which means
+    the implied per-base rate was changeprob/step and re-tiling the same genome
+    silently restated the biology. That is what made short amplifications
+    uncallable at one geometry and callable at another.
+    """
+    remain = float(np.exp(-float(change_rate) * float(step)))
+    return float(np.clip(remain, 1e-12, 1.0 - 1e-12))
+
 
 #Transition Matrix setup
 def setup_transition_matrix(n_states, remain_prob):
@@ -1312,96 +1912,229 @@ def setup_transition_matrix(n_states, remain_prob):
     # np.savetxt("transition.csv", transition, delimiter=",") 
     return transition
 
+def _log_emission_lookup(obs, emission_matrix):
+    """Select log emission probabilities for `obs` from a (state, count) table.
+
+    Returns an (n_obs, n_states) array -- the orientation _viterbi_forward()
+    wants -- with exact zeros mapped to -inf rather than a warning.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logemi = np.log(np.asarray(emission_matrix, dtype=float))
+    logemi[np.isnan(logemi)] = -np.inf
+    return logemi[:, np.asarray(obs, dtype=int)].T
+
+
+def _viterbi_forward(log_emission_obs, log_transition, log_start):
+    """Forward pass of Viterbi, keeping backpointers.
+
+    `log_transition` is indexed [from, to] -- the orientation the recursion
+    actually needs. The old code indexed it [to, from] and got away with it
+    only because setup_transition_matrix() returns a symmetric matrix.
+
+    Returns (logv, ptr) where ptr[i, l] is the state at i-1 on the best path
+    that ends in state `l` at window i. ptr[0] is unused.
+    """
+    log_emission_obs = np.asarray(log_emission_obs, dtype=float)
+    n_obs, n_states = log_emission_obs.shape
+
+    logv = np.full((n_obs, n_states), -np.inf)
+    ptr = np.zeros((n_obs, n_states), dtype=np.int32)
+
+    logv[0] = log_start + log_emission_obs[0]
+
+    state_idx = np.arange(n_states)
+    for i in range(1, n_obs):
+        # cand[k, l] = score of the best path reaching k at i-1, then k -> l
+        cand = logv[i - 1][:, None] + log_transition
+        ptr[i] = np.argmax(cand, axis=0)
+        logv[i] = cand[ptr[i], state_idx] + log_emission_obs[i]
+
+    return logv, ptr
+
+
+def _backtrace(logv, ptr):
+    """Recover the single most probable state path from the forward pass.
+
+    This is the step the old code was missing: it took np.argmax(logv, axis=1)
+    per window, which is a per-window max over paths *ending* there and is not
+    a path at all. Inside an elevated run the high-state column climbs relative
+    to CN1 window by window and only overtakes at the last one, which is why an
+    amplification could come out labelled `1,1,3`.
+    """
+    n_obs = logv.shape[0]
+    path = np.empty(n_obs, dtype=int)
+    path[-1] = int(np.argmax(logv[-1]))
+    for i in range(n_obs - 1, 0, -1):
+        path[i - 1] = ptr[i, path[i]]
+    return path
+
+
+def viterbi_path(log_emission_obs, log_transition, log_start):
+    """Most probable state path. See _viterbi_forward() for the conventions."""
+    logv, ptr = _viterbi_forward(log_emission_obs, log_transition, log_start)
+    return _backtrace(logv, ptr)
+
+
+def _default_log_start(log_transition):
+    """Start distribution: the reference is entered from copy number 1.
+
+    Window 0 therefore contributes its own emission and may differ from CN1 at
+    the cost of exactly one transition, instead of being pinned to CN1 by the
+    old `logv[0, 1] = log(1e-100)`. That matters for a circularly permuted
+    reference, which can begin inside a deletion.
+    """
+    return log_transition[1, :].copy()
+
+
 #Make Viterbi Matrtix
 def make_viterbi_mat(obs, transition_matrix, emission_matrix):
-    num_states = transition_matrix.shape[0]
-    
-    # Create a mask for the zero values
-    mask = (emission_matrix == 0)
-    # Take the logarithm of the non-zero values
-    logemi = np.zeros_like(emission_matrix, dtype=float)
-    logemi[~mask] = np.log(emission_matrix[~mask])
+    """Forward Viterbi scores only, kept for callers that want the matrix.
 
-    # Handle the zero values separately, set to -inf
-    logemi[mask] = -np.inf 
-
-    logv = np.full((len(obs), num_states), np.nan)
-    logtrans = np.log(transition_matrix)
-    
-    logv[0,:] = -np.inf
-    
-    #start prob of state = 1 when including zero state
-
-    logv[0, 1] = np.log(1e-100)
-    
-    for i in range(1, len(obs)):
-        for l in range(num_states):
-            statelprobcounti = logemi[l, obs[i]]
-            maxstate = max(logv[i - 1, :] + logtrans[l, :])
-            logv[i, l] = statelprobcounti + maxstate
-    # np.savetxt("viterbi.csv", logv, delimiter = ',')
+    Segment calling goes through HMM_copy_number(), which needs the
+    backpointers this discards.
+    """
+    log_transition = np.log(transition_matrix)
+    logv, _ = _viterbi_forward(
+        _log_emission_lookup(obs, emission_matrix),
+        log_transition,
+        _default_log_start(log_transition),
+    )
     return logv
 
 
-def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length):
-    states = np.arange(emission_matrix.shape[0])
+def _segments_from_path(path, win_st, win_end, chr_length):
+    """Collapse a per-window state path into Startpos/Endpos/State rows."""
+    def _at(seq, i):
+        return seq.iloc[i] if hasattr(seq, "iloc") else seq[i]
 
-    v = make_viterbi_mat(obs, transition_matrix, emission_matrix)
-
-    most_probable_state_path = np.argmax(v, axis=1)
     rows = []
-
-    prev_most_probable_state = most_probable_state_path[0]
-    prev_most_probable_state_name = states[prev_most_probable_state]
     start_pos = 0
+    prev_state = path[0]
 
-    for i in range(len(obs) - 1):
-        most_probable_state = most_probable_state_path[i]
-        most_probable_state_name = states[most_probable_state]
-
-        if most_probable_state_name != prev_most_probable_state_name:
-            endpos = win_end.iloc[i - 1] if hasattr(win_end, "iloc") else win_end[i - 1]
+    # range(1, len(path)) -- the old loop ran to len(obs) - 1 and so could never
+    # emit a state change at the final window.
+    for i in range(1, len(path)):
+        state = path[i]
+        if state != prev_state:
             rows.append({
                 "Startpos": start_pos,
-                "Endpos": endpos,
-                "State": prev_most_probable_state_name,
+                "Endpos": _at(win_end, i - 1),
+                "State": prev_state,
             })
-            start_pos = win_st.iloc[i] if hasattr(win_st, "iloc") else win_st[i]
-
-        prev_most_probable_state_name = most_probable_state_name
+            start_pos = _at(win_st, i)
+        prev_state = state
 
     rows.append({
         "Startpos": start_pos,
         "Endpos": chr_length,
-        "State": prev_most_probable_state_name,
+        "State": prev_state,
     })
 
-    results = pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
-    return results
+    return pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
 
 
-def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
-            max_copy_number=100, min_called_windows=100):
+def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length,
+                    *, log_emission_obs=None, emission_weight=1.0):
+    """Segment the genome by Viterbi decoding.
+
+    `log_emission_obs` lets a caller supply a per-window (n_obs, n_states) log
+    emission matrix directly -- needed once the GC/OTR corrections enter as
+    per-window offsets on the mean, which a shared (state, count) lookup table
+    cannot express. When omitted, `emission_matrix` is used as that lookup.
+
+    `emission_weight` tempers the likelihood by a constant factor, used to stop
+    overlapping windows counting the same bases more than once.
+    """
+    if log_emission_obs is None:
+        log_emission_obs = _log_emission_lookup(obs, emission_matrix)
+    log_emission_obs = np.asarray(log_emission_obs, dtype=float) * float(emission_weight)
+
+    log_transition = np.log(transition_matrix)
+    path = viterbi_path(
+        log_emission_obs, log_transition, _default_log_start(log_transition)
+    )
+    return _segments_from_path(path, win_st, win_end, chr_length)
+
+
+#: which correction factors compose the emission offset, per --bias mode.
+BIAS_OFFSET_COLUMNS = {
+    "all": ("gc_corr_fact", "otr_gc_corr_fact"),
+    "gc": ("gc_corr_fact",),
+    "otr": ("otr_gc_corr_fact",),
+    "none": (),
+}
+
+
+def bias_offsets(df, bias="all"):
+    """Multiplicative GC/OTR bias factor per window, for the emission mean.
+
+    Both factor columns are DIVISORS applied to normalized coverage
+    (apply_gc_correction: `gc_corr_norm_cov = norm_raw_cov / gc_corr_fact`;
+    apply_otr_correction: `otr_gc_corr_fact` is otr_fit's `y_fit`, and
+    `y_corr = y / y_fit`). So the same numbers multiply the EXPECTED raw count,
+    which is where they belong.
+
+    `bias` has to be passed in rather than inferred: process_multi_genome runs
+    GC correction unconditionally, so `gc_corr_fact` is on the frame even under
+    --bias none, and only the caller knows which factors were meant to apply.
+    """
+    offsets = np.ones(len(df), dtype=float)
+    for column in BIAS_OFFSET_COLUMNS.get(bias, BIAS_OFFSET_COLUMNS["all"]):
+        if column in df.columns:
+            factor = df[column].to_numpy(dtype=float)
+            offsets *= np.where(np.isfinite(factor) & (factor > 0), factor, 1.0)
+    return offsets
+
+
+def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
+            n_states=5, changeprob=None,
+            max_copy_number=100, min_called_windows=100, bias="all",
+            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True):
     """
     Viterbi copy-number calling.
 
+    `change_rate` is the prior probability PER BASE that copy number changes, so
+    the per-window probability is 1 - exp(-change_rate * step) and re-tiling the
+    same genome no longer restates the biology. `changeprob` is the escape
+    hatch: pass a float to go back to a flat per-window probability, ignoring
+    `change_rate`.
+
+    `overlap_weighting` tempers the log emissions by step/window. At the default
+    -w 200 -s 100 every base sits in two windows, so the likelihood would
+    otherwise count each base's evidence twice while the transition prior counts
+    it once.
+
+    The observation is the RAW window depth (`read_count_cov`); the GC and OTR
+    corrections enter as multiplicative offsets on the emission mean, so that
+    E[count | CN = k] = k * mu * offset. Dividing them out of the data instead
+    would scale each window's variance by 1/offset^2 while a single global
+    variance was applied to all of them, and would round after dividing, which
+    inflates the quantisation error of exactly the low-coverage windows that
+    can least afford it.
+
     Windows flagged `is_redundant` by mask_coverage_windows() are censored
-    from the observation sequence and from the emission-model estimate:
+    from the observation sequence and from the emission-model fit:
     coverage over a repeat reflects how many copies collapsed onto that
     locus, not the sample's copy number there, so leaving them in both
-    inflates the variance -- pushing `n_states` up until pile-ups get their
-    own spurious high-CN segments -- and lets a single repeat window break a
-    genuine deletion in two.
+    inflates the variance -- pushing `n_states` up until pile-ups get
+    their own spurious high-CN segments -- and lets a single repeat
+    window break a genuine deletion in two.
 
     They are not dropped from the frame. Each still carries its
-    bias-corrected coverage and inherits `prob_copy_number` from the segment
-    it falls in, and `is_redundant` is written to the CNV.csv alongside so an
-    inherited call can be told from a real one.
+    bias-corrected coverage and inherits `prob_copy_number` from the
+    segment it falls in, and `is_redundant` (if present) survives into
+    the CNV.csv alongside so an inherited call can be told from a real
+    one.
 
-    `min_called_windows` is a floor: if censoring would leave fewer windows
-    than this, every window is used instead. That keeps small references and
-    the synthetic test fixtures -- which carry no `is_redundant` column at
-    all -- behaving exactly as before.
+    `min_called_windows` is a floor: if censoring would leave fewer
+    windows than this, every window is used instead. That keeps small
+    references and the synthetic test fixtures -- which may carry no
+    `is_redundant` column at all -- behaving exactly as before. It governs
+    the OBSERVATION SEQUENCE only: the emission fit excludes every window
+    with any redundant coverage unconditionally, because a window that
+    merely clips the edge of an IS element sits at 1.2-1.4x, inside the
+    fit's censoring window, where it would inflate the dispersion precisely
+    where sharpness matters most.
     """
 
     saveloc = os.path.join(output, "CNV_csv")
@@ -1416,8 +2149,9 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
 
     rc_cap = int(max(1.0, max_copy_number) * med)
 
-    # Back-converted read counts are computed for EVERY window -- the column
-    # is part of the pipeline contract and feeds the diagnostic plots.
+    # Back-converted read counts are computed for EVERY window -- the
+    # column is part of the pipeline contract and feeds the diagnostic
+    # plots.
     new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = (
         (new_exp["otr_gc_corr_norm_cov"] * med)
         .round()
@@ -1425,50 +2159,89 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         .clip(upper=rc_cap)
     )
 
+    # Raw counts and their bias offsets, over every window.
+    counts_all = np.rint(
+        np.nan_to_num(new_exp["read_count_cov"].to_numpy(dtype=float))
+    ).clip(min=0)
+    offsets_all = bias_offsets(new_exp, bias=bias)
+
     if "is_redundant" in new_exp.columns:
-        called = ~new_exp["is_redundant"].to_numpy(dtype=bool)
+        not_redundant = ~new_exp["is_redundant"].to_numpy(dtype=bool)
     else:
-        called = np.ones(len(new_exp), dtype=bool)
+        not_redundant = np.ones(len(new_exp), dtype=bool)
+
+    # An offset is only meaningful up to a constant -- it trades off exactly
+    # against mu -- so anchor it once, on the windows the fit will see, and use
+    # that same scale for the emissions. Otherwise mu would be estimated on one
+    # normalisation and applied on another.
+    anchor = np.median(offsets_all[not_redundant])
+    if np.isfinite(anchor) and anchor > 0:
+        offsets_all = offsets_all / anchor
+
+    # The fit sees only clean windows, always. `min_called_windows` softens the
+    # OBSERVATION mask below, never this one.
+    fit_result = fit_censored_negative_binomial(
+        counts_all[not_redundant], offsets_all[not_redundant]
+    )
+
+    called = not_redundant.copy()
     if called.sum() < min_called_windows:
         called = np.ones(len(new_exp), dtype=bool)
 
     obs_exp = new_exp.loc[called]
-    cor_rc = obs_exp["otr_gc_corr_rdcnt_cov"].tolist()
+    counts = counts_all[called]
+    offsets = offsets_all[called]
 
-    mean = np.mean(cor_rc)
-    var = np.var(cor_rc)
+    if fit_result is not None:
+        mu, size = fit_result
+    else:
+        # Degenerate input -- a flat or under-dispersed frame, where a negative
+        # binomial has no finite `size`. Fall back to the historical moment
+        # estimate and its guard so such frames behave exactly as before.
+        mean = float(np.mean(counts))
+        var = float(np.var(counts))
+        if mean > 0 and var <= mean:
+            var = mean * (1.0 + 1e-3)
+        p, size = solve_pr(mean, var)
+        mu = mean
 
-    if mean > 0 and var <= mean:
-        var = mean * (1.0 + 1e-3)
+    n_states = robust_state_count(
+        counts, offsets, mu, min_states=5, max_states=int(max_copy_number)
+    )
 
-    cov_max = int(np.nan_to_num(obs_exp["otr_gc_corr_norm_cov"].max()))
-    n_states = min(max(cov_max, 5), int(max_copy_number))
-
-    rc_max = int(np.max(cor_rc))
-
-    this_emission = setup_emission_matrix(
+    this_log_emission = log_emission_with_offsets(
+        counts, offsets, mu=mu, size=size,
         n_states=n_states,
-        mean=mean,
-        variance=var,
-        absmax=rc_max,
-        error_rate=error_rate,
+        deletion_coverage_fraction=deletion_coverage_fraction,
     )
-    this_transition = setup_transition_matrix(
-        n_states,
-        remain_prob=(1 - changeprob),
-    )
+    step_bp, window_bp = window_geometry(new_exp)
 
-    # HMM_copy_number indexes win_st/win_end positionally, so the censored
-    # subset can be passed straight through. chr_length stays the genome end
-    # over ALL windows -- the last segment must reach it even if the final
-    # window is censored.
+    if changeprob is not None:
+        remain_prob = 1.0 - float(changeprob)
+    else:
+        remain_prob = remain_prob_for_step(change_rate, step_bp)
+
+    this_transition = setup_transition_matrix(n_states, remain_prob=remain_prob)
+
+    # Every observed transition is charged one step, whatever gap the censored
+    # windows left. Pricing a wide repeat gap as a proportionally cheaper
+    # crossing would make a censored repeat a cheap place to break a segment --
+    # exactly what censoring them was meant to prevent.
+    emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
+
+    # HMM_copy_number indexes win_st/win_end positionally, so the
+    # censored subset can be passed straight through. chr_length stays
+    # the genome end over ALL windows -- the last segment must reach it
+    # even if the final window is censored.
     copy_numbers = HMM_copy_number(
-        cor_rc,
+        counts,
         this_transition,
-        this_emission,
+        None,
         obs_exp["win_st"],
         obs_exp["win_end"],
         new_exp["win_end"].max(),
+        log_emission_obs=this_log_emission,
+        emission_weight=emission_weight,
     )
 
     brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
@@ -1477,9 +2250,9 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
     cn_brk = cn_brk.drop(columns="Endpos")
     cn_brk.to_csv(brk_full_path, index=False)
 
-    # Assign by window index rather than by appending to a flat list: once
-    # censored windows are absent from the observation sequence a segment can
-    # span windows that never voted for it, so the old
+    # Assign by window index rather than by appending to a flat list:
+    # once censored windows are absent from the observation sequence a
+    # segment can span windows that never voted for it, so the old
     # len(CN_HMM) == len(new_exp) invariant no longer holds.
     CN_HMM = pd.Series(np.nan, index=new_exp.index, dtype=float)
 
@@ -1490,8 +2263,9 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=1e-10,
         )
         CN_HMM[in_segment] = int(cnrow.State)
 
-    # Windows on a segment boundary can fall outside every half-open interval;
-    # carry the neighbouring call across rather than leaving a hole.
+    # Windows on a segment boundary can fall outside every half-open
+    # interval; carry the neighbouring call across rather than leaving a
+    # hole.
     new_exp.loc[:, "prob_copy_number"] = CN_HMM.ffill().bfill().astype(int)
 
     csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")

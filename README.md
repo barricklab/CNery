@@ -11,6 +11,9 @@ Recent updates (latest commits):
 - **Cumulative GC skew origin/terminus prediction** — `CNery` now also locates the replication origin and terminus from the reference's own cumulative GC skew ([Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593)), independently of read depth. Reported in `GC_skew/` as a marked-up plot and a JSON summary; nothing downstream consumes it yet.
 - **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
+- **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
+  number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
+  Read `1/rate` as the expected segment length.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
 
@@ -273,7 +276,9 @@ Given an output folder `CNV_out/`, `CNery` writes:
 - `CNV_out/CNV_plt/` — per-reference CNV prediction plots.
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
 - `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
-- `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, and the origin-to-terminus ratio.
+- `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
+
+  `"Relative copy number"` is that sequence's coverage relative to the longest sequence in the run, which reads exactly `1.0`. It is not rounded to an integer: a plasmid at `2.95` is a measurement, and it is the only place plasmid copy number is reported — `prob_copy_number` in the CSVs is called per reference, so a uniformly multi-copy plasmid comes out as `1` there.
 - `CNV_out/GC_skew/` — per-reference cumulative GC-skew plots with the predicted origin and terminus marked, and a JSON summary (`*_gc_skew_results.json`).
 
 Each coverage table produces its own set of outputs, named with the sequence ID derived from its file name. The GC-bias plot is the exception: one pooled fit covers every table in the run.
@@ -299,9 +304,11 @@ Bacterial genomes are G-rich on the leading strand and C-rich on the lagging str
 }
 ```
 
-`Prediction confident` is false when the genome is too short to support the inference, when the two extrema are not roughly antipodal (35–65% of the genome apart, as bidirectional replication implies), or when the two replichores' skew does not separate convincingly. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
+`Prediction confident` is false when the sequence is too short to support the inference, when the two extrema are not roughly antipodal (35–65% of the sequence apart, as bidirectional replication implies), or when the two replichores' skew does not separate convincingly. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
 
-Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers. And it is invariant to circular permutation of the reference: a genome whose coordinates start elsewhere predicts the same locus.
+Expect `false` on plasmids. They have no bidirectional replication origin, so there is no sign change for the cumulative curve to turn on, and the two extrema you get back are noise. That is the intended answer, not a failure — chromosomes in the same run are unaffected, since the prediction is made per reference.
+
+Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers, whatever their depth or growth phase. And it is invariant to circular permutation: a reference whose coordinates start elsewhere predicts the same locus.
 
 These values are **not yet used** for anything. Bias correction and copy-number calling still use the origin and terminus that `--bias otr` infers from the coverage profile.
 
@@ -313,7 +320,9 @@ These values are **not yet used** for anything. Bias correction and copy-number 
 $ CNery -h
 
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
-             [-w W] [-s S] [-f F] [-e E] [--bias {all,none,gc,otr}]
+             [-w W] [-s S] [-f F]
+             [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
+             [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -353,15 +362,38 @@ options:
   -o, --output O        output file prefix / storage location. Defaults to
                         the 'CNV_out' folder in the current dir.
   -w, --window W        Window length used to parse the genome and compute
-                        coverage and GC statistics. Default: 200.
+                        coverage and GC statistics. Default: 100. Wider
+                        windows smooth the coverage but lose short events: the
+                        window statistic is a per-base median, whose precision
+                        grows sublinearly with width, so -w is a resolution
+                        knob.
   -s, --step-size S     Step size (<= window size) for each progression of
                         the window across the genome. Set step-size = window
-                        size for non-overlapping windows. Default: 100.
-  -f, --frag-size F     Average fragment size of the sequencing reads.
-                        Default: 150.
-  -e, --error-rate E    Approximate error rate in sequencing read coverage /
-                        reference alignment. Widens the negative-binomial
-                        emission distributions in the HMM. Default: 0.15.
+                        size for non-overlapping windows. Default: 100, i.e.
+                        non-overlapping. Copy-number calls are near-invariant
+                        to this: the state-change prior is per base (see
+                        --change-rate) and overlapping windows are
+                        down-weighted so they do not count the same bases
+                        twice.
+  -f, --frag-size F     Average fragment size of the sequencing library. GC%
+                        is measured over this many bases centred on each
+                        window. Ignored when smaller than -w. Default: 400.
+  -z, --deletion-coverage-fraction DELETION_COVERAGE_FRACTION
+                        Coverage a deleted region still shows, as a fraction of
+                        the single-copy level. Sets the mean of the
+                        copy-number-0 emission. Real deletions are not empty --
+                        mismapping and repeat spill leave a couple of percent
+                        behind. A fraction rather than an absolute depth so
+                        that what counts as a deletion does not change with how
+                        deeply the sample was sequenced. Default: 0.02.
+  --change-rate CHANGE_RATE
+                        Prior probability PER BASE that copy number changes.
+                        The per-window probability is 1 - exp(-rate * step-
+                        size), so changing -w/-s no longer changes the
+                        implied biology. Read 1/rate as the expected segment
+                        length: the default 1e-06 is one copy-number boundary
+                        per megabase. Larger values give more, shorter
+                        segments.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'
