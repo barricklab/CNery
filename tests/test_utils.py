@@ -59,7 +59,8 @@ class TestEmissionMatrix:
     @pytest.fixture
     def basic_emission(self):
         return setup_emission_matrix(
-            n_states=5, mean=50.0, variance=100.0, absmax=150, error_rate=0.05
+            n_states=5, mean=50.0, variance=100.0, absmax=150,
+            deletion_coverage_fraction=0.02
         )
 
     def test_zero_state_row_peaks_at_low_obs(self, basic_emission):

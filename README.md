@@ -287,7 +287,8 @@ Each coverage table produces its own set of outputs, named with the sequence ID 
 $ CNery -h
 
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
-             [-w W] [-s S] [-f F] [-e E] [--change-rate CHANGE_RATE]
+             [-w W] [-s S] [-f F]
+             [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
              [--bias {all,none,gc,otr}]
              [INPUT ...]
 
@@ -341,11 +342,17 @@ options:
                         --change-rate) and overlapping windows are
                         down-weighted so they do not count the same bases
                         twice.
-  -f, --frag-size F     Average fragment size of the sequencing reads.
-                        Default: 150.
-  -e, --error-rate E    Approximate error rate in sequencing read coverage /
-                        reference alignment. Widens the negative-binomial
-                        emission distributions in the HMM. Default: 0.15.
+  -f, --frag-size F     Average fragment size of the sequencing library. GC%
+                        is measured over this many bases centred on each
+                        window. Ignored when smaller than -w. Default: 400.
+  -z, --deletion-coverage-fraction DELETION_COVERAGE_FRACTION
+                        Coverage a deleted region still shows, as a fraction of
+                        the single-copy level. Sets the mean of the
+                        copy-number-0 emission. Real deletions are not empty --
+                        mismapping and repeat spill leave a couple of percent
+                        behind. A fraction rather than an absolute depth so
+                        that what counts as a deletion does not change with how
+                        deeply the sample was sequenced. Default: 0.02.
   --change-rate CHANGE_RATE
                         Prior probability PER BASE that copy number changes.
                         The per-window probability is 1 - exp(-rate * step-

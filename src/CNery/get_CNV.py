@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .core import (
     DEFAULT_CHANGE_RATE,
+    DEFAULT_DELETION_COVERAGE_FRACTION,
     DEFAULT_FILE_ENDINGS,
     parse_region,
     process_multi_genome,
@@ -151,17 +152,21 @@ def main():
         ),
     )
     parser.add_argument(
-        "-e",
-        "--error-rate",
+        "-z",
+        "--deletion-coverage-fraction",
         action="store",
-        dest="e",
-        default=0.15,
+        dest="deletion_coverage_fraction",
+        default=DEFAULT_DELETION_COVERAGE_FRACTION,
         required=False,
         type=float,
         help=(
-            "Approximate error rate in sequencing read coverage/reference "
-            "alignment. Widens the negative-binomial emission distributions "
-            "in the HMM. Default: 0.15."
+            "Coverage a deleted region still shows, as a fraction of the "
+            "single-copy level. Sets the mean of the copy-number-0 emission. "
+            "Real deletions are not empty -- mismapping and repeat spill leave "
+            "a couple of percent behind. A fraction rather than an absolute "
+            "depth so that what counts as a deletion does not change with how "
+            "deeply the sample was sequenced. Default: %g."
+            % DEFAULT_DELETION_COVERAGE_FRACTION
         ),
     )
     parser.add_argument(
@@ -292,7 +297,7 @@ def main():
             df_cnv = run_HMM(
                 df_gc,
                 out_dir,
-                error_rate=options.e,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
                 bias=options.bias,
                 change_rate=options.change_rate,
             )
@@ -315,7 +320,7 @@ def main():
             df_cnv = run_HMM(
                 df_otr,
                 out_dir,
-                error_rate=options.e,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
                 bias=options.bias,
                 change_rate=options.change_rate,
             )
@@ -327,7 +332,7 @@ def main():
             df_cnv = run_HMM(
                 df_none,
                 out_dir,
-                error_rate=options.e,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
                 bias=options.bias,
                 change_rate=options.change_rate,
             )
@@ -353,7 +358,7 @@ def main():
             df_cnv = run_HMM(
                 df_otr,
                 out_dir,
-                error_rate=options.e,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
                 bias=options.bias,
                 change_rate=options.change_rate,
             )

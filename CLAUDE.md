@@ -198,6 +198,15 @@ are rejected before `get_CNV.main` creates any output directory.
 - The HMM stacks a geometric zero-state row on top of one negative-binomial emission row per copy
   number, so **state index == copy number** and the matrices are `n_states + 1` square/rows. The
   negative binomial (not Poisson) is intentional: coverage is overdispersed.
+- **The zero state's mean is a fraction of the local baseline**, `deletion_coverage_fraction * mu *
+  offset` (`-z`, default 0.02), which makes it the `k = 0.02` case of the emission contract below
+  rather than a special case. It used to be `geom.pmf(count + 1, 1 - error_rate)` — a geometric of
+  mean `error_rate / (1 - error_rate)` = 0.176 counts **absolute**, tied to nothing about the sample.
+  As a fraction of baseline that is 0.28% at 60x and 0.018% at 1000x, so the largest residual coverage
+  still called CN0 drifted from 19% to 4%: the same deletion was called on a shallow run and missed on
+  a deep one. `tests/test_hmm.py::test_deletion_calls_do_not_depend_on_sequencing_depth` pins it.
+  The default 0.02 is measured, not assumed — REL606's called deletions hold a mean 2.2% of baseline
+  (90th percentile 3.2%), the residue of mismapping and repeat spill.
 - **The HMM observes RAW counts, and the bias corrections enter as offsets on the emission mean** —
   `E[count | CN = k] = k * mu * gc_corr_fact * otr_gc_corr_fact`, not `corrected_coverage`. Both
   factor columns are already the divisors, so the same numbers multiply the expectation. Dividing

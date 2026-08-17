@@ -23,7 +23,8 @@ from CNery.core import (
 
 
 def _matrices(mean=50, var=100, n_states=5):
-    em = setup_emission_matrix(n_states, mean, var, absmax=200, error_rate=0.05)
+    em = setup_emission_matrix(n_states, mean, var, absmax=200,
+                              deletion_coverage_fraction=0.02)
     tm = setup_transition_matrix(n_states, remain_prob=1 - 1e-6)
     return em, tm
 
@@ -348,9 +349,11 @@ def test_offsets_shift_the_emission_mean_not_the_data():
     """E[count | CN=k] = k * mu * offset, so a scaled offset scales the peak."""
     counts = np.arange(0, 400, dtype=float)
     plain = log_emission_with_offsets(counts, np.ones_like(counts), mu=100.0,
-                                      size=50.0, n_states=3, error_rate=0.15)
+                                      size=50.0, n_states=3,
+                                      deletion_coverage_fraction=0.02)
     doubled = log_emission_with_offsets(counts, np.full_like(counts, 2.0), mu=100.0,
-                                        size=50.0, n_states=3, error_rate=0.15)
+                                        size=50.0, n_states=3,
+                                        deletion_coverage_fraction=0.02)
     def mode(mu, size):
         # abs=1 because the mode formula can land on an exact integer, where
         # two adjacent counts tie and argmax simply takes the first.
@@ -426,3 +429,60 @@ def test_uncensored_frame_still_calls_the_amplification(tmp_path):
     df["pct_redundant"] = 0.0
     result, _ = _run(df, tmp_path)
     assert result["prob_copy_number"].max() > 1
+
+def _frame_with_partial_deletion(n=300, deleted=slice(140, 160), depth=100.0,
+                                 residual=0.10, seed=5):
+    """Flat coverage with a block that retains `residual` of the baseline.
+
+    A real deletion rarely reads as exactly zero -- mismapping and repeats leave
+    a few percent behind -- so `residual` is what actually decides whether the
+    zero state recognises it. Noise is negative-binomial at a realistic
+    dispersion so the frame is not degenerate, which would send run_HMM down its
+    moment fallback instead of the censored fit.
+    """
+    rng = np.random.default_rng(seed)
+    # Relative variance fixed at REL606's measured 0.0266 so that only the DEPTH
+    # varies between parametrisations. Solving mu + mu^2/size = 0.0266 * mu^2
+    # for size, not `depth / 0.0266 - depth`, which holds 1.027/mu instead and
+    # makes the frame ~26x sharper than real coverage at 1000x.
+    size = 1.0 / max(0.0266 - 1.0 / depth, 1e-4)
+    level = np.full(n, 1.0)
+    level[deleted] = residual
+    counts = nbinom.rvs(size, size / (size + depth * level),
+                        random_state=rng).astype(float)
+    win_st = np.arange(n) * 200
+    return pd.DataFrame({
+        "genome_id": "chr1",
+        "win_st": win_st,
+        "win_end": win_st + 200,
+        "win_len": 200,
+        "gc_percent": 0.5,
+        "read_count_cov": counts,
+        "norm_raw_cov": counts / np.median(counts),
+        "gc_corr_norm_cov": counts / np.median(counts),
+        "otr_gc_corr_norm_cov": counts / np.median(counts),
+        "pct_redundant": 0.0,
+        "is_redundant": False,
+        "is_deletion": False,
+    })
+
+
+@pytest.mark.parametrize("depth", [60.0, 250.0, 1000.0])
+def test_deletion_calls_do_not_depend_on_sequencing_depth(depth, tmp_path):
+    """The same biology must be called the same way at any sequencing depth.
+
+    The zero state used to be a geometric of mean error_rate / (1 - error_rate)
+    = 0.176 counts ABSOLUTE, with nothing tying it to the coverage of the
+    sample. As a fraction of baseline that is 0.28% at 60x and 0.018% at 1000x,
+    so the largest residual coverage it would still call CN0 drifted from 19% to
+    4%. A deletion holding 10% of its coverage -- which is what one next to a
+    repeat looks like -- was therefore called at 60x and missed at 1000x, lost
+    purely because the sample was sequenced deeper.
+    """
+    df = _frame_with_partial_deletion(depth=depth, residual=0.10)
+    result, _ = _run(df, tmp_path / f"d{int(depth)}")
+    called = result.loc[140:159, "prob_copy_number"]
+    assert (called == 0).all(), (
+        f"deletion holding 10% of a {depth:.0f}x baseline was not called CN0; "
+        f"got {sorted(set(called))}"
+    )

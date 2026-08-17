@@ -1297,14 +1297,23 @@ def robust_state_count(counts, offsets, mu, min_states=5, max_states=100, suppor
     return int(min(max(needed, int(min_states)), int(max_states)))
 
 
-def log_emission_with_offsets(counts, offsets, mu, size, n_states, error_rate):
+def log_emission_with_offsets(counts, offsets, mu, size, n_states,
+                              deletion_coverage_fraction):
     """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
 
-    State index == copy number: row 0 is the geometric zero state, and row k is
-    NegBinom(mu = k * mu * offset_i, size = k * size). Scaling `size` with the
-    state alongside the mean keeps variance proportional to copy number, which
-    is what the old `variance * (state + 1)` did -- the offsets are the change
-    here, not the across-state behaviour.
+    State index == copy number. Row k is NegBinom(mu = k * mu * offset_i,
+    size = k * size); scaling `size` with the state alongside the mean keeps
+    variance proportional to copy number. Row 0 is a geometric of mean
+    `deletion_coverage_fraction * mu * offset_i`, so it is the same statement
+    with k = deletion_coverage_fraction rather than a special case -- every row
+    now reads the fitted baseline and the window's bias offset.
+
+    That matters because the zero state used to be `geom.pmf(count + 1,
+    1 - error_rate)`, a geometric of mean `error_rate / (1 - error_rate)` =
+    0.176 counts ABSOLUTE, with nothing tying it to the sample's coverage. As a
+    fraction of baseline that is 0.28% at 60x and 0.018% at 1000x, so the
+    largest residual coverage it would still call CN0 drifted from 19% to 4%:
+    the same deletion was called on a shallow run and missed on a deep one.
 
     A per-window matrix replaces the old (state, count) lookup table because
     the offsets vary per window, which no shared table can express. It also
@@ -1314,7 +1323,11 @@ def log_emission_with_offsets(counts, offsets, mu, size, n_states, error_rate):
     offsets = np.asarray(offsets, dtype=float)
 
     out = np.empty((counts.size, n_states + 1), dtype=float)
-    out[:, 0] = geom.logpmf(counts + 1, 1 - error_rate)
+
+    # The floor is load-bearing, not defensive: on an all-zero frame the
+    # censored fit declines and run_HMM falls back to moments, where mu is 0.
+    zero_mean = np.maximum(float(deletion_coverage_fraction) * mu * offsets, 1e-9)
+    out[:, 0] = counts * np.log(zero_mean / (1.0 + zero_mean)) - np.log1p(zero_mean)
     for state in range(1, n_states + 1):
         out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state * size)
 
@@ -1322,7 +1335,8 @@ def log_emission_with_offsets(counts, offsets, mu, size, n_states, error_rate):
     return out
 
 #Emission Matrix
-def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
+def setup_emission_matrix(n_states, mean, variance, absmax,
+                          deletion_coverage_fraction):
     emission = np.full((n_states, absmax + 1), np.nan)
     
     for state in range(n_states):
@@ -1332,10 +1346,12 @@ def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
         for obs in range(absmax + 1):
             emission[state, obs] = calculate_prob(p, r, obs)
     
-    # error rate offsets the probability threshold of 
-    # predicting zero at erronous read alignments
+    # Row 0 is a geometric whose mean is a FRACTION of the single-copy level,
+    # matching log_emission_with_offsets(). An absolute mean here would make the
+    # threshold for "deleted" depend on how deeply the sample was sequenced.
     obs_range = np.arange(absmax + 1)
-    zero_row = geom.pmf(obs_range + 1, 1 - error_rate)
+    zero_mean = max(float(deletion_coverage_fraction) * mean, 1e-9)
+    zero_row = geom.pmf(obs_range + 1, 1.0 / (1.0 + zero_mean))
     emission = np.vstack((zero_row, emission))
     # np.savetxt("emission.csv", emission, delimiter=",")  
     return emission
@@ -1343,6 +1359,13 @@ def setup_emission_matrix(n_states, mean, variance, absmax, error_rate):
 #: Prior probability per BASE that copy number changes. 1e-6 is one boundary per
 #: ~1 Mb, against the ~25-40 segments these genomes actually carry.
 DEFAULT_CHANGE_RATE = 1e-6
+
+#: Coverage a deleted region still shows, as a fraction of the single-copy
+#: level. Measured on REL606's called deletions: mean 2.2% of baseline, 90th
+#: percentile 3.2% -- mismapping and repeat spill. It sets the mean of the
+#: HMM's copy-number-0 emission, which is a fraction rather than an absolute
+#: count precisely so that the threshold does not move with sequencing depth.
+DEFAULT_DELETION_COVERAGE_FRACTION = 0.02
 
 
 def window_geometry(df):
@@ -1570,7 +1593,8 @@ def bias_offsets(df, bias="all"):
     return offsets
 
 
-def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=None,
+def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
+            n_states=5, changeprob=None,
             max_copy_number=100, min_called_windows=100, bias="all",
             change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True):
     """
@@ -1691,7 +1715,8 @@ def run_HMM(df, output, error_rate=0.15, n_states=5, changeprob=None,
 
     this_log_emission = log_emission_with_offsets(
         counts, offsets, mu=mu, size=size,
-        n_states=n_states, error_rate=error_rate,
+        n_states=n_states,
+        deletion_coverage_fraction=deletion_coverage_fraction,
     )
     step_bp, window_bp = window_geometry(new_exp)
 
