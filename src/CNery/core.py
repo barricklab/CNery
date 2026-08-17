@@ -657,6 +657,11 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
     at EVERY window's GC% (both fit-eligible and censored windows) and
     divide raw normalized coverage by it.
 
+    `relative_copy_number` is this sequence's copies relative to the longest one
+    in the run (see relative_copy_numbers()); it is written straight into the
+    results JSON. The default of 1.0 is the honest answer for a caller holding a
+    single frame -- it is its own longest sequence.
+
     Only windows flagged `deletion_col` (genuine near-zero/outlier
     coverage) are frozen at zero. Redundant-coverage windows (censored
     from fitting but NOT flagged as deletions) still get a real corrected
@@ -1113,7 +1118,75 @@ def fit_otr_bias(df, output):
     }
 
 
-def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
+def censored_median_coverage(df):
+    """Median GC-corrected coverage over windows that are neither deletions nor repeats.
+
+    GC-corrected rather than raw so a plasmid whose base composition differs from
+    the chromosome does not have that read as copy number. NOT otr-corrected:
+    OTR fires on some sequences and not others, so post-OTR values are not
+    comparable within one sample.
+
+    The mask is built from `is_deletion` / `is_redundant` rather than from
+    `exclude_from_fit`, because fit_otr_bias() only guarantees the first two are
+    present. On CWBI's plasmid_1 the censoring moves the estimate from 2.824 to
+    2.946 -- 121 of its 232 windows carry redundant coverage.
+    """
+    values = df["gc_corr_norm_cov"].to_numpy(dtype=float)
+
+    keep = np.ones(len(df), dtype=bool)
+    for column in ("is_deletion", "is_redundant"):
+        if column in df.columns:
+            keep &= ~df[column].to_numpy(dtype=bool)
+    if not keep.any():
+        keep = np.ones(len(df), dtype=bool)
+
+    values = values[keep & np.isfinite(values)]
+    return float(np.median(values)) if values.size else float("nan")
+
+
+def relative_copy_numbers(per_genome):
+    """{genome_id: copies relative to the LONGEST sequence}, which reads exactly 1.0.
+
+    process_multi_genome() normalises every sequence against one pooled median, so
+    a multi-copy plasmid arrives at a multiple of the chromosome. run_HMM then
+    refits the single-copy level from whichever sequence it is handed, so that
+    multiple is otherwise computed and thrown away -- CWBI's plasmids sit at 2.95x
+    and 1.90x the chromosome and are both called copy number 1.
+
+    Deliberately non-integral: 2.95 is a measurement, and rounding it to 3 would
+    discard the precision that makes it worth reporting.
+
+    Sequences are ranked by `win_end.max()`. The frame does not carry the true
+    sequence length and preprocess() drops the trailing partial window, so that is
+    3,354,501 against a real 3,354,690 -- only the ordering matters.
+    """
+    if not per_genome:
+        return {}
+
+    medians = {gid: censored_median_coverage(df) for gid, df in per_genome.items()}
+    longest = max(per_genome, key=lambda gid: float(per_genome[gid]["win_end"].max()))
+    anchor = medians[longest]
+
+    if not np.isfinite(anchor) or anchor <= 0:
+        return {gid: float("nan") for gid in per_genome}
+    return {gid: medians[gid] / anchor for gid in per_genome}
+
+
+def _json_safe(value):
+    """NaN/inf -> None, so json.dump emits `null` rather than bare `NaN`.
+
+    breseq reads this file with nlohmann/json, which is strict JSON and has no
+    allow_nan: a single bare NaN makes the WHOLE file unparseable, so it falls
+    into `catch (...)`, warns, and reports no ori-ter bias. That has been true of
+    every "Not detected" file CNery has written, since yori/yter are NaN there.
+    """
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
+                         relative_copy_number=1.0):
     """
     Apply stage: evaluate the fitted OTR curve at every window, write
     plots/results JSON, and return (df, ori_win, ter_win) -- SAME
@@ -1164,6 +1237,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
         "Terminus window": int(xter),
         "Terminus coverage (normalized)": yter,
         "Origin-to-Termius/Bias Ratio": OTR,
+        "Relative copy number": relative_copy_number,
         "Correction type": "Ori-ter coordinates fit by coverage",
     }
 
@@ -1180,7 +1254,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion"):
     df["otr_gc_corr_fact"] = f1
 
     with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump({k: _json_safe(v) for k, v in results.items()}, f, indent=4)
 
     return df, xori, xter
 

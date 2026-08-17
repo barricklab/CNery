@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .core import (
     DEFAULT_CHANGE_RATE,
+    relative_copy_numbers,
     DEFAULT_DELETION_COVERAGE_FRACTION,
     DEFAULT_FILE_ENDINGS,
     parse_region,
@@ -288,6 +289,11 @@ def main():
         print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
     # Bias-correction and CNV calling per genome
+    # One number per sequence: its coverage relative to the longest sequence in this
+    # run, which reads exactly 1.0. Computed here because it is the only place holding
+    # every sequence at once -- apply_otr_correction() runs per sequence.
+    relative_cn = relative_copy_numbers(per_genome)
+
     for genome_id, df_b2c in per_genome.items():
         print(f"Processing genome: {genome_id}")
 
@@ -319,7 +325,10 @@ def main():
             # process_multi_genome(), so fit_otr_bias() reuses them
             # directly rather than recomputing.
             otr_fit_result = fit_otr_bias(df_otr_in, out_dir)
-            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(
+                otr_fit_result, out_dir,
+                relative_copy_number=relative_cn.get(genome_id, 1.0),
+            )
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'
@@ -357,7 +366,10 @@ def main():
             # Same fit -> apply split as the "otr" branch above, replacing
             # otr_correction(df_gc, out_dir).
             otr_fit_result = fit_otr_bias(df_gc, out_dir)
-            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(
+                otr_fit_result, out_dir,
+                relative_copy_number=relative_cn.get(genome_id, 1.0),
+            )
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'

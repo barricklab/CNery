@@ -244,6 +244,19 @@ are rejected before `get_CNV.main` creates any output directory.
   path comes from `viterbi_path`. Taking `np.argmax(logv, axis=1)` per window is *not* a path — it
   can name a state no single path passes through, which is how a 3-window amplification came out
   labelled `1,1,3`, on its lowest window. `log_transition` is indexed **`[from, to]`**.
+- `OTR_corr/<sample><seq_id>_otr_results.json` carries **`"Relative copy number"`**: this sequence's
+  coverage relative to the longest sequence in the run, which reads exactly 1.0. Deliberately
+  non-integral — 2.95 copies is a measurement. Computed by `relative_copy_numbers()` from the censored
+  median of `gc_corr_norm_cov`, and passed *into* `apply_otr_correction` rather than carried on the
+  frame: it is one scalar per sequence, and a constant column would add 226–407 kB to an 8.3 MB
+  `CNV.csv`.
+- **That JSON must stay strict JSON.** breseq parses it with nlohmann, which has no `allow_nan`, so a
+  single bare `NaN` makes the whole file unparseable and silently costs it all OTR reporting.
+  `_json_safe` maps non-finite values to `null` on the way out. Two further constraints from the same
+  reader: `"Origin-to-Termius/Bias Ratio"` is load-bearing **including the typo** (renaming it makes
+  breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
+  so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
+  three columns and the assert is fatal.
 - Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
   `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
   functions in `core.py` assume they already exist.
@@ -309,11 +322,12 @@ Three of them carry the load for a specific area:
   `TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
 - `cwbi_ssym_ht04` — **the only multi-sequence dataset and the only CSV one**. A chromosome plus
   two plasmids, so it is the only cover for `process_multi_genome`'s pooled GC fit and its shared
-  global median. Note what it shows: the pooled median keeps the plasmids at 2.82x and 1.88x the
-  chromosome in `norm_raw_cov`, but `run_HMM` refits the single-copy level from whichever sequence
-  it is handed (fitted mu 100.9 / 300.0 / 194.6), so **both plasmids are reported as CN 1**. The
-  relative depth is preserved and then discarded. That follows from "CN calling is per-reference",
-  but it does mean plasmid copy number is not something CNery currently reports.
+  global median. Note what it shows: the pooled median keeps the plasmids above the chromosome, but
+  `run_HMM` refits the single-copy level from whichever sequence it is handed (fitted mu
+  100.9 / 300.0 / 194.6), so **`prob_copy_number` is 1 for both plasmids** — that follows from "CN
+  calling is per-reference". The multiple is not lost, though: it is published as
+  **`"Relative copy number"`** in each sequence's `_otr_results.json`, at 2.953 and 1.898 against a
+  chromosome pinned to exactly 1.0.
 - `adp1_mgd06_lb` — the first non-REL606 genome, which is why sequence length and window count are
   per-`Sequence` rather than the module constants they used to be.
 

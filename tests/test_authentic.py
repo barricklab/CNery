@@ -61,6 +61,7 @@ from CNery.core import (
     genome_id_from_path,
     preprocess,
     process_multi_genome,
+    relative_copy_numbers,
     resolve_coverage_inputs,
     run_HMM,
 )
@@ -85,7 +86,7 @@ class Sequence:
 
     seq_id: str
     length: int
-    relative_depth: float = 1.0  # median norm_raw_cov, i.e. depth vs the POOLED median
+    relative_cn: float = 1.0     # copies relative to the run's LONGEST sequence
     expected_cn: int = 1         # modal copy number run_HMM actually calls
     otr_detected: bool = False   # does otr_fit find a replication gradient here?
     otr_tightens: bool = True    # ...and is the gradient strong enough to help?
@@ -142,8 +143,8 @@ DATASETS = {
          # wash: windows within 20% of single-copy go 91.8% -> 91.5%, IQR 0.130 -> 0.136.
          # Contrast p5_75k_exp at ratio 2.05 (53% -> 95%). Recorded rather than asserted
          # away -- a weak gradient that neither helps nor harms is the honest reading.
-         Sequence("plasmid_1", 116_754, relative_depth=2.82, has_deletions=False),
-         Sequence("plasmid_2", 82_656, relative_depth=1.88, has_deletions=False)),
+         Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False),
+         Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False)),
         0, 4, 4, schema="total_only", ending="coverage.csv"),
     "adp1_mgd06_lb": Spec(
         (Sequence("ADP1-ISx", 3_592_307),), 0, 4, 4, schema="total_only"),
@@ -221,12 +222,19 @@ def _run_pipeline(name, path, out):
         win=WIN, step=STEP, frag=FRAG,
     )
 
+    # Mirrors get_CNV.main(): one number per sequence, computed across ALL of them
+    # because apply_otr_correction() runs per sequence and cannot see the others.
+    relative_cn = relative_copy_numbers(per_genome)
+
     frames = {}
     for seq_id, df_gc in per_genome.items():
         # df_gc already carries is_deletion/is_redundant from the
         # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
         # so fit_otr_bias() reuses them.
-        df_otr, ori, ter = apply_otr_correction(fit_otr_bias(df_gc, str(out)), str(out))
+        df_otr, ori, ter = apply_otr_correction(
+            fit_otr_bias(df_gc, str(out)), str(out),
+            relative_copy_number=relative_cn[seq_id],
+        )
         frames[seq_id] = {"gc": df_gc, "otr": df_otr, "cnv": run_HMM(df_otr, str(out))}
 
     return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
@@ -544,6 +552,21 @@ class TestOriginTerminus:
             assert after > before, f"expected tightening, got {before:.1%} -> {after:.1%}"
             assert after > 0.85
 
+    def test_results_json_is_strict_json(self, seq):
+        """No bare NaN or Infinity -- breseq's parser is strict and rejects the file.
+
+        breseq reads this with nlohmann/json, which has no allow_nan, so ONE
+        non-finite value makes the whole file unparseable: it warns and reports no
+        ori-ter bias. That was true of every "Not detected" file CNery wrote, because
+        the origin/terminus coverages are NaN there. json.dump emits bare NaN by
+        default, so this guards the fix.
+        """
+        def reject(token):
+            raise AssertionError(f"non-finite {token!r} in the results JSON")
+
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            json.loads(fh.read(), parse_constant=reject)
+
     def test_otr_json_matches_golden(self, seq, regenerate_goldens):
         from conftest import golden_compare
 
@@ -555,6 +578,10 @@ class TestOriginTerminus:
             assert got["Origin-to-Termius/Bias Ratio"] == want["Origin-to-Termius/Bias Ratio"]
             assert got["Origin window"] == want["Origin window"]
             assert got["Terminus window"] == want["Terminus window"]
+            # A float, so compared with tolerance -- LOWESS and scipy.optimize drift
+            # across library versions.
+            assert got["Relative copy number"] == pytest.approx(
+                want["Relative copy number"], rel=1e-6)
 
         golden_compare(
             _produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json"),
@@ -585,24 +612,28 @@ class TestCopyNumber:
         assert calls.mode().iloc[0] == seq["seq"].expected_cn
         assert (calls == seq["seq"].expected_cn).mean() > 0.8
 
-    def test_pooled_median_preserves_relative_depth(self, seq):
-        """A plasmid's depth relative to the chromosome must survive normalisation.
+    def test_relative_copy_number_is_reported(self, seq):
+        """Every sequence publishes its copies relative to the longest one.
 
-        process_multi_genome pools every sequence and divides by ONE global median,
-        so CWBI's plasmids come through at 2.82x and 1.88x the chromosome rather than
-        being flattened to 1.0 each. Per-sequence normalisation would destroy that,
-        and nothing else in the suite would notice.
-
-        Note what this does NOT assert, because it is not what CNery does:
-        `prob_copy_number` for those plasmids is 1, not 3 and 2. run_HMM refits the
-        single-copy level from whichever sequence it is handed -- fitted mu is 100.9,
-        300.0 and 194.6 for the three -- so a plasmid sitting wholly above the
-        chromosome reads as 1x its OWN baseline. The relative depth is preserved in
-        norm_raw_cov and then discarded by the caller. That is the documented
-        per-reference design, but it does mean plasmid copy number is not reported.
+        This is the number run_HMM cannot give: it refits the single-copy level from
+        whichever sequence it is handed -- fitted mu 100.9, 300.0 and 194.6 for CWBI's
+        three -- so a plasmid sitting wholly above the chromosome is called copy number
+        1. The multiple is computed by the pooled normalisation and would otherwise be
+        discarded. Deliberately non-integral: 2.95 is a measurement.
         """
-        got = float(seq["cnv"]["norm_raw_cov"].median())
-        assert got == pytest.approx(seq["seq"].relative_depth, rel=0.05)
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            got = json.load(fh)["Relative copy number"]
+        assert isinstance(got, float)
+        assert got == pytest.approx(seq["seq"].relative_cn, rel=0.02)
+
+    def test_longest_sequence_is_the_anchor(self, seq):
+        """The longest sequence reads exactly 1.0, so the value is 'copies relative to
+        the chromosome' rather than 'relative to a pooled median it happens to dominate'."""
+        longest = max(seq["spec"].sequences, key=lambda q: q.length)
+        if seq["seq_id"] != longest.seq_id:
+            pytest.skip("not the longest sequence in this dataset")
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            assert json.load(fh)["Relative copy number"] == pytest.approx(1.0)
 
     def test_no_segment_starts_on_a_repeat_window(self, seq):
         """Repeat windows are censored from the observation sequence, so no segment

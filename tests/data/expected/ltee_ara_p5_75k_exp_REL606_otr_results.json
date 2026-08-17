@@ -4,5 +4,6 @@
     "Terminus window": 1558001,
     "Terminus coverage (normalized)": 0.678164152790478,
     "Origin-to-Termius/Bias Ratio": 2.048481442746239,
+    "Relative copy number": 1.0,
     "Correction type": "Ori-ter coordinates fit by coverage"
 }
