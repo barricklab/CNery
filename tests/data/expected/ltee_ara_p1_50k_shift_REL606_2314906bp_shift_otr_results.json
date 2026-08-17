@@ -5,5 +5,14 @@
     "Terminus coverage (normalized)": 0.8620853356644822,
     "Origin-to-Termius/Bias Ratio": 1.3448664054390522,
     "Relative copy number": 1.0,
-    "Correction type": "Ori-ter coordinates fit by coverage"
+    "Correction type": "Ori-ter coordinates fit by coverage",
+    "Coverage fit r-squared": 0.4262,
+    "Coverage fit p-value": 0.001,
+    "GC skew fit r-squared": 0.3431,
+    "GC skew fit p-value": 0.001,
+    "GC skew prediction confident": true,
+    "Coverage vs skew likelihood ratio": 541.38,
+    "Coverage vs skew likelihood-ratio p-value": 0.004,
+    "Bootstrap surrogates": 1000,
+    "Breakpoint source": "coverage fit"
 }

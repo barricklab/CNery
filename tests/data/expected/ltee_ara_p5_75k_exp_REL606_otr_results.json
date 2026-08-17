@@ -1,9 +1,18 @@
 {
-    "Origin window": 3803501,
-    "Origin coverage (normalized)": 1.3912551635697654,
-    "Terminus window": 1558001,
-    "Terminus coverage (normalized)": 0.678164152790478,
-    "Origin-to-Termius/Bias Ratio": 2.048481442746239,
+    "Origin window": 3885501,
+    "Origin coverage (normalized)": 1.3909908920362537,
+    "Terminus window": 1526001,
+    "Terminus coverage (normalized)": 0.6785291977185511,
+    "Origin-to-Termius/Bias Ratio": 2.0469920890910376,
     "Relative copy number": 1.0,
-    "Correction type": "Ori-ter coordinates fit by coverage"
+    "Correction type": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)",
+    "Coverage fit r-squared": 0.4659,
+    "Coverage fit p-value": 0.001,
+    "GC skew fit r-squared": 0.4643,
+    "GC skew fit p-value": 0.001,
+    "GC skew prediction confident": true,
+    "Coverage vs skew likelihood ratio": 12.06,
+    "Coverage vs skew likelihood-ratio p-value": 0.8032,
+    "Bootstrap surrogates": 1000,
+    "Breakpoint source": "GC skew"
 }

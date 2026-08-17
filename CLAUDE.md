@@ -31,9 +31,9 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 221; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 137, offline, ~14s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 84, real coverage tables
+conda run -p $PWD/env pytest                    # all 560; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 263, offline, ~35s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 297, real coverage tables
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
@@ -309,12 +309,83 @@ are rejected before `get_CNV.main` creates any output directory.
   deliberate.
 - The bootstrap is seeded (`seed=0`) so a given input always gives the same p and the goldens stay
   stable. It costs ~0.15 s on a 4.6 Mb genome against ~4 s for `preprocess`, so roughly 3%.
-- The GC-skew ori/ter is **computed and reported but deliberately not consumed** — OTR correction
-  and the HMM still use `otr_fit`'s coverage-derived estimate. The two disagree about which
-  sequences even have a usable origin, and that is the expected reading rather than a bug: `otr_fit`
-  needs an active replication gradient in the *coverage*, so it fires on exponential-phase
-  `ltee_ara_p5_75k_exp` and not on the stationary-phase Ara-3 samples, while the skew estimate
-  returns the same ~49%-separated pair for every REL606 sample regardless.
+
+### Deciding whether the OTR tent is real, and whose breakpoints to use
+
+- **Everything here rests on one identity.** `_otr_design_matrix`'s rows sum to exactly 1, so for
+  fixed breakpoints the tent's column span is `span{1, u}` for a single phase vector `u` (0 at the
+  origin, 1 at the terminus, back to 0). Hence `1 - RSS/SST == r²(u, y)` — a dot product, not a
+  least-squares solve, which is what makes scoring a whole breakpoint grid across 1000 surrogates
+  affordable. It is the *same* objective the Nelder–Mead search minimizes, not an approximation.
+  Do not "simplify" `_otr_grid_scores` back into a loop over `minimize`.
+- The old gate was **separation plus a vacuous `bias_threshold`**: the label swap guarantees
+  `y_ori >= y_ter`, so `ratio > 1.0` reduced to `y_ter > 0` and nothing ever tested the tent against
+  a null. It is now separation **and** a circular block bootstrap at p ≤ 0.01, on a series decimated
+  to ≤ `OTR_SCORE_CELLS` cells so cost is independent of genome size and of `-w`/`-s`.
+- **Block length here governs validity, not just power** — the opposite of the GC-skew gate, where
+  `test_verdict_is_insensitive_to_block_length` pins insensitivity as a virtue. Measured
+  false-positive rate at a nominal 1%: 0.00 at block ≈ 5τ, but 0.10–0.33 at block ≈ τ. Hence the
+  floor at `5 * tau` alongside the block-count target. **τ must be measured on the residual of the
+  best tent**, never the raw series: the ramp is itself long-range structure, and measuring it raw
+  pushed `p5_75k_exp` from p = 0.001 to 0.034 — the test destroying its own detection.
+- **One bootstrap function covers both arms, and the shape of `phases` is the whole difference.**
+  `R > 1` is the free fit, whose breakpoints were data-chosen, so the null re-runs that selection on
+  every surrogate. `R == 1` is the GC-skew fit, whose breakpoints came from `ref_base` — the coverage
+  resampling never touches it, so no selection occurred and taking a max would be a *conservative
+  error*, not a safe default. That is why the skew arm is the more powerful of the two: on CWBI's
+  chromosome it scores a smaller statistic (0.0152 vs 0.0255) and returns a smaller p (0.213 vs 0.278).
+- **An orientation contradiction rejects the skew candidate; it never relabels it.** `otr_fit` swaps
+  its own breakpoints when they come back inverted, which is legitimate because they are unlabelled
+  and the antipodal seeds are blind. The skew's labels *are* the imported prior. Measured, 1 of 8
+  sequences contradicts (`ltee_ara_m3_32k_2rg`, ratio 0.907) and its skew tent explains r² = 0.007,
+  so what is rejected there is the sign of noise — on flat synthetic coverage the sign is a coin
+  flip (49.3% over 300 trials).
+- **When both arms are live, a bootstrap likelihood ratio decides.** The models are nested — both fit
+  the anchors by OLS, the skew model additionally fixes the two breakpoint positions — so
+  `Λ = m·ln(RSS_skew/RSS_free)` with 2 degrees of freedom. `RSS_free` is the minimum over the *same
+  band-restricted grid*, never a fresh Nelder–Mead fit: fed the unrestricted optimum, adp1's
+  degenerate 1.1%-separation spike (r² 0.1175 against a band-restricted 0.0524) wins at p = 0.001
+  instead of losing at 0.181. Run the LRT only *after* both arms have been gated, never in place of
+  the gates.
+- **Λ's null is not χ²(2), and the reason is autocorrelation alone.** With *iid* residuals the null
+  of Λ is χ²(2) to Monte-Carlo error on all eight sequences (q99 8.3–9.3 against 9.21), and stays so
+  even with the separation band removed — neighbouring tents are near-collinear, so the max over
+  change-point breakpoints costs essentially nothing. What breaks it is that real residuals stay
+  spatially autocorrelated, inflating Λ's 99th percentile by 2.8×–128× (24×–51× on the *E. coli*
+  chromosomes). χ²(2) would report p < 0.001 for **every** sequence, including `p5_75k_exp` where the
+  two tents agree to 1.8% of the genome and the skew lands on REL606's *oriC* — bootstrap p is 0.80.
+  `test_chi_square_would_reject_where_the_bootstrap_does_not` pins this.
+- **The LRT resamples residuals; the detection gate resamples the raw series.** They disagree on
+  purpose. A bootstrap for a composite null must simulate *from* the null model, and the LRT's null
+  ("the skew tent is the truth") is fully specified. The detection gate's null has no fitted signal
+  to hold fixed, so residual resampling there would bake the alternative into it.
+- `OTR_LR_ALPHA = 0.05`, deliberately **not** the 0.01 the two detection gates share: those decide
+  whether to correct at all, this only picks which of two credible ramps supplies the breakpoints.
+  At 0.01 the synthetic true-null rejection rate is 0/30 and power halves (33% vs 70% at a
+  5%-of-genome displacement). On the corpus every verdict is identical for any α in 0.01–0.10.
+- **`OTR_SKEW_MAX_P = None` means the skew arm needs no coverage evidence of its own**, and the cost
+  is explicit: on `ltee_ara_m3_38k` and `adp1_mgd06_lb` the applied ramps (1.069, 1.067) sit inside
+  the flat-noise band and their own fixed-breakpoint p-values are 0.243 and 0.615. Those corrections
+  are applied because the reference says an origin is there and the coverage does not contradict it.
+  What bounds the damage is that the skew supplies only *where* — the amplitude is still solved by
+  OLS against the observed coverage, so a flat sample yields a flat tent (300 synthetic flat series:
+  ratio median 0.999, 95th pct 1.051, max 1.089). Setting it to 0.01 instead would rescue **zero**
+  sequences; the fixed-breakpoint p-values run 0.001, 0.001, 0.213, 0.243, 0.328, 0.343, 0.615, 0.841
+  with a clean gap, so nothing between 0.01 and 0.2 behaves differently.
+- **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,
+  not at a point, so a symmetric V must choose between matching the descent and matching the trough.
+  On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the coverage fit puts its
+  terminus 221 kb early and the skew 270 kb late — the truth is between them. The LRT still picks the
+  coverage fit there (p = 0.004), and 87% of that fit's advantage comes from *outside* the disputed
+  stretch: the tent is a global two-line fit, so moving the terminus by 10.6% of the genome re-slopes
+  both limbs everywhere. Note the skew is nonetheless the better *landmark* estimate on that sample
+  (terminus 1.526 Mb against *dif* at ~1.55 Mb; the coverage fit is ~490 kb off). `otr_fit` optimises
+  the coverage trend, not the annotation, and the skew's landmarks stay published in `GC_skew/`.
+- The GC-skew coordinates are now consumed, so **`predict_ori_ter_from_skew` must run before
+  `fit_otr_bias`** — it does in `get_CNV.main` and in `tests/test_authentic.py::_run_pipeline`.
+  Computing it afterwards silently reverts to the coverage-only arm. `otr_fit` also refuses a
+  prediction whose `"Windows"` disagrees with the frame, because the skew's indices are positional
+  and `otr_fit` works in `df.index`; those agree only because `process_multi_genome` resets the index.
 
 ## Testing conventions
 
@@ -369,12 +440,19 @@ spread is real regression coverage for the prefix-based footer stripping that re
 
 Three of them carry the load for a specific area:
 
-- `ltee_ara_p5_75k_exp` — **the only sample where OTR correction fires strongly**, an
-  exponential-phase culture whose replication gradient is real (1.95x peak to trough, origin
-  ~3.80 Mb and terminus ~1.56 Mb, matching REL606's known ones). It is the regression test for the
-  ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging the two breakpoints, so
-  a mirrored fit divides by an inverted ramp and *spreads* coverage out —
+- `ltee_ara_p5_75k_exp` — **the only sample whose coverage carries a strong replication gradient**,
+  an exponential-phase culture where it is real (1.95x peak to trough, terminus ~1.53 Mb, matching
+  REL606's known ones). Since the GC-skew arm landed, four of the six chromosomes correct, but this
+  is the only one where the *coverage fit* clears significance on its own strength — and even here
+  the likelihood ratio cannot separate the two estimates (p = 0.80) and defers to the skew, whose
+  origin lands on REL606's *oriC* at ~3.886 Mb where the coverage fit was 82 kb short. It is also the
+  regression test for the ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging
+  the two breakpoints, so a mirrored fit divides by an inverted ramp and *spreads* coverage out —
   `TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
+- `ltee_ara_p1_50k_shift` — **the only sequence where the coverage fit beats the GC skew**
+  (likelihood ratio p = 0.004), and so the only live exercise of the arbitration's other branch.
+  Also the case that shows the tent model's limit: neither estimate sits at the observed coverage
+  trough. See the terminus-region bullet above.
 - `cwbi_ssym_ht04` — **the only multi-sequence dataset and the only CSV one**. A chromosome plus
   two plasmids, so it is the only cover for `process_multi_genome`'s pooled GC fit and its shared
   global median. Note what it shows: the pooled median keeps the plasmids above the chromosome, but
@@ -382,7 +460,12 @@ Three of them carry the load for a specific area:
   100.9 / 300.0 / 194.6), so **`prob_copy_number` is 1 for both plasmids** — that follows from "CN
   calling is per-reference". The multiple is not lost, though: it is published as
   **`"Relative copy number"`** in each sequence's `_otr_results.json`, at 2.953 and 1.898 against a
-  chromosome pinned to exactly 1.0.
+  chromosome pinned to exactly 1.0. Its chromosome is also the case that motivated the significance
+  gate: the coverage fit there is a marginal 1.217 that fails at p = 0.28 and used to be applied
+  anyway, moving windows within 20% of single-copy from 91.8% to 91.5%. It is now corrected on the
+  skew's coordinates instead, at ratio 1.169, and finally helps (91.8% → 92.5%). Both plasmids are
+  the negative control for the skew arm — neither clears the skew's own gate, which is the expected
+  answer for a replicon with no bidirectional origin.
 - `adp1_mgd06_lb` — the first non-REL606 genome, which is why sequence length and window count are
   per-`Sequence` rather than the module constants they used to be.
 

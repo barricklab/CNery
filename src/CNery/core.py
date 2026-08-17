@@ -926,6 +926,432 @@ def _otr_concentrated_rss(breakpoints, x, y, genome_len):
     return rss, beta[0], beta[1]
 
 
+# ---------------------------------------------------------------------------
+# Deciding whether the OTR tent is REAL, and whose breakpoints to believe.
+#
+# Everything below rests on one identity. _otr_design_matrix()'s rows sum to
+# exactly 1 -- on arc A they are (1 - t_a, t_a), on arc B (t_b, 1 - t_b) -- so
+# for fixed breakpoints the tent's column span equals span{1, u}, where
+# u = M[:, 1] is the "phase" running 0 at the origin, 1 at the terminus, and
+# back to 0. Fitting the anchor values is therefore ordinary least squares on a
+# single regressor, and
+#
+#     1 - _otr_concentrated_rss(bp, x, y, L)[0] / SST  ==  r-squared(u, y)
+#
+# which is a dot product rather than a least-squares solve. That collapses "one
+# lstsq per candidate breakpoint pair" into a single matrix multiply over the
+# whole grid AND the whole surrogate batch at once, and -- the part that
+# matters for correctness rather than speed -- it is the SAME objective the
+# Nelder-Mead search in otr_fit() minimises, not an approximation of it.
+#
+# Do not "simplify" _otr_grid_scores() back into a loop over minimize(): the
+# bootstraps below evaluate the grid on every one of 1000 surrogates, which is
+# affordable only in this closed form.
+# ---------------------------------------------------------------------------
+
+#: Circular block bootstrap size. Deliberately the same 1000 as
+#: DEFAULT_SKEW_SURROGATES (defined further down, with the GC-skew gate) so every
+#: p-value CNery reports floors at the same 1/(B+1) and means the same thing.
+#: Measured cost at this size is ~0.12 s per sequence for the detection gate and
+#: ~0.2 s for the likelihood-ratio test, against ~4.4-6.8 s for preprocess().
+DEFAULT_OTR_SURROGATES = 1000
+
+#: A tent is only corrected for if it beats this. Same level as the GC-skew
+#: gate: both are DETECTION gates, deciding whether to apply a correction at all.
+OTR_MAX_P = 0.01
+
+#: Origin and terminus must be roughly antipodal, consistent with bidirectional
+#: replication. predict_ori_ter_from_skew() defaults to this same band, so the
+#: two estimates are gated on one decision rather than two copies of it.
+OTR_SEP_LO, OTR_SEP_HI = 0.35, 0.65
+
+#: The coverage series is decimated to at most this many uniform circular cells
+#: before scoring, which caps the bootstrap cost independently of genome size
+#: and of -w/-s. A 46,298-window frame and a 9,258-window one both land here.
+OTR_SCORE_CELLS = 4000
+
+#: Breakpoint search grid. Measured on ltee_ara_p5_75k_exp (m = 3086), the best
+#: r-squared is 0.46391 at 32, 64 and 128 origins and 0.46392 at 256 -- the
+#: surface is saturated well below this, and 64 keeps a 2x margin. The
+#: likelihood-ratio verdicts are likewise unchanged from a 4x finer grid to a
+#: 4x coarser one, which is what licenses a grid this cheap.
+OTR_GRID_ORIGINS = 64
+OTR_GRID_SEPARATIONS = 13
+
+#: Block bootstrap shape. Coverage autocorrelation is far longer than GC skew's,
+#: and unlike the skew gate the block length here governs VALIDITY, not just
+#: power. Measured false-positive rate at a nominal 1% on AR(1) nulls: at
+#: block ~= 5*tau it is 0.00, at block ~= 2.6*tau it is 0.03-0.08, and at
+#: block ~= tau it is 0.10-0.33. Hence the floor at 5*tau as well as the
+#: target block count.
+OTR_TARGET_BLOCKS = 20
+OTR_BLOCK_AUTOCORR_MULTIPLE = 5
+OTR_MIN_BLOCKS = 8
+OTR_MIN_BLOCK = 10
+
+#: Below this many cells there is nothing to resample; the bootstrap declines
+#: (p = 1.0, 0 surrogates) rather than inventing a null, as _skew_bootstrap_p()
+#: does under 8 windows.
+OTR_MIN_CELLS = 32
+
+#: Coverage evidence required at the GC-skew breakpoints before its coordinates
+#: may be used. None means "none": the skew's own bootstrap is the gate, and the
+#: coverage only has to not contradict the orientation.
+#:
+#: The alternative is one constant wide and worth seeing. At 0.01 the skew arm
+#: fires only on ltee_ara_p5_75k_exp, and there only to refine coordinates that
+#: were already being corrected -- ZERO sequences are rescued from "not
+#: detected". The fixed-breakpoint p-values across the eight authentic sequences
+#: are 0.001, 0.001, 0.213, 0.243, 0.328, 0.343, 0.615 and 0.841, a clean gap,
+#: so no threshold between 0.01 and 0.2 behaves any differently.
+#:
+#: The cost of None is explicit: on ltee_ara_m3_38k and adp1_mgd06_lb the ramp
+#: that gets applied (ratio 1.069 and 1.067) is indistinguishable from noise by
+#: the coverage's own evidence. It is applied because the reference sequence
+#: says an origin is there and the coverage does not contradict it. What bounds
+#: the damage is that the skew supplies only WHERE -- the amplitude is still
+#: solved from the coverage, so a flat sample yields a flat tent. Measured over
+#: 300 synthetic flat series: injected ratio median 0.999, 95th percentile
+#: 1.051, maximum 1.089.
+OTR_SKEW_MAX_P = None
+
+#: Significance level for the coverage-vs-skew likelihood-ratio test. NOT the
+#: 0.01 the two detection gates share, and deliberately so: those decide whether
+#: to correct at all, while this one only chooses which of two already-credible
+#: ramps supplies the breakpoints.
+#:
+#: Measured on a synthetic tent with AR(1) residuals (tau = 20): the rejection
+#: rate under a true null is 7% at 0.05 and 0% at 0.01, and power at a
+#: 5%-of-genome breakpoint displacement is 70% against 33%. At 0.01 the test is
+#: conservative in the direction that favours the fallback, which is not the
+#: safe direction here.
+#:
+#: On the eight authentic sequences every verdict is identical for any alpha in
+#: 0.01..0.10, so this number currently decides nothing.
+OTR_LR_ALPHA = 0.05
+
+
+def _otr_decimate(y, keep, cells=OTR_SCORE_CELLS):
+    """Coverage on a uniform circular grid of cells, over UNCENSORED windows only.
+
+    Each cell takes the mean of the unmasked windows falling in it. Cells with no
+    unmasked window at all -- only reachable inside a deletion longer than one
+    cell -- are filled by circular linear interpolation from their neighbours.
+
+    Deliberately NOT `y[keep]` compacted into a contiguous circle. That would
+    shorten a 20 kb deletion to zero width and bend the tent through the gap;
+    decimating on position keeps every arc length proportional to genomic
+    coordinate. It also makes the bootstrap cost independent of genome size and
+    of the window/step settings, which is what keeps the gate affordable.
+    """
+    y = np.asarray(y, dtype=float)
+    keep = np.asarray(keep, dtype=bool)
+    n = y.size
+    m = int(min(int(cells), n))
+    if m < 1:
+        return np.zeros(0, dtype=float)
+
+    cell = (np.arange(n) * m) // n
+    good = keep & np.isfinite(y)
+    if not good.any():
+        return np.zeros(m, dtype=float)
+
+    total = np.bincount(cell[good], weights=y[good], minlength=m)
+    count = np.bincount(cell[good], minlength=m)
+    out = np.full(m, np.nan, dtype=float)
+    filled = count > 0
+    out[filled] = total[filled] / count[filled]
+
+    if not filled.all():
+        xp = np.flatnonzero(filled)
+        out = np.interp(np.arange(m, dtype=float), xp.astype(float), out[xp], period=float(m))
+    return out
+
+
+def _otr_phase(m, x_ori, x_ter):
+    """The tent's single regressor: 0 at the origin, 1 at the terminus, back to 0.
+
+    Column 1 of _otr_design_matrix() evaluated on the decimated grid. Taken from
+    that function rather than re-derived, so the geometry has exactly one
+    definition and the modulo/wraparound handling cannot drift.
+    """
+    return _otr_design_matrix(np.arange(m, dtype=float), float(x_ori), float(x_ter), float(m))[:, 1]
+
+
+def _otr_normalize_phases(rows):
+    """Mean-centre and unit-normalise each phase row, so scoring is one matmul.
+
+    With a centred, unit-norm u the squared correlation is just (u . y_c)^2 over
+    the total sum of squares -- no per-candidate division, no lstsq.
+    """
+    P = np.atleast_2d(np.asarray(rows, dtype=float))
+    P = P - P.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(P, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return P / norms
+
+
+def _otr_phase_grid(m, sep_lo=OTR_SEP_LO, sep_hi=OTR_SEP_HI,
+                    n_origins=OTR_GRID_ORIGINS, n_seps=OTR_GRID_SEPARATIONS):
+    """(R, m) normalised phase rows over the band-restricted breakpoint grid.
+
+    Restricting the grid to the same 35-65% separation band the gate uses is not
+    an optimisation: the observed statistic is only ever acted on if it falls in
+    the band, so the null must be the maximum over the band too, or observed and
+    surrogate are drawn from different spaces. It turns OTR_SEP_LO/HI from an
+    arbitrary threshold into the definition of the search space.
+
+    Returns (phases, breakpoints) with breakpoints[i] == (x_ori, x_ter).
+    """
+    origins = np.linspace(0.0, float(m), int(n_origins), endpoint=False)
+    seps = np.linspace(float(sep_lo), float(sep_hi), int(n_seps))
+    rows, bps = [], []
+    for xo in origins:
+        for frac in seps:
+            xt = (xo + frac * m) % m
+            rows.append(_otr_phase(m, xo, xt))
+            bps.append((float(xo), float(xt)))
+    return _otr_normalize_phases(rows), bps
+
+
+def _otr_grid_scores(Y, phases):
+    """Best tent r-squared for each column of `Y`, over every row of `phases`.
+
+    `Y` is (m,) or (m, B); the return is (B,). This one function scores the
+    OBSERVED series and every surrogate -- the observed call is simply B == 1 --
+    so "observed and null were scored the same way" is a property of there being
+    one code path, not a convention someone has to maintain.
+    """
+    Y = np.asarray(Y, dtype=float)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    Yc = Y - Y.mean(axis=0, keepdims=True)
+    sst = np.einsum("ij,ij->j", Yc, Yc)
+    C = np.asarray(phases, dtype=float) @ Yc
+    best = np.max(C * C, axis=0)
+    out = np.zeros_like(sst)
+    nz = sst > 0
+    out[nz] = best[nz] / sst[nz]
+    return out
+
+
+def _otr_autocorr_length(residual, max_lag=400):
+    """First lag at which the autocorrelation drops below 1/e, at least 1.
+
+    MUST be given the residual of the best-fitting tent, never the raw series.
+    The ramp is itself long-range structure, so measuring on raw coverage lets
+    the alternative hypothesis inflate the estimate -- on ltee_ara_p5_75k_exp
+    tau reads 297 cells raw against 15 on the residual, which forces the block
+    count down to 8 and pushes the p-value from 0.001 to 0.034. That is the test
+    destroying its own detection.
+    """
+    r = np.asarray(residual, dtype=float)
+    r = r - r.mean()
+    n = r.size
+    denom = float(r @ r)
+    if n < 4 or denom <= 0:
+        return 1
+    thresh = 1.0 / np.e
+    for lag in range(1, int(min(max_lag, n // 2)) + 1):
+        if float(r[lag:] @ r[:-lag]) / denom < thresh:
+            return lag
+    return int(min(max_lag, max(1, n // 2)))
+
+
+def _otr_block_length(m, tau, block=None):
+    """Block length in cells: enough blocks to shuffle, long enough to stay valid.
+
+    Two constraints, and unlike the GC-skew gate the second one is about
+    VALIDITY. Blocks shorter than a few multiples of the autocorrelation length
+    leak the long-range structure into the surrogates and the test stops holding
+    its nominal size -- measured at 10-33% false positives when block ~= tau
+    against 0% at 5*tau. So the length is the LARGER of "aim for
+    OTR_TARGET_BLOCKS blocks" and "at least 5 tau", then bounded so at least
+    OTR_MIN_BLOCKS blocks survive.
+    """
+    if block is None:
+        block = max(m // OTR_TARGET_BLOCKS, OTR_BLOCK_AUTOCORR_MULTIPLE * int(tau))
+    upper = max(1, m // OTR_MIN_BLOCKS)
+    return int(np.clip(int(block), min(OTR_MIN_BLOCK, upper), upper))
+
+
+def _otr_block_indices(rng, m, block, size):
+    """(size, m) circular block-bootstrap index matrix."""
+    n_blocks = int(np.ceil(m / block))
+    offsets = np.arange(block)
+    starts = rng.integers(0, m, size=(size, n_blocks))
+    idx = starts[:, :, None] + offsets[None, None, :]
+    return idx.reshape(size, n_blocks * block)[:, :m] % m
+
+
+def _otr_bootstrap_p(series, phases, observed, block,
+                     n_surrogates=DEFAULT_OTR_SURROGATES, seed=0):
+    """Circular block bootstrap p-value for a tent r-squared. Covers BOTH arms.
+
+    The null is "a sequence with this much local coverage autocorrelation but no
+    genome-scale origin-to-terminus ramp": resampling whole blocks preserves the
+    short-range structure, reshuffling their order destroys the long-range one.
+    The RAW series is resampled, not residuals -- there is no fitted signal to
+    hold fixed under a no-ramp null, and residual resampling would bake the
+    alternative into it. (The likelihood-ratio test in _otr_lr_bootstrap_p()
+    resamples residuals precisely because ITS null is a fitted model. The two
+    disagree on purpose.)
+
+    `phases` is (R, m) and its shape is the whole difference between the arms:
+
+      R > 1  -- the free coverage fit. Its breakpoints were chosen by looking at
+                the coverage, so the null must re-run that selection on every
+                surrogate, exactly as _skew_score() re-runs the extrema search.
+      R == 1 -- the GC-skew fit. Its breakpoints came from `ref_base`, which the
+                coverage resampling never touches, so no selection has occurred
+                and max-over-one-row IS the fixed statistic. Taking a maximum
+                here would be a conservative error, not a safe default. This is
+                why the skew arm is the more powerful of the two: on CWBI's
+                chromosome it scores a SMALLER statistic (0.0152 against 0.0255)
+                and returns a SMALLER p-value (0.213 against 0.278).
+
+    Nothing in the body branches on R.
+
+    Returns (p, surrogates_used). p is (#{surrogate >= observed} + 1) / (B + 1),
+    so it is floored at 1/(B+1) and is an upper bound, not a measurement.
+    """
+    series = np.asarray(series, dtype=float)
+    m = series.size
+    if m < OTR_MIN_CELLS:
+        return 1.0, 0
+
+    rng = np.random.default_rng(seed)
+    at_least = 0
+    done = 0
+    chunk = max(1, min(250, n_surrogates))
+    while done < n_surrogates:
+        size = min(chunk, n_surrogates - done)
+        idx = _otr_block_indices(rng, m, block, size)
+        scores = _otr_grid_scores(series[idx].T, phases)
+        at_least += int(np.count_nonzero(scores >= observed))
+        done += size
+
+    return (at_least + 1) / (n_surrogates + 1), int(n_surrogates)
+
+
+def _otr_tent_fit(series, phase_row):
+    """(fitted, residual, r_squared) for one normalised phase row.
+
+    With a centred, unit-norm regressor the OLS fit is just the projection, so
+    this needs no lstsq and stays consistent with _otr_grid_scores() by
+    construction.
+    """
+    y = np.asarray(series, dtype=float)
+    u = np.asarray(phase_row, dtype=float)
+    yc = y - y.mean()
+    c = float(u @ yc)
+    fitted = y.mean() + c * u
+    sst = float(yc @ yc)
+    return fitted, y - fitted, (c * c / sst if sst > 0 else 0.0)
+
+
+def _otr_lr_statistic(series, skew_phase, phases):
+    """Lambda = m * ln(RSS_skew / RSS_free), plus the two r-squareds.
+
+    The two OTR models are NESTED. Both fit the anchor VALUES by ordinary least
+    squares -- that is what _otr_design_matrix()'s affine structure buys. The
+    GC-skew model additionally FIXES the breakpoint POSITIONS; the free model
+    fits them too. The difference is exactly 2 parameters, which is what makes a
+    likelihood ratio the right instrument here and "r-squared must beat the
+    other by 10%" the wrong one.
+
+    RSS_free is the minimum over the same band-restricted grid the detection
+    statistic maximises over -- NOT a fresh Nelder-Mead fit. Comparing an
+    unrestricted optimum against a band-restricted null is apples to oranges:
+    fed Nelder-Mead's degenerate 78-window-separation spike on adp1_mgd06_lb,
+    the same test returns p = 0.001 instead of 0.181 and hands a no-gradient
+    sequence to the coverage fit.
+
+    Lambda is clamped at 0. Nesting guarantees RSS_free <= RSS_skew
+    mathematically, but grid discretisation does not, because the skew's
+    breakpoints are snapped to the nearest grid cell. Measured, this never binds
+    on real data and binds on 59/1000 surrogates of one sequence whose skew
+    separation falls outside the band -- there the models genuinely are not
+    nested over the search set, and without the clamp Lambda goes negative and
+    biases the verdict toward the free fit.
+    """
+    m = np.asarray(series, dtype=float).size
+    r2_skew = float(_otr_grid_scores(series, np.atleast_2d(skew_phase))[0])
+    r2_free = float(_otr_grid_scores(series, phases)[0])
+    r2_free = max(r2_free, r2_skew)
+    rss_skew, rss_free = 1.0 - r2_skew, 1.0 - r2_free
+    if rss_free <= 0 or rss_skew <= 0:
+        return 0.0, r2_skew, r2_free
+
+    # Snap a negligible difference to exactly zero. When the free grid's optimum
+    # IS the skew's row -- the two agree -- floating-point dust can leave Lambda
+    # at ~1e-13 instead of 0, and that is not harmless: a large share of
+    # surrogates score exactly 0 too, so `surrogate >= observed` flips from true
+    # to false for all of them and the p-value collapses from 1.0 to ~0.4. An
+    # r-squared difference below this is not evidence about anything.
+    if r2_free - r2_skew <= 1e-12:
+        return 0.0, r2_skew, r2_free
+    return max(0.0, m * float(np.log(rss_skew / rss_free))), r2_skew, r2_free
+
+
+def _otr_lr_bootstrap_p(series, skew_phase, phases, observed, block,
+                        n_surrogates=DEFAULT_OTR_SURROGATES, seed=0):
+    """Bootstrap p-value for Lambda under the null "the GC-skew tent is the truth".
+
+    Fit the tent at the skew's breakpoints, hold that fit FIXED, circular-block
+    resample its RESIDUALS, add them back, and recompute Lambda on each
+    surrogate. A bootstrap for a composite null must simulate FROM the null
+    model, and here the null is a fully specified one -- unlike the detection
+    gate's, whose null has no fitted signal to hold fixed. Resampling the raw
+    series here would answer "is there a ramp", which is not what is being
+    arbitrated.
+
+    The resampling is by BLOCKS, and that is the entire reason this function
+    exists rather than a chi-square(2) lookup. Measured on all eight authentic
+    sequences: with IID residuals the null of Lambda IS chi-square(2) to within
+    Monte-Carlo error (median 1.2-1.9 against 1.39, 99th percentile 8.3-9.3
+    against 9.21), and it stays chi-square(2) even with the separation band
+    removed entirely -- neighbouring tents are near-collinear, so the maximum
+    over breakpoints costs essentially nothing despite the breakpoints being
+    change-points. What breaks chi-square(2) is that the residuals remain
+    spatially autocorrelated, which inflates Lambda's 99th percentile by
+    2.8x-128x (24x-51x on the E. coli chromosomes).
+
+    That is not academic. chi-square(2) reports p < 0.001 for every one of the
+    eight sequences, including ltee_ara_p5_75k_exp, where the two tents agree to
+    1.8% of the genome and the GC skew lands on REL606's oriC -- the bootstrap
+    p-value there is 0.82.
+
+    Returns (p, surrogates_used).
+    """
+    series = np.asarray(series, dtype=float)
+    m = series.size
+    if m < OTR_MIN_CELLS:
+        return 1.0, 0
+
+    fitted, residual, _ = _otr_tent_fit(series, skew_phase)
+    if not np.isfinite(residual).all() or float(residual @ residual) <= 0:
+        return 1.0, 0
+
+    rng = np.random.default_rng(seed)
+    at_least = 0
+    done = 0
+    chunk = max(1, min(250, n_surrogates))
+    while done < n_surrogates:
+        size = min(chunk, n_surrogates - done)
+        idx = _otr_block_indices(rng, m, block, size)
+        surro = fitted[:, None] + residual[idx].T
+        r2s = _otr_grid_scores(surro, np.atleast_2d(skew_phase))
+        r2f = np.maximum(_otr_grid_scores(surro, phases), r2s)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lam = m * np.log((1.0 - r2s) / (1.0 - r2f))
+        lam = np.where(np.isfinite(lam), np.maximum(lam, 0.0), 0.0)
+        at_least += int(np.count_nonzero(lam >= observed))
+        done += size
+
+    return (at_least + 1) / (n_surrogates + 1), int(n_surrogates)
+
+
 #Fit the coverage based on the presence and the degree of origin and terminus biased read counts observed
 #
 # Fits the ENTIRE circular coverage profile (positions 1..genome_len) as
@@ -976,7 +1402,115 @@ def _otr_concentrated_rss(breakpoints, x, y, genome_len):
 # recovered within 1-2 window-widths of the true simulated positions, and
 # noticeably more accurately than the previous per-arc approach on
 # realistically noisy Poisson-sampled coverage.
-def otr_fit(df, bias_threshold=1.0, n_seeds=8):
+def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
+                lam=None, p_lr=None, surrogates=0, skew_result=None,
+                source="not corrected"):
+    """The evidence behind the OTR verdict, ready for the results JSON.
+
+    Written whatever the verdict, so a REJECTED fit stays diagnosable from the
+    file -- and so does an accepted one whose coverage evidence is thin, which
+    under OTR_SKEW_MAX_P = None is a real case rather than a hypothetical. Every
+    value is rounded here and passed through _json_safe() on the way out, so a
+    missing statistic emits `null` and never a bare NaN.
+
+    These are additions only. "Origin-to-Termius/Bias Ratio" keeps its name and
+    its typo, and "Origin window"/"Terminus window" stay non-null, because
+    breseq parses this file with nlohmann and adding keys is the only change
+    that is safe there.
+    """
+    def _r(v, nd):
+        return None if v is None or not np.isfinite(v) else round(float(v), nd)
+
+    confident = None
+    if skew_result:
+        confident = bool(skew_result.get("Prediction confident"))
+
+    return {
+        "Coverage fit r-squared": _r(s_free, 4),
+        "Coverage fit p-value": _r(p_free, 5),
+        "GC skew fit r-squared": _r(s_skew, 4),
+        "GC skew fit p-value": _r(p_skew, 5),
+        "GC skew prediction confident": confident,
+        "Coverage vs skew likelihood ratio": _r(lam, 2),
+        "Coverage vs skew likelihood-ratio p-value": _r(p_lr, 5),
+        "Bootstrap surrogates": int(surrogates),
+        "Breakpoint source": source,
+    }
+
+
+def _otr_skew_candidate(skew_result, df, series, phases, m):
+    """The GC-skew coordinates as an OTR candidate, or None.
+
+    Four ways to get None, and they say different things:
+
+      - there is no prediction, or the skew's own bootstrap called it low
+        confidence;
+      - the prediction was made against a different window count, so its indices
+        do not address this frame (see below);
+      - OTR_SKEW_MAX_P is set and the coverage does not support a tent here;
+      - the coverage says the skew's ORIGIN is the low point.
+
+    That last one is a REJECTION, not a relabelling. otr_fit() swaps its own
+    breakpoints when they come out inverted, which is legitimate there because
+    they are unlabelled and the antipodal seeds are blind to which is which.
+    Here the labels ARE the imported prior: swapping them keeps the coordinates
+    and discards the only thing the GC skew contributed. Measured, 1 of the 8
+    authentic sequences contradicts (ltee_ara_m3_32k_2rg, ratio 0.907) and its
+    skew tent explains r-squared 0.007 -- so what is rejected there is the sign
+    of noise. On synthetic flat coverage the sign is a coin flip (49.3% over 300
+    trials), which makes this a 50% filter on no-signal sequences rather than
+    evidence about them.
+
+    Returns a dict with the phase row, breakpoints, anchor values and r-squared.
+    """
+    if not skew_result or not skew_result.get("Prediction confident"):
+        return None
+
+    # The skew's indices are POSITIONAL (np.argmin over cum_gc_skew) while
+    # otr_fit works in df.index. process_multi_genome() resets the index, so the
+    # two agree today -- but the skew arm makes a silently wrong answer possible
+    # where before there was only a reported one, so check rather than trust.
+    # Declining is right: --bias otr on an oddly shaped frame still gets its own
+    # free fit.
+    if int(skew_result.get("Windows", -1)) != len(df):
+        print("OTR: GC-skew prediction is for a different window count; ignoring it")
+        return None
+
+    n = len(df)
+    o_win = int(skew_result["Origin window index"]) % n
+    t_win = int(skew_result["Terminus window index"]) % n
+    o_cell = (o_win * m) / n
+    t_cell = (t_win * m) / n
+
+    phase = _otr_normalize_phases(_otr_phase(m, o_cell, t_cell))
+    fitted, residual, r2 = _otr_tent_fit(series, phase[0])
+
+    # Anchor values at the skew's breakpoints, on the real windows rather than
+    # the decimated ones -- these are what get reported and applied.
+    x = df.index.to_numpy().astype(float)
+    y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
+    keep = np.ones(n, dtype=bool)
+    for column in ("is_deletion", "is_redundant"):
+        if column in df.columns:
+            keep &= ~df[column].to_numpy(dtype=bool)
+    if keep.sum() < 4:
+        keep = np.ones(n, dtype=bool)
+    _, y_ori, y_ter = _otr_concentrated_rss(
+        (float(o_win), float(t_win)), x[keep], y[keep], float(n)
+    )
+
+    if not (np.isfinite(y_ori) and np.isfinite(y_ter)) or y_ter <= 0 or y_ori < y_ter:
+        return None
+
+    return {
+        "phase": phase, "residual": residual, "r2": r2,
+        "o_win": o_win, "t_win": t_win, "y_ori": float(y_ori), "y_ter": float(y_ter),
+    }
+
+
+def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
+            skew_max_p=OTR_SKEW_MAX_P, lr_alpha=OTR_LR_ALPHA,
+            n_surrogates=DEFAULT_OTR_SURROGATES, block=None, seed=0):
 
     x = df.index.to_numpy().astype(float)
     y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
@@ -1024,7 +1558,7 @@ def otr_fit(df, bias_threshold=1.0, n_seeds=8):
         # Not enough clean data to fit anything meaningful.
         y_flat = np.repeat(np.mean(y), n)
         print("OTR bias not detected (insufficient clean windows)")
-        return y, y_flat, o_idx_seed, t_idx_seed, False
+        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail()
 
     # Multi-start: the masked argmax/argmin seed, plus n_seeds evenly
     # spaced positions around the circle, each paired with its antipode.
@@ -1050,7 +1584,7 @@ def otr_fit(df, bias_threshold=1.0, n_seeds=8):
     if best is None:
         y_flat = np.repeat(np.mean(y), n)
         print("OTR bias not detected (no seed converged)")
-        return y, y_flat, o_idx_seed, t_idx_seed, False
+        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail()
 
     _, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt = best
 
@@ -1058,11 +1592,10 @@ def otr_fit(df, bias_threshold=1.0, n_seeds=8):
     # anchor came out higher. _otr_concentrated_rss() is symmetric under
     # swapping the two breakpoints -- the same tent, the same residuals, the
     # same RSS -- and the seeds below are blind antipodal pairs, so which one
-    # is returned as x_ori is arbitrary. magnitude_ok further down reads y_ori
-    # as the PEAK, so without this a perfectly good fit fails the gate on a
-    # coin flip: on the p5_75k_exp dataset it found the right breakpoints
-    # (1.56 Mb and 3.80 Mb, 48.5% apart) and then rejected them because the
-    # ratio came out 0.49 instead of 2.05.
+    # is returned as x_ori is arbitrary, and everything downstream reads y_ori
+    # as the PEAK. Note _otr_skew_candidate() deliberately does NOT do this: its
+    # labels come from the reference sequence, so an inversion there is evidence
+    # against the prediction rather than a bookkeeping detail.
     if y_ori_opt < y_ter_opt:
         x_ori_opt, x_ter_opt = x_ter_opt, x_ori_opt
         y_ori_opt, y_ter_opt = y_ter_opt, y_ori_opt
@@ -1080,25 +1613,95 @@ def otr_fit(df, bias_threshold=1.0, n_seeds=8):
 
     print(f'fitted x_ori:{x_ori_opt:.2f} and x_ter: {x_ter_opt:.2f}')
 
-    # Bias is only corrected if ori/ter are roughly opposite each other on
-    # the circular genome (consistent with bidirectional replication) and
-    # the fitted anchor-value ratio clears bias_threshold. bias_threshold
-    # is left at 1.0 for now (any ori>ter passes); revisit if noise alone
-    # is triggering false-positive corrections.
+    # ---- Is this tent real, and whose breakpoints do we believe? -----------
+    #
+    # There used to be a `magnitude_ok` here comparing the anchor ratio against
+    # a `bias_threshold` of 1.0. It was vacuous: the label swap above guarantees
+    # y_ori >= y_ter, so it reduced to y_ter > 0, and nothing anywhere tested the
+    # tent against a null. A flat, pure-noise genome still produces a best-fit
+    # tent, and if its breakpoints happened to land 35-65% apart the coverage was
+    # divided by noise. Both statistics below are computed unconditionally, even
+    # when the answer is no, so a rejected fit stays diagnosable from the JSON --
+    # the same choice predict_ori_ter_from_skew() makes.
     circular_dist = min(abs(x_ori_opt - x_ter_opt), genome_len - abs(x_ori_opt - x_ter_opt))
-    separation_ok = (0.35 * genome_len <= circular_dist <= 0.65 * genome_len)
-    magnitude_ok = (y_ter_opt > 0) and ((y_ori_opt / y_ter_opt) > bias_threshold)
+    separation_ok = (OTR_SEP_LO * genome_len <= circular_dist <= OTR_SEP_HI * genome_len)
 
-    if not (separation_ok and magnitude_ok):
+    series = _otr_decimate(y, fit_mask)
+    m = series.size
+    phases, _ = _otr_phase_grid(m) if m >= OTR_MIN_CELLS else (np.zeros((1, max(m, 1))), [])
+
+    if m >= OTR_MIN_CELLS:
+        s_free = float(_otr_grid_scores(series, phases)[0])
+        best_row = int(np.argmax(np.abs(phases @ (series - series.mean()))))
+        _, resid_free, _ = _otr_tent_fit(series, phases[best_row])
+        block_free = _otr_block_length(m, _otr_autocorr_length(resid_free), block)
+        p_free, surrogates = _otr_bootstrap_p(
+            series, phases, s_free, block_free, n_surrogates, seed
+        )
+    else:
+        s_free, p_free, surrogates = 0.0, 1.0, 0
+
+    free_live = bool(separation_ok and p_free <= max_p)
+
+    skew = _otr_skew_candidate(skew_result, df, series, phases, m)
+    p_skew, s_skew = None, None
+    if skew is not None:
+        s_skew = skew["r2"]
+        block_skew = _otr_block_length(m, _otr_autocorr_length(skew["residual"]), block)
+        p_skew, _ = _otr_bootstrap_p(
+            series, skew["phase"], s_skew, block_skew, n_surrogates, seed
+        )
+        if skew_max_p is not None and p_skew > skew_max_p:
+            skew = None
+
+    # The likelihood ratio only arbitrates between two candidates that have each
+    # already earned their place. Running it in place of the gates is the failure
+    # mode: fed an out-of-band Nelder-Mead spike against a band-restricted null,
+    # it hands a no-gradient sequence to the coverage fit at p = 0.001.
+    lam, p_lr = None, None
+    if free_live and skew is not None:
+        lam, s_skew, s_free_cmp = _otr_lr_statistic(series, skew["phase"], phases)
+        block_lr = _otr_block_length(m, _otr_autocorr_length(skew["residual"]), block)
+        p_lr, _ = _otr_lr_bootstrap_p(
+            series, skew["phase"][0], phases, lam, block_lr, n_surrogates, seed
+        )
+        use_free = p_lr <= lr_alpha
+    elif free_live:
+        use_free = True
+    elif skew is not None:
+        use_free = False
+    else:
         y_fit = np.repeat(np.mean(y), n)
-        print("OTR bias not detected")
-        return y, y_fit, o_idx, t_idx, False
+        why = "separation %.3f outside band" % (circular_dist / genome_len) if not separation_ok \
+            else "p=%.4f" % p_free
+        print(f"OTR bias not detected ({why}; no usable GC-skew prediction)")
+        return y, y_fit, o_idx, t_idx, False, _otr_detail(
+            s_free=s_free, p_free=p_free, s_skew=s_skew, p_skew=p_skew,
+            surrogates=surrogates, skew_result=skew_result, source="not corrected",
+        )
+
+    if use_free:
+        source = "coverage fit"
+    else:
+        source = "GC skew"
+        x_ori_opt, x_ter_opt = float(skew["o_win"]), float(skew["t_win"])
+        y_ori_opt, y_ter_opt = skew["y_ori"], skew["y_ter"]
+        o_idx, t_idx = skew["o_win"], skew["t_win"]
+        # No separation re-check: predict_ori_ter_from_skew() gates on the same
+        # OTR_SEP_LO..OTR_SEP_HI band, so this candidate is in-band by construction.
+
+    print(f"OTR bias detected, breakpoints from the {source}"
+          + (f" (likelihood ratio p={p_lr:.4f})" if p_lr is not None else ""))
 
     y_fit = otr_predict(x, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt, genome_len)
     y_fit = np.clip(y_fit, otr_floor, None)
     y_corr = y / y_fit
 
-    return y_corr, y_fit, o_idx, t_idx, True
+    return y_corr, y_fit, o_idx, t_idx, True, _otr_detail(
+        s_free=s_free, p_free=p_free, s_skew=s_skew, p_skew=p_skew,
+        lam=lam, p_lr=p_lr, surrogates=surrogates,
+        skew_result=skew_result, source=source,
+    )
 
 
 def find_nearest(array, value):
@@ -1114,16 +1717,21 @@ def find_nearest(array, value):
 # it, then split the former monolithic otr_correction() into a fit stage
 # and an apply stage.
 # ---------------------------------------------------------------------------
-def fit_otr_bias(df, output):
+def fit_otr_bias(df, output, skew_result=None, **otr_kwargs):
     """
     Fit stage: runs the median-filter smoothing (if not already present),
     ensures deletion/redundant masking columns exist (running
     mask_coverage_windows() if they don't -- e.g. when OTR correction is
     run without a prior GC-correction pass), and runs otr_fit().
 
+    `skew_result` is predict_ori_ter_from_skew()'s dict, when the caller has
+    one. It is optional and defaults to None, which reproduces the old
+    coverage-only behaviour exactly -- that is what keeps every existing call
+    site working.
+
     Returns
     -------
-    dict with keys "y_corr", "y_fit", "o_idx", "t_idx", "bias",
+    dict with keys "y_corr", "y_fit", "o_idx", "t_idx", "bias", "detail",
     "df_with_medfil". `y_corr` is otr_fit()'s own corrected-coverage array
     (== unchanged input when bias is not detected, == y/y_fit when it is)
     and must be used as-is by apply_otr_correction() rather than
@@ -1148,7 +1756,9 @@ def fit_otr_bias(df, output):
                 df["gc_corr_norm_cov"], size=win, mode="reflect"
             )
 
-    y_corr, y_fit, o_idx, t_idx, bias = otr_fit(df)
+    y_corr, y_fit, o_idx, t_idx, bias, detail = otr_fit(
+        df, skew_result=skew_result, **otr_kwargs
+    )
 
     return {
         "y_corr": np.asarray(y_corr, dtype=float),
@@ -1156,6 +1766,7 @@ def fit_otr_bias(df, output):
         "o_idx": o_idx,
         "t_idx": t_idx,
         "bias": bias,
+        "detail": detail,
         "df_with_medfil": df,
     }
 
@@ -1273,6 +1884,17 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         yter = np.nan
         OTR = "Not detected"
 
+    detail = otr_fit_result.get("detail") or {}
+
+    # "Correction type" was already the field naming where the coordinates came
+    # from, and GC_SKEW_METHOD is already the matching string -- so the arm that
+    # won is reported by giving this key its other legal value, not by adding a
+    # parallel one. It stays on the coverage string when nothing fired, since
+    # nothing was used and changing it would move goldens for no information.
+    correction_type = "Ori-ter coordinates fit by coverage"
+    if bias and detail.get("Breakpoint source") == "GC skew":
+        correction_type = GC_SKEW_METHOD
+
     results = {
         "Origin window": int(xori),
         "Origin coverage (normalized)": yori,
@@ -1280,8 +1902,9 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         "Terminus coverage (normalized)": yter,
         "Origin-to-Termius/Bias Ratio": OTR,
         "Relative copy number": relative_copy_number,
-        "Correction type": "Ori-ter coordinates fit by coverage",
+        "Correction type": correction_type,
     }
+    results.update(detail)
 
     df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"].copy()
 
@@ -1310,13 +1933,21 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
 # "reaches its global maximum at the E.coli terminus, while the minimum resides
 # over the replication origin".
 #
-# Nothing downstream consumes these values yet -- they are reported in their own
-# JSON and marked on their own plot, and OTR correction and the HMM are
-# unchanged. Worth knowing before wiring them in: the two methods disagree about
-# which sequences even have a usable origin, and that is expected. otr_fit needs
-# an active replication gradient in the COVERAGE, so it fires on exponential-phase
-# samples and not on stationary-phase ones; the skew estimate reads the sequence
-# and returns the same answer either way.
+# otr_fit() CONSUMES these, as its second breakpoint candidate: see
+# _otr_skew_candidate() and the arbitration at the end of otr_fit(). They are
+# still reported in their own JSON and marked on their own plot, and under
+# --bias gc/none nothing reads them.
+#
+# The two methods disagree about which sequences even have a usable origin, and
+# that disagreement is the whole reason this is worth wiring in rather than a
+# problem with it. otr_fit needs an active replication gradient in the COVERAGE,
+# so its own fit clears significance on exponential-phase samples and not on
+# stationary-phase ones; the skew reads the sequence and returns the same answer
+# either way. Where the coverage has nothing, the skew can still say where to
+# look -- and because the ramp's AMPLITUDE is then solved by least squares
+# against the observed coverage, a sample with no gradient gets a near-flat tent
+# rather than an imported one. Measured over 300 synthetic flat series, the
+# largest ratio that produced was 1.089.
 # ---------------------------------------------------------------------------
 GC_SKEW_METHOD = "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
 
@@ -1438,8 +2069,8 @@ def predict_ori_ter_from_skew(
     df,
     win=None,
     step=None,
-    sep_lo=0.35,
-    sep_hi=0.65,
+    sep_lo=OTR_SEP_LO,
+    sep_hi=OTR_SEP_HI,
     max_p=0.01,
     n_surrogates=DEFAULT_SKEW_SURROGATES,
     block=None,

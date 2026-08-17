@@ -52,6 +52,7 @@ import pandas as pd
 import pytest
 
 from CNery.core import (
+    GC_SKEW_METHOD,
     STRAND_SPLIT_COLUMNS,
     TOTAL_ONLY_COLUMNS,
     _detect_delimiter,
@@ -95,6 +96,7 @@ class Sequence:
     expected_cn: int = 1         # modal copy number run_HMM actually calls
     otr_detected: bool = False   # does otr_fit find a replication gradient here?
     otr_tightens: bool = True    # ...and is the gradient strong enough to help?
+    otr_source: str = None       # "coverage fit" or "GC skew" -- WHICH estimate won
     skew_confident: bool = True  # does the cumulative GC skew clear its own gate?
     has_deletions: bool = True  # any window at or below 10% of the median
     has_repeats: bool = True    # any window carrying redundant coverage
@@ -125,13 +127,40 @@ class Spec:
 REL606 = 4_629_812
 
 DATASETS = {
+    # The only sequence where the coverage fit BEATS the GC skew. Both arms are
+    # live and the likelihood ratio picks the coverage (p = 0.004): the two agree
+    # on the origin to ~1% of the genome but put the terminus 10.6% apart, and a
+    # tent hinged at the skew's terminus mis-slopes the whole curve -- 87% of the
+    # coverage fit's advantage comes from OUTSIDE the disputed stretch. Worth
+    # knowing that the skew is nonetheless the better landmark estimate here:
+    # mapped back through the 2,314,906 bp rotation its terminus lands at 1.526 Mb
+    # against REL606's dif at ~1.55 Mb, while the coverage fit's is ~490 kb off.
+    # The observed coverage trough is at neither, sitting between them -- a
+    # single-kink tent cannot represent a terminus REGION.
     "ltee_ara_p1_50k_shift": Spec(
-        (Sequence("REL606_2314906bp_shift", REL606, otr_detected=True),), 0, 4, 9),
+        (Sequence("REL606_2314906bp_shift", REL606, otr_detected=True,
+                  otr_source="coverage fit"),), 0, 4, 9),
+    # Confident skew, but the coverage says the skew's ORIGIN is the low point
+    # (anchor ratio 0.907), so the prediction is rejected rather than relabelled.
     "ltee_ara_m3_32k_2rg": Spec((Sequence("REL606", REL606),), 2, 10, 25),
-    "ltee_ara_m3_38k": Spec((Sequence("REL606", REL606),), 1, 7, 17),
+    # Stationary phase, so there is no replication gradient in the coverage and
+    # the free fit cannot clear its own gate. The skew arm still fires, because
+    # the reference says an origin is there and the coverage does not contradict
+    # it -- and the applied ramp (1.069) is honestly indistinguishable from noise,
+    # with the coverage's own fixed-breakpoint p at 0.243. otr_tightens=False
+    # records what that buys: 85.6% -> 85.3%, a wash. This is the accepted cost of
+    # OTR_SKEW_MAX_P = None, and it is bounded by the amplitude being FITTED from
+    # the coverage rather than imported: a flat sample yields a flat tent.
+    "ltee_ara_m3_38k": Spec(
+        (Sequence("REL606", REL606, otr_detected=True, otr_tightens=False,
+                  otr_source="GC skew"),), 1, 7, 17),
+    # The strong case, and the one that validates the whole arbitration. Both arms
+    # fire and agree to 1.8% of the genome, so the likelihood ratio cannot separate
+    # them (p = 0.82) and defers to the skew -- whose origin lands on REL606's oriC
+    # at ~3.886 Mb, where the coverage fit was 82 kb short.
     "ltee_ara_p5_75k_exp": Spec(
-        (Sequence("REL606", REL606, otr_detected=True),), 0, 4, 4,
-        schema="total_only"),
+        (Sequence("REL606", REL606, otr_detected=True, otr_source="GC skew"),),
+        0, 4, 4, schema="total_only"),
     # The only multi-sequence dataset, and the only CSV one. The plasmids are the
     # reason it is here: process_multi_genome normalises every sequence against ONE
     # pooled median, so a multi-copy plasmid lands at a multiple of the chromosome
@@ -144,11 +173,13 @@ DATASETS = {
     # so n_states comes out 39. Of the 79 chromosome windows above 10x, 76 ARE
     # redundant and correctly censored -- these three are not.
     "cwbi_ssym_ht04": Spec(
-        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_tightens=False),
-         # The chromosome's fitted ratio is a marginal 1.217, and the correction is a
-         # wash: windows within 20% of single-copy go 91.8% -> 91.5%, IQR 0.130 -> 0.136.
-         # Contrast p5_75k_exp at ratio 2.05 (53% -> 95%). Recorded rather than asserted
-         # away -- a weak gradient that neither helps nor harms is the honest reading.
+        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_source="GC skew"),
+         # This one changed twice. The chromosome's COVERAGE fit is a marginal
+         # 1.217 that fails the significance gate outright (p = 0.28), and it used
+         # to be applied anyway -- a wash that moved windows within 20% of
+         # single-copy from 91.8% to 91.5%. The GC-skew arm now supplies the
+         # breakpoints instead, at ratio 1.169, and the correction finally helps
+         # (91.8% -> 92.5%), which is why otr_tightens is no longer False here.
          # Neither plasmid clears the GC-skew gate, which is the expected answer:
          # a plasmid has no bidirectional replication origin, so there is no sign
          # change for the cumulative curve to turn on. Both are rejected by the
@@ -161,8 +192,15 @@ DATASETS = {
          Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False,
                   skew_confident=False)),
         0, 4, 4, schema="total_only", ending="coverage.csv"),
+    # Like m3_38k, corrected on the skew's coordinates rather than the coverage's
+    # -- the free fit's optimum is a degenerate spike 1.1% of the genome wide,
+    # nowhere near the 35-65% band. LB culture, so some fork activity is at least
+    # plausible, and the correction does tighten (94.1% -> 95.0%); but the
+    # coverage's own evidence at those breakpoints is p = 0.615, so read the ramp
+    # (1.067) as sequence-justified rather than coverage-justified.
     "adp1_mgd06_lb": Spec(
-        (Sequence("ADP1-ISx", 3_592_307),), 0, 4, 4, schema="total_only"),
+        (Sequence("ADP1-ISx", 3_592_307, otr_detected=True, otr_source="GC skew"),),
+        0, 4, 4, schema="total_only"),
 }
 
 ALL = list(DATASETS)
@@ -246,17 +284,20 @@ def _run_pipeline(name, path, out):
         # df_gc already carries is_deletion/is_redundant from the
         # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
         # so fit_otr_bias() reuses them.
-        df_otr, ori, ter = apply_otr_correction(
-            fit_otr_bias(df_gc, str(out)), str(out),
-            relative_copy_number=relative_cn[seq_id],
-        )
-
-        # Independent of everything above -- it reads only ref_base -- but run
-        # here so the artifacts land in the same output tree as the rest, and
-        # ahead of nothing, exactly as get_CNV.main() places it.
+        # Ahead of the OTR fit, exactly as get_CNV.main() places it. This
+        # ORDERING IS LOAD-BEARING now: it reads only ref_base, so it is
+        # available whatever the coverage does, and fit_otr_bias() takes it as
+        # the second breakpoint candidate. Computing it afterwards -- as this
+        # harness used to -- silently runs the coverage-only arm and stops
+        # mirroring main().
         skew = predict_ori_ter_from_skew(df_gc, win=WIN, step=STEP)
         write_gc_skew_results(skew, str(out), seq_id)
         plot_gc_skew(df_gc, str(out), skew)
+
+        df_otr, ori, ter = apply_otr_correction(
+            fit_otr_bias(df_gc, str(out), skew_result=skew), str(out),
+            relative_copy_number=relative_cn[seq_id],
+        )
 
         frames[seq_id] = {"gc": df_gc, "otr": df_otr,
                           "cnv": run_HMM(df_otr, str(out)), "skew": skew}
@@ -507,28 +548,39 @@ class TestPipelineShape:
 
 @per_sequence
 class TestOriginTerminus:
-    """Whether OTR correction fires, per sequence, and that it does real work when it does.
+    """Whether OTR correction fires, per sequence, WHICH estimate supplied the
+    breakpoints, and that it does real work when it does.
 
-    `otr_fit` gates on two things: origin and terminus 35-65% of the genome apart as a
-    circular distance, and a fitted anchor ratio above `bias_threshold`. Which sequences
-    clear that is a property of the sample, so `Sequence.otr_detected` records it rather
-    than the suite assuming one answer for all of them. It is per SEQUENCE, not per
-    dataset: a plasmid has no replication origin.
+    There are now two candidates and three gates between them.
 
-    ltee_ara_p5_75k_exp is the reason this is recorded rather than blanket-asserted: it is
-    an EXPONENTIAL-phase culture, so replication forks are active and the gradient is real
-    -- measured independently of the fit at 1.95x peak-to-trough, 47.4% apart. The
-    stationary-phase Ara-3 samples sit at 31.6% and 14.2% separation and cannot clear the
-    gate at all.
+    The COVERAGE fit must land 35-65% of the genome apart AND beat a circular
+    block bootstrap at p <= 0.01. That second condition is new and is the whole
+    point: the old `bias_threshold` was vacuous (the label swap in otr_fit()
+    guarantees y_ori >= y_ter, so "ratio > 1.0" reduced to "y_ter > 0"), so
+    nothing ever tested the tent against a null and a flat genome whose best-fit
+    tent happened to be antipodal had its coverage divided by noise. CWBI's
+    chromosome was exactly that case at a marginal 1.217.
 
-    TestGCSkewOriginTerminus is the independent cross-check on that reading. The
-    sequence-derived estimate puts ori/ter ~49% apart on every REL606 sequence regardless
-    of growth phase, since it never looks at coverage -- which says the stationary-phase
-    failures above are a property of the coverage SIGNAL (no active forks to leave a
-    gradient), not of the genome or of the fit.
+    The GC-SKEW fit is admitted whenever the skew's own bootstrap called the
+    prediction confident and the coverage does not contradict its ORIENTATION.
+    It needs no coverage significance of its own (OTR_SKEW_MAX_P is None), which
+    is a deliberate decision with a visible cost -- see ltee_ara_m3_38k and
+    adp1_mgd06_lb in DATASETS above.
 
-    These assertions fail if detection starts OR stops happening anywhere -- either is a
-    real change worth noticing.
+    When BOTH are live a bootstrap likelihood-ratio test decides, and only then:
+    the two models are nested, differing by exactly the two breakpoint
+    parameters. On this corpus that happens on two sequences and splits them,
+    which is why `otr_source` is recorded per sequence and not assumed.
+
+    Note what this costs the suite: TestGCSkewOriginTerminus is NO LONGER an
+    independent cross-check on these coordinates, because the skew now feeds the
+    OTR fit. What it still independently establishes is that the skew estimate is
+    a function of the reference sequence alone -- which is what makes it usable
+    on stationary-phase samples where the coverage carries no gradient, and also
+    what makes ramp injection there a real possibility rather than a hypothetical.
+
+    These assertions fail if detection starts OR stops happening anywhere, or if
+    the winning estimate changes -- all three are real changes worth noticing.
     """
 
     def test_detection_matches_the_spec(self, seq):
@@ -541,6 +593,41 @@ class TestOriginTerminus:
             assert float(ratio) > 1.0, f"origin should out-cover terminus, got {ratio}"
         else:
             assert ratio == "Not detected"
+
+    def test_correction_source_matches_the_spec(self, seq):
+        """WHICH estimate supplied the breakpoints, not merely whether one did.
+
+        Recorded per sequence because the two arms answer for different reasons.
+        ltee_ara_p5_75k_exp is the case worth understanding: BOTH fire and agree
+        to 1.8% of the genome, so the likelihood ratio cannot separate them
+        (p = 0.82) and defers to the GC skew as the better-supported estimate of
+        the same thing -- REL606's oriC is at ~3.886 Mb, where the skew lands,
+        and the coverage fit was 82 kb short of it.
+
+        ltee_ara_p1_50k_shift is the other end: both fire, but they place the
+        terminus 10.6% of the genome apart and the coverage fit explains
+        materially more (p = 0.004), so it keeps its own breakpoints.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        expected = seq["seq"].otr_source or "not corrected"
+        assert data["Breakpoint source"] == expected
+        # "Correction type" is how a reader of the file alone tells them apart.
+        if expected == "GC skew":
+            assert data["Correction type"] == GC_SKEW_METHOD
+        else:
+            assert data["Correction type"] == "Ori-ter coordinates fit by coverage"
+
+    def test_skew_sourced_coordinates_agree_with_the_skew_file(self, seq):
+        """The two JSONs now share a coordinate and must not be able to disagree."""
+        if seq["seq"].otr_source != "GC skew":
+            pytest.skip("breakpoints did not come from the GC skew here")
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            otr = json.load(fh)
+        with open(_produced(seq["out"], seq["seq_id"], "GC_skew", "_gc_skew_results.json")) as fh:
+            skew = json.load(fh)
+        assert otr["Origin window"] == skew["Origin (bp)"]
+        assert otr["Terminus window"] == skew["Terminus (bp)"]
 
     def test_coverage_passes_through_when_no_bias_is_found(self, seq):
         # With no bias detected, otr_correction must leave the GC-corrected values alone.

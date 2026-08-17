@@ -291,6 +291,30 @@ def main():
         plot_copy(df_cnv, start, end, output=out_dir)
         print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
+    def _report_otr(smpl, genome_id, otr_fit_result):
+        """Say whether OTR fired, on whose coordinates, and on what evidence.
+
+        Named separately from the fit because "corrected OTR bias" is no longer
+        the only outcome worth printing: the correction can now come from the
+        GC skew rather than the coverage, and a rejection carries a p-value that
+        explains itself.
+        """
+        detail = otr_fit_result.get("detail") or {}
+        p = detail.get("Coverage fit p-value")
+        if not otr_fit_result["bias"]:
+            print(
+                f"{smpl} ({genome_id}): no origin/terminus bias corrected "
+                f"(coverage fit p={p}); see OTR_corr/ for the evidence."
+            )
+            return
+        source = detail.get("Breakpoint source", "coverage fit")
+        p_lr = detail.get("Coverage vs skew likelihood-ratio p-value")
+        extra = "" if p_lr is None else f", likelihood ratio p={p_lr}"
+        print(
+            f"{smpl} ({genome_id}): corrected origin/terminus of replication "
+            f"(OTR) bias using the {source}{extra}."
+        )
+
     # Bias-correction and CNV calling per genome
     # One number per sequence: its coverage relative to the longest sequence in this
     # run, which reads exactly 1.0. Computed here because it is the only place holding
@@ -303,8 +327,13 @@ def main():
         # Origin/terminus from the reference's own cumulative GC skew. This sits
         # ahead of the --bias branch on purpose: it reads only the sequence, so
         # unlike the coverage-derived OTR results it is available in all four
-        # modes, including the ones that never call apply_otr_correction(). It is
-        # reported only -- nothing below consumes it.
+        # modes, including the ones that never call apply_otr_correction().
+        #
+        # fit_otr_bias() takes it as a second candidate: when the coverage fit
+        # cannot clear its own significance gate, or when it can but a
+        # likelihood-ratio test says it is no better than a tent hinged here,
+        # these coordinates supply the correction instead. Under --bias gc/none
+        # nothing consumes it and it is still reported.
         skew_result = predict_ori_ter_from_skew(
             df_b2c, win=options.w, step=options.s
         )
@@ -349,15 +378,12 @@ def main():
             # GC-stage mask_coverage_windows() call inside
             # process_multi_genome(), so fit_otr_bias() reuses them
             # directly rather than recomputing.
-            otr_fit_result = fit_otr_bias(df_otr_in, out_dir)
+            otr_fit_result = fit_otr_bias(df_otr_in, out_dir, skew_result=skew_result)
             df_otr, ori_win, ter_win = apply_otr_correction(
                 otr_fit_result, out_dir,
                 relative_copy_number=relative_cn.get(genome_id, 1.0),
             )
-            print(
-                f'{smpl} ({genome_id}): Corrected origin/terminus of '
-                f'replication (OTR) bias in coverage.'
-            )
+            _report_otr(smpl, genome_id, otr_fit_result)
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
             df_cnv = run_HMM(
@@ -390,15 +416,12 @@ def main():
             )
             # Same fit -> apply split as the "otr" branch above, replacing
             # otr_correction(df_gc, out_dir).
-            otr_fit_result = fit_otr_bias(df_gc, out_dir)
+            otr_fit_result = fit_otr_bias(df_gc, out_dir, skew_result=skew_result)
             df_otr, ori_win, ter_win = apply_otr_correction(
                 otr_fit_result, out_dir,
                 relative_copy_number=relative_cn.get(genome_id, 1.0),
             )
-            print(
-                f'{smpl} ({genome_id}): Corrected origin/terminus of '
-                f'replication (OTR) bias in coverage.'
-            )
+            _report_otr(smpl, genome_id, otr_fit_result)
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
             df_cnv = run_HMM(

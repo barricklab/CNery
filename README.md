@@ -123,7 +123,7 @@ CNery <inputs> -o <output folder> -w 500 -s 250 --bias gc
 CNery <inputs> -o <output folder> -w 500 -s 250 --bias none
 ```
 
-When OTR correction is applied, the origin and terminus of replication are automatically inferred from the coverage profile — no manual coordinates are required.
+When OTR correction is applied, the origin and terminus of replication are automatically inferred — no manual coordinates are required. CNery fits them from the coverage profile, falling back to the reference's own cumulative GC skew when the coverage carries no usable gradient. Either way the correction is applied only if it beats a bootstrap null, so a flat genome is left alone.
 
 ---
 
@@ -278,6 +278,8 @@ Given an output folder `CNV_out/`, `CNery` writes:
 - `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
 
+  It also records the evidence behind the decision, whether or not a correction was applied: `"Coverage fit r-squared"` / `"Coverage fit p-value"`, the same pair for the GC-skew-anchored fit, the `"Coverage vs skew likelihood ratio"` and its p-value when both candidates were live, `"Bootstrap surrogates"`, and `"Breakpoint source"` (`coverage fit`, `GC skew`, or `not corrected`). A rejected fit is therefore diagnosable from the file alone. Note the p-values are floored at `1/(surrogates+1)`, so `0.001` is an upper bound rather than a measurement.
+
   `"Relative copy number"` is that sequence's coverage relative to the longest sequence in the run, which reads exactly `1.0`. It is not rounded to an integer: a plasmid at `2.95` is a measurement, and it is the only place plasmid copy number is reported — `prob_copy_number` in the CSVs is called per reference, so a uniformly multi-copy plasmid comes out as `1` there.
 - `CNV_out/GC_skew/` — per-reference cumulative GC-skew plots with the predicted origin and terminus marked, and a JSON summary (`*_gc_skew_results.json`).
 
@@ -325,7 +327,9 @@ Expect `false` on plasmids. They have no bidirectional replication origin, so th
 
 Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers, whatever their depth or growth phase. And it is invariant to circular permutation: a reference whose coordinates start elsewhere predicts the same locus.
 
-These values are **not yet used** for anything. Bias correction and copy-number calling still use the origin and terminus that `--bias otr` infers from the coverage profile.
+These values feed the OTR correction as its second candidate. CNery prefers the coverage-derived origin and terminus when they clear their own significance test *and* a likelihood-ratio test says they fit better than a ramp hinged at the GC-skew coordinates; otherwise it uses the skew's, provided the skew prediction is confident and the coverage does not contradict which end is the origin. `"Correction type"` and `"Breakpoint source"` in `*_otr_results.json` say which was used.
+
+The practical consequence: a sequence with no replication gradient in its coverage but a confident skew prediction now receives a small correction where it previously received none. The magnitude is still fitted from the coverage, not imported — on a genuinely flat sequence the fitted ramp is close to 1.0 — but the evidence for such a correction is the reference sequence, not the reads. `"GC skew fit p-value"` reports what the coverage itself had to say about it.
 
 ---
 
