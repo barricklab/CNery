@@ -4,6 +4,9 @@ import argparse
 from pathlib import Path
 
 from .core import (
+    DEFAULT_CHANGE_RATE,
+    relative_copy_numbers,
+    DEFAULT_DELETION_COVERAGE_FRACTION,
     DEFAULT_FILE_ENDINGS,
     parse_region,
     process_multi_genome,
@@ -104,11 +107,14 @@ def main():
         action="store",
         dest="w",
         required=False,
-        default=200,
+        default=100,
         type=int,
         help=(
             "Define window length to parse through the genome and calculate "
-            "coverage and GC statistics."
+            "coverage and GC statistics. Default: 100. Wider windows smooth "
+            "the coverage but lose short events: the window statistic is a "
+            "per-base median, whose precision grows sublinearly with width, so "
+            "-w is a resolution knob."
         ),
     )
 
@@ -123,7 +129,10 @@ def main():
         help=(
             "Define step size (<= window size) for each progression of the "
             "window across the genome sequence. Set step-size=window-size "
-            "if non-overlapping windows."
+            "if non-overlapping windows. Default: 100, i.e. non-overlapping. "
+            "Copy-number calls are near-invariant to this: the state-change "
+            "prior is per base (see --change-rate) and overlapping windows are "
+            "down-weighted so they do not count the same bases twice."
         ),
     )
 
@@ -132,23 +141,48 @@ def main():
         "--frag-size",
         action="store",
         dest="f",
-        default=150,
+        default=400,
         required=False,
         type=int,
-        help="Average fragment size of the sequencing reads.",
+        help=(
+            "Average fragment size of the sequencing library. GC%% is measured "
+            "over this many bases centred on each window, because GC bias acts at "
+            "fragment scale rather than at whatever window size was asked for. "
+            "Ignored when it is smaller than -w, which is then used instead. "
+            "Default: 400."
+        ),
     )
     parser.add_argument(
-        "-e",
-        "--error-rate",
+        "-z",
+        "--deletion-coverage-fraction",
         action="store",
-        dest="e",
-        default=0.15,
+        dest="deletion_coverage_fraction",
+        default=DEFAULT_DELETION_COVERAGE_FRACTION,
         required=False,
         type=float,
         help=(
-            "Approximate error rate in sequencing read coverage/reference "
-            "alignment. Widens the negative-binomial emission distributions "
-            "in the HMM. Default: 0.15."
+            "Coverage a deleted region still shows, as a fraction of the "
+            "single-copy level. Sets the mean of the copy-number-0 emission. "
+            "Real deletions are not empty -- mismapping and repeat spill leave "
+            "a couple of percent behind. A fraction rather than an absolute "
+            "depth so that what counts as a deletion does not change with how "
+            "deeply the sample was sequenced. Default: %g."
+            % DEFAULT_DELETION_COVERAGE_FRACTION
+        ),
+    )
+    parser.add_argument(
+        "--change-rate",
+        action="store",
+        dest="change_rate",
+        default=DEFAULT_CHANGE_RATE,
+        required=False,
+        type=float,
+        help=(
+            "Prior probability PER BASE that copy number changes. The "
+            "per-window probability is 1 - exp(-rate * step-size), so changing "
+            "-w/-s no longer changes the implied biology. Read 1/rate as the "
+            "expected segment length: the default 1e-06 is one copy-number "
+            "boundary per megabase. Larger values give more, shorter segments."
         ),
     )
     parser.add_argument(
@@ -255,6 +289,11 @@ def main():
         print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
     # Bias-correction and CNV calling per genome
+    # One number per sequence: its coverage relative to the longest sequence in this
+    # run, which reads exactly 1.0. Computed here because it is the only place holding
+    # every sequence at once -- apply_otr_correction() runs per sequence.
+    relative_cn = relative_copy_numbers(per_genome)
+
     for genome_id, df_b2c in per_genome.items():
         print(f"Processing genome: {genome_id}")
 
@@ -266,7 +305,13 @@ def main():
                 f'(pooled fit).'
             )
             df_gc["otr_gc_corr_norm_cov"] = df_gc["gc_corr_norm_cov"]
-            df_cnv = run_HMM(df_gc, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_gc,
+                out_dir,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "otr":
@@ -280,20 +325,35 @@ def main():
             # process_multi_genome(), so fit_otr_bias() reuses them
             # directly rather than recomputing.
             otr_fit_result = fit_otr_bias(df_otr_in, out_dir)
-            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(
+                otr_fit_result, out_dir,
+                relative_copy_number=relative_cn.get(genome_id, 1.0),
+            )
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
-            print(f'{smpl} ({genome_id}): OTR bias vs coverage plots saved.')
-            df_cnv = run_HMM(df_otr, out_dir, error_rate=options.e)
+            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
+            df_cnv = run_HMM(
+                df_otr,
+                out_dir,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "none":
             df_none = df_b2c.copy()
             df_none["otr_gc_corr_norm_cov"] = df_none["norm_raw_cov"]
-            df_cnv = run_HMM(df_none, out_dir, error_rate=options.e)
+            df_cnv = run_HMM(
+                df_none,
+                out_dir,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
         elif options.bias == "all":
@@ -306,14 +366,23 @@ def main():
             # Same fit -> apply split as the "otr" branch above, replacing
             # otr_correction(df_gc, out_dir).
             otr_fit_result = fit_otr_bias(df_gc, out_dir)
-            df_otr, ori_win, ter_win = apply_otr_correction(otr_fit_result, out_dir)
+            df_otr, ori_win, ter_win = apply_otr_correction(
+                otr_fit_result, out_dir,
+                relative_copy_number=relative_cn.get(genome_id, 1.0),
+            )
             print(
                 f'{smpl} ({genome_id}): Corrected origin/terminus of '
                 f'replication (OTR) bias in coverage.'
             )
             plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
-            print(f'{smpl} ({genome_id}): OTR bias vs coverage plots saved.')
-            df_cnv = run_HMM(df_otr, out_dir, error_rate=options.e)
+            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
+            df_cnv = run_HMM(
+                df_otr,
+                out_dir,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
+                bias=options.bias,
+                change_rate=options.change_rate,
+            )
             emit_cnv_plot(df_cnv, genome_id)
 
 

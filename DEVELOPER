@@ -24,8 +24,8 @@ If you do need breseq for generating new test data, install it separately. See t
 Run pytest from the repository root. pyproject.toml supplies testpaths, pythonpath=["src"],
 and the default marker filter, so no install step or PYTHONPATH fiddling is needed.
 
-Run everything. This is the default. On a cold cache it downloads ~105 MB of authentic
-datasets and takes about a minute; afterwards it is roughly a minute from cache:
+Run everything. This is the default. On a cold cache it downloads ~152 MB of authentic
+datasets and takes a couple of minutes; afterwards it is roughly 90 seconds from cache:
 $ conda run -p $PWD/env pytest
 
 Run only the synthetic tier. Fast, offline, a few seconds -- the inner loop while editing:
@@ -144,10 +144,29 @@ the same:
   ltee_ara_p1_50k_shift   24 MB   0 read groups, 10 cols,  4-line footer, permuted reference
   ltee_ara_m3_32k_2rg     48 MB   2 read groups, 26 cols, 10-line footer, CN up to 10
   ltee_ara_m3_38k         37 MB   1 read group,  18 cols,  7-line footer, 108 kb CN=2 region
+  ltee_ara_p5_75k_exp     20 MB   1 seq,  5 cols,  4-line footer, --total-only, OTR fires
+  cwbi_ssym_ht04          14 MB   3 seq,  5 cols,  4-line footer, --total-only, CSV, plasmids
+  adp1_mgd06_lb           13 MB   1 seq,  5 cols,  4-line footer, 3.59 Mb Acinetobacter
 
-The three footer lengths matter: none is 4, so together they are real regression coverage for
-the prefix-based footer stripping that replaced skipfooter=4. A fixed skip of four lines would
+The footer lengths matter: 4, 10 and 7, so together they are real regression coverage for the
+prefix-based footer stripping that replaced skipfooter=4. A fixed skip of four lines would
 silently delete 6 and 3 real data rows from the 32k and 38k tables respectively.
+
+ltee_ara_p5_75k_exp is the only sample where OTR correction fires strongly. It is exponential
+phase, so replication forks are active and the gradient is real -- 1.95x peak to trough, origin
+~3.80 Mb and terminus ~1.56 Mb, which are REL606's actual ones.
+
+cwbi_ssym_ht04 is the only multi-sequence dataset and the only CSV one: a chromosome plus two
+plasmids, which is the only cover for process_multi_genome's pooled GC fit and shared global
+median. Worth knowing what it demonstrates: the pooled median keeps the plasmids at 2.82x and
+1.88x the chromosome in norm_raw_cov, but run_HMM refits the single-copy level per sequence, so
+both plasmids are reported as CN 1. Plasmid copy number is preserved and then discarded.
+
+adp1_mgd06_lb is the first genome that is not REL606, which is why sequence length and window
+count live on Sequence rather than being module constants.
+
+Tests that read a frame or an output file are parametrized per SEQUENCE. Goldens follow, at
+tests/data/expected/<dataset>_<seq_id>_break_pts.csv -- CNery writes one file per sequence.
 
 When adding a dataset, prefer one that covers something none of the existing ones do. Another
 sample with the same shape costs download time and adds little.
@@ -180,11 +199,14 @@ origin/terminus windows) or numpy.testing.assert_allclose with an explicit toler
 === Recording Known-Bad Behavior ===
 
 Some tests deliberately record what the code currently does rather than what it should do, as
-a tripwire while an area is under development. TestOriginTerminus in
-tests/test_authentic_ltee.py is the current example: the LTEE dataset's rotated reference was
-meant to exercise the otr_fit branch where the origin index is below the terminus index, but
-does not reach it, because the median-filter seed places the two about 6% of the genome apart,
-below the 35% floor in otr_fit.
+a tripwire while an area is under development.
+
+TestOriginTerminus in tests/test_authentic.py used to be the example: it recorded that OTR
+correction fired on none of the datasets. That is no longer a known-bad record -- OTR now fires
+on two of the four, and Spec.otr_detected says which, so the class asserts real behavior in both
+directions rather than pinning one outcome. What replaced the tripwire is
+test_correction_tightens_coverage, which checks the correction does WORK (coverage pulled toward
+the single-copy level) rather than merely that a ratio was reported.
 
 When you do this, say so explicitly in the test docstring, and write the assertions so they
 fail if the behavior changes in either direction. A test that quietly encodes a bug as correct

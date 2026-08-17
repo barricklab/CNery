@@ -10,6 +10,9 @@ Recent updates (latest commits):
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
 - **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
+- **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
+  number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
+  Read `1/rate` as the expected segment length.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
 
@@ -272,7 +275,9 @@ Given an output folder `CNV_out/`, `CNery` writes:
 - `CNV_out/CNV_plt/` — per-reference CNV prediction plots.
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
 - `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
-- `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, and the origin-to-terminus ratio.
+- `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
+
+  `"Relative copy number"` is that sequence's coverage relative to the longest sequence in the run, which reads exactly `1.0`. It is not rounded to an integer: a plasmid at `2.95` is a measurement, and it is the only place plasmid copy number is reported — `prob_copy_number` in the CSVs is called per reference, so a uniformly multi-copy plasmid comes out as `1` there.
 
 Each coverage table produces its own set of outputs, named with the sequence ID derived from its file name. The GC-bias plot is the exception: one pooled fit covers every table in the run.
 
@@ -284,7 +289,9 @@ Each coverage table produces its own set of outputs, named with the sequence ID 
 $ CNery -h
 
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
-             [-w W] [-s S] [-f F] [-e E] [--bias {all,none,gc,otr}]
+             [-w W] [-s S] [-f F]
+             [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
+             [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -324,15 +331,38 @@ options:
   -o, --output O        output file prefix / storage location. Defaults to
                         the 'CNV_out' folder in the current dir.
   -w, --window W        Window length used to parse the genome and compute
-                        coverage and GC statistics. Default: 200.
+                        coverage and GC statistics. Default: 100. Wider
+                        windows smooth the coverage but lose short events: the
+                        window statistic is a per-base median, whose precision
+                        grows sublinearly with width, so -w is a resolution
+                        knob.
   -s, --step-size S     Step size (<= window size) for each progression of
                         the window across the genome. Set step-size = window
-                        size for non-overlapping windows. Default: 100.
-  -f, --frag-size F     Average fragment size of the sequencing reads.
-                        Default: 150.
-  -e, --error-rate E    Approximate error rate in sequencing read coverage /
-                        reference alignment. Widens the negative-binomial
-                        emission distributions in the HMM. Default: 0.15.
+                        size for non-overlapping windows. Default: 100, i.e.
+                        non-overlapping. Copy-number calls are near-invariant
+                        to this: the state-change prior is per base (see
+                        --change-rate) and overlapping windows are
+                        down-weighted so they do not count the same bases
+                        twice.
+  -f, --frag-size F     Average fragment size of the sequencing library. GC%
+                        is measured over this many bases centred on each
+                        window. Ignored when smaller than -w. Default: 400.
+  -z, --deletion-coverage-fraction DELETION_COVERAGE_FRACTION
+                        Coverage a deleted region still shows, as a fraction of
+                        the single-copy level. Sets the mean of the
+                        copy-number-0 emission. Real deletions are not empty --
+                        mismapping and repeat spill leave a couple of percent
+                        behind. A fraction rather than an absolute depth so
+                        that what counts as a deletion does not change with how
+                        deeply the sample was sequenced. Default: 0.02.
+  --change-rate CHANGE_RATE
+                        Prior probability PER BASE that copy number changes.
+                        The per-window probability is 1 - exp(-rate * step-
+                        size), so changing -w/-s no longer changes the
+                        implied biology. Read 1/rate as the expected segment
+                        length: the default 1e-06 is one copy-number boundary
+                        per megabase. Larger values give more, shorter
+                        segments.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'

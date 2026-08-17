@@ -113,7 +113,7 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
 | `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
 | `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
-| `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts |
+| `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts (output/plots only — **not** the HMM's observation) |
 | `prob_copy_number` | `run_HMM` | Viterbi state |
 
 Supporting columns other stages depend on: `gc_cor_med_fil` (median filter of `gc_corr_norm_cov`;
@@ -131,15 +131,19 @@ Adding a stage means reading the previous column name and writing the next one.
 ### `--bias` works by aliasing columns
 
 `get_CNV.py:212-265` implements the four modes by *renaming data into the column the next stage
-expects*, rather than by branching inside the correction functions. `run_HMM` unconditionally reads
-`otr_gc_corr_norm_cov`; `fit_otr_bias` unconditionally reads `gc_corr_norm_cov`.
+expects*, rather than by branching inside the correction functions. `fit_otr_bias` unconditionally
+reads `gc_corr_norm_cov`. The aliasing still drives the corrected-coverage columns written to
+`CNV.csv` and the plots — but **not** the HMM, which now takes `bias` as an argument and composes its
+emission offset from the correction-factor columns directly.
 
 - `all` — no aliasing; both corrections run in sequence.
 - `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely.
 - `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input.
 - `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`.
 
-Any new bias mode is another aliasing branch here, not a new parameter threaded through `core.py`.
+Any new bias mode is another aliasing branch here, not a new parameter threaded through `core.py` —
+*plus* an entry in `BIAS_OFFSET_COLUMNS`, since the HMM composes its emission offset from the
+correction-factor columns rather than reading the aliased coverage column.
 
 Note that GC correction has *already run* by the time this dispatch executes — `process_multi_genome`
 does it unconditionally, and the `otr`/`none` branches discard the result by overwriting the column.
@@ -191,11 +195,68 @@ are rejected before `get_CNV.main` creates any output directory.
   and `tests/test_regression.py`.
 - `apply_otr_correction` (`core.py:767`) applies the OTR factor everywhere except `is_deletion`
   windows, for the same reason.
-- The HMM (`core.py:920-1021`) stacks a geometric zero-state row on top of one negative-binomial
-  emission row per copy number, so **state index == copy number** and the matrices are
-  `n_states + 1` square/rows. The negative binomial (not Poisson) is intentional: coverage is
-  overdispersed, and `run_HMM` nudges `var` above `mean` when a synthetic-flat input would otherwise
-  make `solve_pr` divide by a non-positive number.
+- The HMM stacks a geometric zero-state row on top of one negative-binomial emission row per copy
+  number, so **state index == copy number** and the matrices are `n_states + 1` square/rows. The
+  negative binomial (not Poisson) is intentional: coverage is overdispersed.
+- **The zero state's mean is a fraction of the local baseline**, `deletion_coverage_fraction * mu *
+  offset` (`-z`, default 0.02), which makes it the `k = 0.02` case of the emission contract below
+  rather than a special case. It used to be `geom.pmf(count + 1, 1 - error_rate)` — a geometric of
+  mean `error_rate / (1 - error_rate)` = 0.176 counts **absolute**, tied to nothing about the sample.
+  As a fraction of baseline that is 0.28% at 60x and 0.018% at 1000x, so the largest residual coverage
+  still called CN0 drifted from 19% to 4%: the same deletion was called on a shallow run and missed on
+  a deep one. `tests/test_hmm.py::test_deletion_calls_do_not_depend_on_sequencing_depth` pins it.
+  The default 0.02 is measured, not assumed — REL606's called deletions hold a mean 2.2% of baseline
+  (90th percentile 3.2%), the residue of mismapping and repeat spill.
+- **The HMM observes RAW counts, and the bias corrections enter as offsets on the emission mean** —
+  `E[count | CN = k] = k * mu * gc_corr_fact * otr_gc_corr_fact`, not `corrected_coverage`. Both
+  factor columns are already the divisors, so the same numbers multiply the expectation. Dividing
+  them out of the data instead scales each window's variance by `1/factor²` while a single global
+  variance is applied to all of them, and rounds after dividing. This is why the HMM reads
+  `read_count_cov` and the factor columns rather than `otr_gc_corr_norm_cov`, which stays in the
+  frame for the CSV and the plots. `bias_offsets()` composes the factors per `--bias` mode, and
+  `bias` must be **passed in** to `run_HMM` — `gc_corr_fact` is on the frame even under `--bias none`.
+- `fit_censored_negative_binomial` ports breseq's censoring (`coverage_distribution.cpp`): mode of a
+  5-point moving average searched upward from `mean/4`, then `[0.5, 1.5] × mode`. Without it,
+  `np.var` over every window measures the spread of a *mixture* — an amplification inflates the very
+  dispersion meant to detect it (REL606: var/mean 6.03 against a true var/mu of 2.48). The objective
+  is the truncated likelihood, not breseq's least-squares, so the fitted `size` is **not** comparable
+  to breseq's `nbinom_size_parameter`. It returns `None` on degenerate input; `run_HMM` then falls
+  back to moments plus the `var = mean * (1 + 1e-3)` guard.
+- **No window with any redundant coverage enters that fit, unconditionally.** This is deliberately
+  *not* softened by `min_called_windows` the way the observation mask is: a window clipping the edge
+  of an IS element sits at 1.2–1.4x, *inside* the censoring band, where the bounds cannot catch it.
+- `changeprob` is a per-*base* rate (`--change-rate`, `DEFAULT_CHANGE_RATE = 1e-6`), converted to a
+  per-window probability as `1 - exp(-rate * step)`. A flat per-window probability implies a per-base
+  rate of `changeprob/step`, so re-tiling the same genome silently restated the biology. Every
+  observed transition is charged one `step` regardless of the gap censored windows left — pricing a
+  wide repeat gap as a cheaper crossing would make a censored repeat a cheap place to break a segment.
+- Log emissions are tempered by `step/window` (`overlap_weighting`). Under `-w 200 -s 100` every
+  base sits in two windows, so the likelihood would otherwise count each base twice while the
+  transition prior counts it once. It is a no-op at the default `-w 100 -s 100`, where
+  `step == window`. Note this does **not** buy full `-w` invariance: the window statistic is a
+  per-base *median*, whose precision grows sublinearly with window width (fitted `size` 43 at
+  `w=100` against 54 at `w=200`), so `-w` remains a resolution knob. That is why the default is
+  `-w 100 -s 100`: at `-w 200` the weakest two-window events stop being callable.
+- `robust_state_count` sizes the state space from a 3-window rolling median, not `int(max(coverage))`
+  — with a flat off-diagonal the switch cost carries `-log(n_states)`, so one outlier window would
+  otherwise make every duplication call dearer genome-wide.
+- The decode is a **real Viterbi backtrace**. `make_viterbi_mat` returns forward scores only; the
+  path comes from `viterbi_path`. Taking `np.argmax(logv, axis=1)` per window is *not* a path — it
+  can name a state no single path passes through, which is how a 3-window amplification came out
+  labelled `1,1,3`, on its lowest window. `log_transition` is indexed **`[from, to]`**.
+- `OTR_corr/<sample><seq_id>_otr_results.json` carries **`"Relative copy number"`**: this sequence's
+  coverage relative to the longest sequence in the run, which reads exactly 1.0. Deliberately
+  non-integral — 2.95 copies is a measurement. Computed by `relative_copy_numbers()` from the censored
+  median of `gc_corr_norm_cov`, and passed *into* `apply_otr_correction` rather than carried on the
+  frame: it is one scalar per sequence, and a constant column would add 226–407 kB to an 8.3 MB
+  `CNV.csv`.
+- **That JSON must stay strict JSON.** breseq parses it with nlohmann, which has no `allow_nan`, so a
+  single bare `NaN` makes the whole file unparseable and silently costs it all OTR reporting.
+  `_json_safe` maps non-finite values to `null` on the way out. Two further constraints from the same
+  reader: `"Origin-to-Termius/Bias Ratio"` is load-bearing **including the typo** (renaming it makes
+  breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
+  so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
+  three columns and the assert is fatal.
 - Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
   `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
   functions in `core.py` assume they already exist.
@@ -243,12 +304,36 @@ verified against a sha256 pinned in `tests/data/registry.json`, and used only by
 
 ```bash
 conda run -p $PWD/env pytest -m authentic       # this tier only
-CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest   # relocate the ~105 MB cache
+CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest   # relocate the ~152 MB cache
 ```
 
-Three datasets, differing where it matters — 0/1/2 read groups, 10/18/26 columns, and **4/7/10-line
-footers**. That last spread is deliberate: none is 4, so they are real regression coverage for the
-prefix-based footer stripping that replaced `skipfooter=4`.
+Six datasets, differing where it matters — 0/1/2 read groups, 5/10/18/26 columns, 4/7/10-line
+footers, TSV and CSV, one and three sequences, and three different genome lengths. The footer
+spread is real regression coverage for the prefix-based footer stripping that replaced
+`skipfooter=4`.
+
+Three of them carry the load for a specific area:
+
+- `ltee_ara_p5_75k_exp` — **the only sample where OTR correction fires strongly**, an
+  exponential-phase culture whose replication gradient is real (1.95x peak to trough, origin
+  ~3.80 Mb and terminus ~1.56 Mb, matching REL606's known ones). It is the regression test for the
+  ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging the two breakpoints, so
+  a mirrored fit divides by an inverted ramp and *spreads* coverage out —
+  `TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
+- `cwbi_ssym_ht04` — **the only multi-sequence dataset and the only CSV one**. A chromosome plus
+  two plasmids, so it is the only cover for `process_multi_genome`'s pooled GC fit and its shared
+  global median. Note what it shows: the pooled median keeps the plasmids above the chromosome, but
+  `run_HMM` refits the single-copy level from whichever sequence it is handed (fitted mu
+  100.9 / 300.0 / 194.6), so **`prob_copy_number` is 1 for both plasmids** — that follows from "CN
+  calling is per-reference". The multiple is not lost, though: it is published as
+  **`"Relative copy number"`** in each sequence's `_otr_results.json`, at 2.953 and 1.898 against a
+  chromosome pinned to exactly 1.0.
+- `adp1_mgd06_lb` — the first non-REL606 genome, which is why sequence length and window count are
+  per-`Sequence` rather than the module constants they used to be.
+
+Tests that read a frame or an output file are parametrized **per sequence**, not per dataset.
+Goldens are named `<dataset>_<seq_id>_break_pts.csv` for the same reason — CNery writes one file
+per sequence.
 
 Check the result says *passed*, not *skipped* — an unfetchable dataset skips (with the dataset, URL,
 and error in the reason) rather than failing, which keeps offline work possible but can look like

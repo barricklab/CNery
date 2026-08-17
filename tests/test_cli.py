@@ -244,12 +244,16 @@ class TestFlagSpellings:
 
     @pytest.mark.parametrize("flag", [
         "--file-ending", "--region", "-o", "--output", "-w", "--window",
-        "-s", "--step-size", "-f", "--frag-size", "-e", "--error-rate", "--bias",
+        "-s", "--step-size", "-f", "--frag-size",
+        "-z", "--deletion-coverage-fraction", "--bias",
     ])
     def test_flag_is_accepted(self, flag, tmp_path, monkeypatch):
         parser_args = {
             "--file-ending": "coverage.tsv", "--region": "100-2000",
             "--bias": "none",
+            # A fraction of baseline now, so the generic "100" would ask the
+            # zero state to expect 100x the single-copy level.
+            "-z": "0.05", "--deletion-coverage-fraction": "0.05",
         }
         value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)
         if value is None:

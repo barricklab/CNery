@@ -1,0 +1,9 @@
+{
+    "Origin window": 60001,
+    "Origin coverage (normalized)": 1.1256782505400533,
+    "Terminus window": 1792001,
+    "Terminus coverage (normalized)": 0.9247469017727953,
+    "Origin-to-Termius/Bias Ratio": 1.2159676131612125,
+    "Relative copy number": 1.0,
+    "Correction type": "Ori-ter coordinates fit by coverage"
+}
