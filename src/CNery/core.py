@@ -1007,6 +1007,19 @@ def otr_fit(df, bias_threshold=1.0, n_seeds=8):
 
     _, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt = best
 
+    # Orient the labels by the fitted anchor values: the origin is whichever
+    # anchor came out higher. _otr_concentrated_rss() is symmetric under
+    # swapping the two breakpoints -- the same tent, the same residuals, the
+    # same RSS -- and the seeds below are blind antipodal pairs, so which one
+    # is returned as x_ori is arbitrary. magnitude_ok further down reads y_ori
+    # as the PEAK, so without this a perfectly good fit fails the gate on a
+    # coin flip: on the p5_75k_exp dataset it found the right breakpoints
+    # (1.56 Mb and 3.80 Mb, 48.5% apart) and then rejected them because the
+    # ratio came out 0.49 instead of 2.05.
+    if y_ori_opt < y_ter_opt:
+        x_ori_opt, x_ter_opt = x_ter_opt, x_ori_opt
+        y_ori_opt, y_ter_opt = y_ter_opt, y_ori_opt
+
     # Wrap fitted positions back into [0, genome_len). The optimizer can
     # legitimately return an out-of-range value (e.g. -1.6, mathematically
     # equivalent to genome_len - 1.6 under the circular model) that

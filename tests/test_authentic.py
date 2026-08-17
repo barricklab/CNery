@@ -1,22 +1,28 @@
 """Consistency tests against authentic breseq coverage tables.
 
 Marked ``authentic``. These run by default; use ``pytest -m synthetic`` for the fast offline
-inner loop. On a cold cache they download ~105 MB from GitHub Releases, then cache it (set
+inner loop. On a cold cache they download ~125 MB from GitHub Releases, then cache it (set
 CNERY_TESTDATA_DIR to relocate). See DEVELOPER.
 
-Three datasets, chosen to differ where it matters rather than to pile up more of the same:
+Four datasets, chosen to differ where it matters rather than to pile up more of the same:
 
     ltee_ara_p1_50k_shift   0 read groups,  10 cols,  4-line footer, permuted reference
     ltee_ara_m3_32k_2rg     2 read groups,  26 cols, 10-line footer
     ltee_ara_m3_38k         1 read group,   18 cols,  7-line footer
+    ltee_ara_p5_75k_exp     0 read groups,   5 cols,  4-line footer, --total-only, OTR fires
 
-The three footer lengths are the point of the last column: none of them is 4, so these are real
-regression coverage for the prefix-based footer stripping that replaced ``skipfooter=4`` -- which
-would have silently deleted 6 and 3 data rows from the 32k and 38k tables.
+The footer lengths are the point of that column: 4, 10 and 7, so these are real regression
+coverage for the prefix-based footer stripping that replaced ``skipfooter=4`` -- which would
+have silently deleted 6 and 3 data rows from the 32k and 38k tables.
+
+The last row covers two things nothing else does: the ``--total-only`` schema, where bam2cov
+ships the sums it has already taken rather than strand-split counts, and a sample where OTR
+correction actually FIRES. It is an exponential-phase culture, so replication forks are active
+and the origin-to-terminus gradient is real -- 1.95x peak to trough, against nothing detectable
+in the three stationary-phase samples. See TestOriginTerminus.
 
 These assertions record what the code does TODAY. That is deliberate: a tripwire for unintended
-change, not a claim the current output is correct. Notably OTR correction fires on none of the
-three (see TestOriginTerminus).
+change, not a claim the current output is correct.
 
 After an intended behavior change, refresh the goldens and review the diff::
 
@@ -36,6 +42,8 @@ import pandas as pd
 import pytest
 
 from CNery.core import (
+    STRAND_SPLIT_COLUMNS,
+    TOTAL_ONLY_COLUMNS,
     _read_coverage_table,
     apply_otr_correction,
     coverage_table_path,
@@ -61,19 +69,24 @@ EXPECTED_DIR = os.path.join(os.path.dirname(__file__), "data", "expected")
 @dataclass(frozen=True)
 class Spec:
     seq_id: str
-    read_groups: int      # 0 = no --per-read-group columns at all
-    footer_lines: int     # 4 aggregate + 3 per read group
-    data_columns: int     # excluding the position index
+    read_groups: int              # 0 = no --per-read-group columns at all
+    footer_lines: int             # 4 aggregate + 3 per read group
+    data_columns: int             # excluding the position index
+    schema: str = "strand_split"  # or "total_only" (bam2cov --total-only)
+    otr_detected: bool = False    # does otr_fit find a replication gradient?
 
 
 DATASETS = {
-    "ltee_ara_p1_50k_shift": Spec("REL606_2314906bp_shift", 0, 4, 9),
+    "ltee_ara_p1_50k_shift": Spec("REL606_2314906bp_shift", 0, 4, 9, otr_detected=True),
     "ltee_ara_m3_32k_2rg": Spec("REL606", 2, 10, 25),
     "ltee_ara_m3_38k": Spec("REL606", 1, 7, 17),
+    "ltee_ara_p5_75k_exp": Spec("REL606", 0, 4, 4,
+                                schema="total_only", otr_detected=True),
 }
 
 ALL = list(DATASETS)
 WITH_READ_GROUPS = [n for n, s in DATASETS.items() if s.read_groups]
+WITH_OTR = [n for n, s in DATASETS.items() if s.otr_detected]
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -121,6 +134,19 @@ def _produced(pipeline, subdir, suffix):
     prefix = os.path.basename(str(pipeline["out"]))
     return os.path.join(pipeline["out"], subdir,
                         f"{prefix}{pipeline['spec'].seq_id}{suffix}")
+
+
+def _coverage_columns(name):
+    """The coverage columns this dataset's schema is required to carry.
+
+    bam2cov writes either strand-split counts or, under --total-only, the sums
+    it has already taken. `raw_table` reads the file with _read_coverage_table,
+    which deliberately does NOT normalize, so the expectation has to follow the
+    schema rather than assume one of them.
+    """
+    if DATASETS[name].schema == "total_only":
+        return TOTAL_ONLY_COLUMNS
+    return STRAND_SPLIT_COLUMNS
 
 
 def _golden(name, suffix):
@@ -191,12 +217,11 @@ class TestInputIntegrity:
     def test_footer_did_not_leak_into_the_data(self, raw_table):
         name, df = raw_table
         assert not df["ref_base"].astype(str).str.startswith("#").any()
-        assert df["unique_top_cov"].dtype.kind in "iu"
+        assert df[_coverage_columns(name)[0]].dtype.kind in "iu"
 
     def test_columns_cnery_depends_on(self, raw_table):
         name, df = raw_table
-        for col in ("ref_base", "unique_top_cov", "unique_bot_cov",
-                    "redundant_top_cov", "redundant_bot_cov"):
+        for col in ("ref_base",) + _coverage_columns(name):
             assert col in df.columns
 
     def test_column_count_matches_spec(self, raw_table):
@@ -297,33 +322,67 @@ class TestPipelineShape:
 
 @pytest.mark.parametrize("dataset_dir", ALL, indirect=True)
 class TestOriginTerminus:
-    """Records that OTR correction fires on none of the three datasets.
+    """Whether OTR correction fires, per dataset, and that it does real work when it does.
 
-    otr_fit requires the median-filter seed to place origin and terminus 35-65% of the
-    genome apart, measured as a circular distance (`separation_ok`, core.py:679). Measured
-    separations: 30.6% (p1_50k_shift), 31.2% (m3_32k_2rg) and 32.7% (m3_38k) -- all just
-    under the floor. REL606's true origin and terminus are roughly antipodal, so ~50% is
-    expected; three independent samples landing at 30-33% points at the seed compressing
-    the separation rather than at three unlucky datasets.
+    `otr_fit` gates on two things: origin and terminus 35-65% of the genome apart as a
+    circular distance, and a fitted anchor ratio above `bias_threshold`. Which datasets
+    clear that is a property of the sample, so `Spec.otr_detected` records it rather than
+    the suite assuming one answer for all of them.
 
-    These assertions fail if detection starts OR stops happening -- either is a real change
-    worth noticing while this area is under development.
+    ltee_ara_p5_75k_exp is the reason this class is parametrized rather than blanket: it is
+    an EXPONENTIAL-phase culture, so replication forks are active and the gradient is real
+    -- measured independently of the fit at 1.95x peak-to-trough, 47.4% apart. The two
+    stationary-phase Ara-3 samples sit at 31.6% and 14.2% separation and cannot clear the
+    gate at all.
+
+    These assertions fail if detection starts OR stops happening on any dataset -- either
+    is a real change worth noticing.
     """
 
-    def test_bias_is_not_currently_detected(self, pipeline):
+    def test_detection_matches_the_spec(self, pipeline):
         # Read what the run PRODUCED, not the golden -- asserting that the golden says what
         # the golden says would be circular and would pass no matter what the code did.
         with open(_produced(pipeline, "OTR_corr", "_otr_results.json")) as fh:
-            assert json.load(fh)["Origin-to-Termius/Bias Ratio"] == "Not detected"
+            ratio = json.load(fh)["Origin-to-Termius/Bias Ratio"]
+        if pipeline["spec"].otr_detected:
+            assert ratio != "Not detected", "expected OTR correction to fire"
+            assert float(ratio) > 1.0, f"origin should out-cover terminus, got {ratio}"
+        else:
+            assert ratio == "Not detected"
 
-    def test_uncorrected_coverage_passes_through(self, pipeline):
+    def test_coverage_passes_through_when_no_bias_is_found(self, pipeline):
         # With no bias detected, otr_correction must leave the GC-corrected values alone.
+        if pipeline["spec"].otr_detected:
+            pytest.skip("OTR fires on this dataset; see test_correction_tightens_coverage")
         df = pipeline["otr"]
         np.testing.assert_allclose(
             df["otr_gc_corr_norm_cov"].to_numpy(),
             df["gc_corr_norm_cov"].to_numpy(),
             rtol=1e-9,
         )
+
+    def test_correction_tightens_coverage(self, pipeline):
+        """The correction must pull coverage TOWARD the single-copy level.
+
+        Reporting a ratio is not evidence that anything was corrected. On
+        ltee_ara_p5_75k_exp the fraction of windows within 20% of single-copy goes from
+        53% to 95%; without that, `test_single_copy_dominates` below could not pass.
+
+        This is also the regression test for the ori/ter label swap: otr_fit's objective is
+        symmetric under exchanging the two breakpoints, so a fit that comes back mirrored
+        divides by an INVERTED ramp and spreads coverage out instead of tightening it.
+        """
+        if not pipeline["spec"].otr_detected:
+            pytest.skip("no OTR correction applied on this dataset")
+        df = pipeline["otr"]
+        near = lambda v: float(((v > 0.8) & (v < 1.2)).mean())
+        before = near(df["gc_corr_norm_cov"].to_numpy())
+        after = near(df["otr_gc_corr_norm_cov"].to_numpy())
+        assert after > before, (
+            f"OTR correction did not tighten coverage: {before:.1%} -> {after:.1%}. "
+            "An inverted ori/ter labelling would do exactly this."
+        )
+        assert after > 0.85
 
     def test_otr_json_matches_golden(self, pipeline, regenerate_goldens):
         from conftest import golden_compare

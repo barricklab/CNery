@@ -33,6 +33,13 @@
       "sha256": "867e0cafc565c79a0e5ec2fa6ec915b5595addac917259e9fac750562f340fa6",
       "bytes": 38729657,
       "description": "LTEE Ara-3 38k generations, one read group; 18-column table with a 7-line footer"
+    },
+    "ltee_ara_p5_75k_exp": {
+      "tag": "testdata-ltee_ara_p5_75k_exp-v1",
+      "file": "ltee_ara_p5_75k_exp.tar.gz",
+      "sha256": "8c479612e217b0b5cb239d09baffc9b51b958cf6b73d0f0574b6b53855f77230",
+      "bytes": 20818834,
+      "description": "LTEE Ara+5 75k generations, exponential phase; --total-only 5-column table with a 4-line footer; the only dataset where OTR correction fires"
     }
   }
 }
