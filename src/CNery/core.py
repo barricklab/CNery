@@ -326,7 +326,7 @@ def read_coverage_table(path):
     return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
-def preprocess(df, win=100, step=100, frag=150):
+def preprocess(df, win=100, step=100, frag=400):
 
     if (step > win):
         return print(
@@ -342,13 +342,25 @@ def preprocess(df, win=100, step=100, frag=150):
     start_coord = int(df_b2c.index[0])
     genome = df_b2c['ref_base']
     genome_len = len(genome)
-    genome_cyc = list(
-        islice(
-            cycle(genome),
-            int(genome_len * 0.75),
-            genome_len + int(genome_len * 1.25)
+    # GC% is measured over max(frag, win) bases centred on each window, because
+    # GC bias acts at the scale of the sequenced fragment rather than at
+    # whatever window size was asked for. `gc_pad` is what that costs on each
+    # side of the window.
+    gc_pad = max((max(int(frag), win) - win) // 2, 0)
+
+    # The reference is circular, so windows near either end draw their padding
+    # from the other end. Carry exactly `gc_pad` bases of wrap-around either
+    # side -- no more, and never less: this used to be a fixed +/-25% of the
+    # genome, which is both larger than needed on a chromosome and too small
+    # whenever the fragment exceeds half the reference, where it silently
+    # produced an out-of-range slice.
+    if genome_len:
+        gc_start = (-gc_pad) % genome_len
+        genome_cyc = list(
+            islice(cycle(genome), gc_start, gc_start + genome_len + 2 * gc_pad)
         )
-    )
+    else:
+        genome_cyc = []
 
     fragseq = []
     fragment = []
@@ -418,29 +430,20 @@ def preprocess(df, win=100, step=100, frag=150):
         window.insert(i, i)
         win_end.insert(i, i + winu)
         lst_win = win_end[(len(win_end) - 1)]
-        i_off = i + int(genome_len * 0.25)
+        # genome_cyc[gc_pad] is genome[0], so this is where window i starts in it.
+        i_off = i + gc_pad
 
-        # If fragment size is greater than the window size calculate the
-        # GC% of the entire fragment covering the coverage window
-        if (frag > win):
-            diff = int((frag - win) / 2)
-            fragseq = genome_cyc[(i_off - diff):((i_off + win) + diff)]
-            fragment.insert(i, ''.join(str(element) for element in fragseq))
-            gcc = ''.join([nucleotide for nucleotide in fragseq
-                           if nucleotide in ['C', 'G']])
-            gccp = (len(gcc) / len(fragseq))
-            gcp_s.insert(i, gccp)
-        # Otherwise use the length of the window to calculate the GC%
-        else:
-            diff = int((win - frag) / 2)
-            fragseq = list(
-                genome_cyc[i_off - diff:(i_off + win) + diff]
-            )
-            fragment.insert(i, ''.join(str(element) for element in fragseq))
-            gcc = ''.join([nucleotide for nucleotide in fragseq
-                           if nucleotide in ['C', 'G']])
-            gccp = (len(gcc) / len(fragseq))
-            gcp_s.insert(i, gccp)
+        # One span, always max(frag, win). This was two branches: `frag > win`
+        # spanned frag, correctly, but the `frag <= win` branch spanned
+        # `2 * win - frag` where its own comment said it used the window length
+        # -- so at -w 200 -f 150 it measured GC over 250 bases, neither the
+        # window nor the fragment.
+        fragseq = genome_cyc[(i_off - gc_pad):((i_off + win) + gc_pad)]
+        fragment.insert(i, ''.join(str(element) for element in fragseq))
+        gcc = ''.join([nucleotide for nucleotide in fragseq
+                       if nucleotide in ['C', 'G']])
+        gccp = (len(gcc) / len(fragseq))
+        gcp_s.insert(i, gccp)
 
         i = i + step
 
@@ -666,7 +669,7 @@ def process_multi_genome(
     output_prefix,
     win=100,
     step=100,
-    frag=150,
+    frag=400,
 ):
     """
     Preprocess every coverage table, pool them for GC correction, plot the pooled bias,

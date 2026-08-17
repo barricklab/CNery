@@ -139,10 +139,16 @@ def main():
         "--frag-size",
         action="store",
         dest="f",
-        default=150,
+        default=400,
         required=False,
         type=int,
-        help="Average fragment size of the sequencing reads.",
+        help=(
+            "Average fragment size of the sequencing library. GC%% is measured "
+            "over this many bases centred on each window, because GC bias acts at "
+            "fragment scale rather than at whatever window size was asked for. "
+            "Ignored when it is smaller than -w, which is then used instead. "
+            "Default: 400."
+        ),
     )
     parser.add_argument(
         "-e",
