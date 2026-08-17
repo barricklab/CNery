@@ -291,21 +291,35 @@ verified against a sha256 pinned in `tests/data/registry.json`, and used only by
 
 ```bash
 conda run -p $PWD/env pytest -m authentic       # this tier only
-CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest   # relocate the ~125 MB cache
+CNERY_TESTDATA_DIR=/big/disk conda run -p $PWD/env pytest   # relocate the ~152 MB cache
 ```
 
-Four datasets, differing where it matters — 0/1/2 read groups, 5/10/18/26 columns, and **4/7/10-line
-footers**. That spread is deliberate: it is real regression coverage for the prefix-based footer
-stripping that replaced `skipfooter=4`.
+Six datasets, differing where it matters — 0/1/2 read groups, 5/10/18/26 columns, 4/7/10-line
+footers, TSV and CSV, one and three sequences, and three different genome lengths. The footer
+spread is real regression coverage for the prefix-based footer stripping that replaced
+`skipfooter=4`.
 
-`ltee_ara_p5_75k_exp` earns its place twice over. It is the only `--total-only` table (5 columns,
-where bam2cov has already summed the strands), and **the only sample where OTR correction fires** —
-an exponential-phase culture, so replication forks are active and the origin-to-terminus gradient is
-real: 1.95x peak to trough, origin ~3.80 Mb and terminus ~1.56 Mb, matching REL606's known ones. The
-other three are stationary-phase and detect nothing. It is also the regression test for the ori/ter
-label swap: `_otr_concentrated_rss` is symmetric under exchanging the two breakpoints, so a mirrored
-fit divides by an inverted ramp and *spreads* coverage out —
-`TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
+Three of them carry the load for a specific area:
+
+- `ltee_ara_p5_75k_exp` — **the only sample where OTR correction fires strongly**, an
+  exponential-phase culture whose replication gradient is real (1.95x peak to trough, origin
+  ~3.80 Mb and terminus ~1.56 Mb, matching REL606's known ones). It is the regression test for the
+  ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging the two breakpoints, so
+  a mirrored fit divides by an inverted ramp and *spreads* coverage out —
+  `TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
+- `cwbi_ssym_ht04` — **the only multi-sequence dataset and the only CSV one**. A chromosome plus
+  two plasmids, so it is the only cover for `process_multi_genome`'s pooled GC fit and its shared
+  global median. Note what it shows: the pooled median keeps the plasmids at 2.82x and 1.88x the
+  chromosome in `norm_raw_cov`, but `run_HMM` refits the single-copy level from whichever sequence
+  it is handed (fitted mu 100.9 / 300.0 / 194.6), so **both plasmids are reported as CN 1**. The
+  relative depth is preserved and then discarded. That follows from "CN calling is per-reference",
+  but it does mean plasmid copy number is not something CNery currently reports.
+- `adp1_mgd06_lb` — the first non-REL606 genome, which is why sequence length and window count are
+  per-`Sequence` rather than the module constants they used to be.
+
+Tests that read a frame or an output file are parametrized **per sequence**, not per dataset.
+Goldens are named `<dataset>_<seq_id>_break_pts.csv` for the same reason — CNery writes one file
+per sequence.
 
 Check the result says *passed*, not *skipped* — an unfetchable dataset skips (with the dataset, URL,
 and error in the reason) rather than failing, which keeps offline work possible but can look like

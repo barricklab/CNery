@@ -20,7 +20,8 @@ and no release is created, so it is safe to run to inspect what would happen. Th
 still runs on a dry run, so a version clash surfaces before you do the real one.
 
 The folder should hold what CNery actually reads: one coverage table per sequence, named
-``<seq_id>.coverage.tsv``. No BAM and no reference FASTA -- they are not inputs, and shipping
+``<seq_id>.coverage.tsv`` or ``<seq_id>.coverage.csv`` -- a dataset may hold several, as
+cwbi_ssym_ht04 does with a chromosome and two plasmids. No BAM and no reference FASTA -- they are not inputs, and shipping
 them only inflates the download. A ``dataset.json`` provenance manifest is generated alongside
 them if absent; fill in its blank fields before publishing, because authentic data without
 provenance stops being reproducible as soon as whoever generated it moves on.

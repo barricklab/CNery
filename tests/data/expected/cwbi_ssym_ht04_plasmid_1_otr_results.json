@@ -1,0 +1,8 @@
+{
+    "Origin window": 1,
+    "Origin coverage (normalized)": NaN,
+    "Terminus window": 116501,
+    "Terminus coverage (normalized)": NaN,
+    "Origin-to-Termius/Bias Ratio": "Not detected",
+    "Correction type": "Ori-ter coordinates fit by coverage"
+}

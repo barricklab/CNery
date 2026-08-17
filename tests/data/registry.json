@@ -40,6 +40,20 @@
       "sha256": "8c479612e217b0b5cb239d09baffc9b51b958cf6b73d0f0574b6b53855f77230",
       "bytes": 20818834,
       "description": "LTEE Ara+5 75k generations, exponential phase; --total-only 5-column table with a 4-line footer; the only dataset where OTR correction fires"
+    },
+    "cwbi_ssym_ht04": {
+      "tag": "testdata-cwbi_ssym_ht04-v1",
+      "file": "cwbi_ssym_ht04.tar.gz",
+      "sha256": "a808fd3cad41d439c6ece75946ea7a0f925825e6d7ebf1bd30cd1d03ed21ba3f",
+      "bytes": 14319403,
+      "description": "Symbiont CWBI HT-04 gen 30; chromosome plus two multi-copy plasmids as CSV --total-only tables; the only multi-sequence and only CSV dataset"
+    },
+    "adp1_mgd06_lb": {
+      "tag": "testdata-adp1_mgd06_lb-v1",
+      "file": "adp1_mgd06_lb.tar.gz",
+      "sha256": "ca38d1b67e06bf24fbd3dfcccd533c7ff5e959c714a630804f6c19123556eb39",
+      "bytes": 13473761,
+      "description": "Acinetobacter baylyi ADP1-ISx, MGD06 LB clone E02; 3.59 Mb reference, TSV --total-only; the first non-REL606 genome"
     }
   }
 }
