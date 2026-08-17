@@ -299,14 +299,29 @@ Bacterial genomes are G-rich on the leading strand and C-rich on the lagging str
     "Separation (fraction of genome)": 0.4903,
     "Cumulative skew amplitude": 151.2949,
     "Replichore skew t-statistic": 34.77,
+    "Replichore skew p-value": 0.001,
+    "Bootstrap surrogates": 1000,
     "Prediction confident": true,
     "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
 }
 ```
 
-`Prediction confident` is false when the sequence is too short to support the inference, when the two extrema are not roughly antipodal (35–65% of the sequence apart, as bidirectional replication implies), or when the two replichores' skew does not separate convincingly. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
+`Prediction confident` requires two things: the two extrema roughly antipodal (35–65% of the sequence apart, as bidirectional replication implies), and a p-value of 0.01 or better. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
 
-Expect `false` on plasmids. They have no bidirectional replication origin, so there is no sign change for the cumulative curve to turn on, and the two extrema you get back are noise. That is the intended answer, not a failure — chromosomes in the same run are unaffected, since the prediction is made per reference.
+#### How the p-value is computed, and how to read it
+
+Adjacent windows are not independent — genome composition varies on scales far longer than one window — so an ordinary *t*-test would badly overstate significance. `Replichore skew t-statistic` is therefore reported as an **effect size only**; its magnitude is inflated by an unknown factor and should not be converted to a p-value.
+
+The p-value instead comes from a **circular block bootstrap**. Contiguous blocks of windows are resampled with replacement around the circle, which preserves local autocorrelation while destroying the long-range two-arm pattern being tested for; the null is "a sequence that wobbles like this one but has no single origin". The full procedure — locating the extrema, then scoring the two arms — is re-run on every surrogate, so choosing the breakpoints by looking at the data is paid for rather than ignored.
+
+Two things to know when reading it:
+
+- **It is floored at `1/(B+1)`.** A real chromosome beats all 1,000 surrogates and reads back exactly `0.001`. That is an upper bound, not a measurement — read it as "p < 0.001". `Bootstrap surrogates` is reported so the floor is visible.
+- **Block length adapts to sequence length.** What governs power is the number of blocks rather than their size, so CNery targets ~20 blocks, bounded to 10–200 windows each. Sequences too short to give both long-enough and numerous-enough blocks simply do not reach significance, which is an honest reflection of how little evidence they carry.
+
+The bootstrap is seeded, so repeated runs on the same input give the same p. It adds roughly 3% to the per-sequence cost (~0.15 s on a 4.6 Mb genome).
+
+Expect `false` on plasmids. They have no bidirectional replication origin, so there is no sign change for the cumulative curve to turn on, and the two extrema you get back are noise — the two in the test data land at `p` = 0.36 and 0.44. That is the intended answer, not a failure, and chromosomes in the same run are unaffected since the prediction is made per reference.
 
 Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers, whatever their depth or growth phase. And it is invariant to circular permutation: a reference whose coordinates start elsewhere predicts the same locus.
 

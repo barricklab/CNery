@@ -278,16 +278,37 @@ are rejected before `get_CNV.main` creates any output directory.
 - Overlapping windows (`step < win`) count each base `win/step` times over in `cum_gc_skew`. That
   is one uniform factor across every window, so it rescales the curve without moving either
   extremum; no stride weighting is applied.
-- The skew estimate's confidence gate is **three conditions, not one**: enough windows, ori/ter
-  35–65% apart (the same band `otr_fit` uses), and a replichore t-statistic clearing 5. The third
-  earns its place — `cwbi_ssym_ht04`'s `plasmid_1` lands *inside* the separation band at 0.444 and
-  is rejected only by t=2.90. Plasmids have no bidirectional origin, so there is no sign change to
-  find, and `Sequence.skew_confident` in `tests/test_authentic.py` records which sequences pass.
+- The skew estimate's confidence gate is **two conditions**: ori/ter 35–65% apart (the same band
+  `otr_fit` uses), and a circular block bootstrap p-value at or below 0.01. There is deliberately
+  **no minimum window count** — the bootstrap subsumes it, since a short sequence cannot reach
+  significance on its own, and one arbitrary constant beats two. `Sequence.skew_confident` in
+  `tests/test_authentic.py` records which sequences pass.
+- **The t-statistic is an effect size, not a test statistic.** Skew is spatially autocorrelated
+  (REL606's ACF is still 0.22 at lag 10), so t's magnitude is inflated by an unknown factor and
+  `t = 34.8` emphatically does not mean `p ≈ 1e-250`. `_replichore_t` deflates the effective sample
+  size by the `win/step` overlap factor, which stops t growing as `sqrt(win/step)` from nothing but
+  a finer stride — but that fixes double-counting only, not the autocorrelation. The p-value is
+  what carries inferential weight; t is retained because it is the readable effect size.
+- `_skew_bootstrap_p` re-runs the **whole** procedure — extrema search included — on every
+  surrogate. The breakpoints are chosen by looking at the data, so a null holding them fixed would
+  ignore that selection and be far too easy to beat.
+- **What governs the bootstrap's power is the NUMBER of blocks, not their length.** Measured on a
+  synthetic switch: 24 blocks puts p at its floor, 12 gives 0.004, 6 gives 0.035 and 3 gives 0.041,
+  whatever the block length. Hence `_skew_block_length` targets `SKEW_TARGET_BLOCKS = 20` and
+  adapts to `n`, rather than taking a fixed length. Bounded to 10–200 windows: at least the local
+  autocorrelation length, and past 200 nothing is gained while blocks are lost.
+- **p is floored at `1/(B+1)` and is an upper bound, not a measurement.** Every real chromosome
+  exhausts all 1000 surrogates and reads back exactly 0.001. `"Bootstrap surrogates"` is in the
+  JSON so that floor is legible from the file alone. Resolving further means `B ≈ 1e6` at ~90 s per
+  sequence, to say something already obvious.
 - The gate sets a flag; it never suppresses a coordinate. `GC_skew/*_gc_skew_results.json` always
-  carries the measured origin, terminus, separation, amplitude and t, so a rejected prediction can
-  be diagnosed from the file and the plot. Contrast the OTR JSON, which discards its coordinates
-  behind `"Not detected"`. Like that file it is written with `allow_nan=False` and stays strict
-  RFC JSON — every value in it is finite by construction, and the assertion is deliberate.
+  carries the measured origin, terminus, separation, amplitude, t and p, so a rejected prediction
+  can be diagnosed from the file and the plot. Contrast the OTR JSON, which discards its
+  coordinates behind `"Not detected"`. Like that file it is written with `allow_nan=False` and
+  stays strict RFC JSON — every value in it is finite by construction, and the assertion is
+  deliberate.
+- The bootstrap is seeded (`seed=0`) so a given input always gives the same p and the goldens stay
+  stable. It costs ~0.15 s on a 4.6 Mb genome against ~4 s for `preprocess`, so roughly 3%.
 - The GC-skew ori/ter is **computed and reported but deliberately not consumed** — OTR correction
   and the HMM still use `otr_fit`'s coverage-derived estimate. The two disagree about which
   sequences even have a usable origin, and that is the expected reading rather than a bug: `otr_fit`

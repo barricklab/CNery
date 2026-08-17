@@ -27,10 +27,15 @@ WIN, STEP = 200, 100
 # at exactly two points. Both units are 6 bp with the same GC content, which
 # keeps gc_percent flat across the join and leaves skew as the only signal.
 LEADING, LAGGING = "GGGGCA", "CCCCGA"
-ARM_UNITS = 500
-ARM_BP = ARM_UNITS * len(LEADING)          # 3000 bp per arm
+# Long enough for the bootstrap to have power. At 24 kb this is 239 windows and
+# ~21 blocks, which is where the p-value reaches its floor; a 6 kb toy gives
+# only ~6 blocks and cannot clear 0.01 however clean its switch is. That is the
+# honest statistical situation for a short sequence rather than a fixture quirk
+# -- see TestBootstrap.
+ARM_UNITS = 2000
+ARM_BP = ARM_UNITS * len(LEADING)          # 12,000 bp per arm
 SWITCH_SEQ = LEADING * ARM_UNITS + LAGGING * ARM_UNITS
-SEQ_BP = len(SWITCH_SEQ)                   # 6000 bp -> 59 windows, over min_windows
+SEQ_BP = len(SWITCH_SEQ)                   # 24,000 bp -> 239 windows
 
 
 def _circular_delta(a, b, length):
@@ -116,6 +121,7 @@ class TestPrediction:
             "Origin window index", "Terminus window index",
             "Windows", "Separation (fraction of genome)",
             "Cumulative skew amplitude", "Replichore skew t-statistic",
+            "Replichore skew p-value", "Bootstrap surrogates",
             "Prediction confident", "Prediction method",
         }
         assert result["Prediction method"] == GC_SKEW_METHOD
@@ -180,12 +186,14 @@ class TestConfidenceGate:
         assert np.isfinite(result["Replichore skew t-statistic"])
 
     def test_too_few_windows_is_not_confident(self, tmp_path):
-        # 10 windows, well under min_windows, but a clean skew switch: rejected
-        # on window count alone.
+        # A handful of windows, but a perfectly clean skew switch. There is no
+        # minimum-window gate any more: the bootstrap has to reject this on its
+        # own, which is the point of dropping that constant.
         short = LEADING * 100 + LAGGING * 100
         _, result = _predict(tmp_path, short, win=600, step=120)
-        assert result["Windows"] < 50
+        assert result["Windows"] < 10
         assert result["Prediction confident"] is False
+        assert result["Replichore skew p-value"] > 0.01
 
     def test_adjacent_extrema_are_not_confident(self, tmp_path):
         # A single G-rich patch in an otherwise skew-free genome puts the two
@@ -196,10 +204,105 @@ class TestConfidenceGate:
         assert result["Separation (fraction of genome)"] < 0.35
         assert result["Prediction confident"] is False
 
+    def test_rejected_prediction_still_reports_a_p_value(self, tmp_path):
+        # Not just the coordinates -- the evidence too, so the rejection can be
+        # read rather than taken on trust.
+        _, result = _predict(tmp_path, "AT" * 1500)
+        assert result["Replichore skew p-value"] == pytest.approx(1.0)
+        assert result["Prediction confident"] is False
+
     def test_rejected_prediction_still_reports_coordinates(self, tmp_path):
         _, result = _predict(tmp_path, "AT" * 1500)
         assert isinstance(result["Origin (bp)"], int)
         assert isinstance(result["Terminus (bp)"], int)
+
+
+class TestBootstrap:
+    """The circular block bootstrap behind the p-value.
+
+    A plain t-test would be indefensible here: skew is spatially autocorrelated,
+    so the t statistic's magnitude is inflated by an unknown factor. The
+    bootstrap builds the null by resampling BLOCKS -- preserving local structure
+    while destroying the global two-arm pattern -- and re-runs the whole
+    procedure, extrema search included, on every surrogate so that choosing the
+    breakpoints from the data is paid for rather than ignored.
+    """
+
+    def test_p_value_is_a_probability(self, tmp_path):
+        _, result = _predict(tmp_path, SWITCH_SEQ)
+        p = result["Replichore skew p-value"]
+        assert 0.0 < p <= 1.0
+
+    def test_p_value_floors_at_one_over_b_plus_one(self, tmp_path):
+        # A clean switch exhausts every surrogate, so p reads back exactly its
+        # floor. This is an upper bound, not a measurement -- which is why
+        # "Bootstrap surrogates" is reported alongside it.
+        df = _windows(tmp_path, SWITCH_SEQ)
+        result = predict_ori_ter_from_skew(
+            df, win=WIN, step=STEP, n_surrogates=200
+        )
+        assert result["Bootstrap surrogates"] == 200
+        assert result["Replichore skew p-value"] == round(1 / 201, 5)
+
+    def test_more_surrogates_lowers_the_floor(self, tmp_path):
+        df = _windows(tmp_path, SWITCH_SEQ)
+        coarse = predict_ori_ter_from_skew(df, win=WIN, step=STEP, n_surrogates=100)
+        fine = predict_ori_ter_from_skew(df, win=WIN, step=STEP, n_surrogates=500)
+        assert fine["Replichore skew p-value"] < coarse["Replichore skew p-value"]
+
+    def test_is_deterministic_for_a_fixed_seed(self, tmp_path):
+        # Goldens depend on this.
+        df = _windows(tmp_path, SWITCH_SEQ)
+        runs = [predict_ori_ter_from_skew(df, win=WIN, step=STEP) for _ in range(2)]
+        assert runs[0] == runs[1]
+
+    def test_seed_changes_only_the_p_value(self, tmp_path):
+        df = _windows(tmp_path, SWITCH_SEQ)
+        a = predict_ori_ter_from_skew(df, win=WIN, step=STEP, seed=1)
+        b = predict_ori_ter_from_skew(df, win=WIN, step=STEP, seed=2)
+        for key in ("Origin (bp)", "Terminus (bp)",
+                    "Replichore skew t-statistic", "Windows"):
+            assert a[key] == b[key], key
+
+    @pytest.mark.parametrize("block", [5, 10, 20])
+    def test_verdict_is_insensitive_to_block_length(self, tmp_path, block):
+        # Block length is a modelling choice, so the conclusion must not ride on
+        # it -- across every length that still leaves enough blocks (>=12 at
+        # this sequence's 239 windows), the verdict is the same.
+        df = _windows(tmp_path, SWITCH_SEQ)
+        result = predict_ori_ter_from_skew(df, win=WIN, step=STEP, block=block)
+        assert result["Prediction confident"] is True
+
+    def test_power_is_lost_when_blocks_get_too_few(self, tmp_path):
+        """What DOES matter is the number of blocks, not their length.
+
+        Pinning this because it is the reason SKEW_TARGET_BLOCKS exists and the
+        reason the default block length is adaptive rather than a constant: with
+        only a handful of blocks, reshuffling them reassembles a two-arm pattern
+        often enough that even a perfectly clean switch stops being significant.
+        """
+        df = _windows(tmp_path, SWITCH_SEQ)
+        n = len(df)
+        many = predict_ori_ter_from_skew(df, win=WIN, step=STEP, block=n // 24)
+        few = predict_ori_ter_from_skew(df, win=WIN, step=STEP, block=n // 4)
+        assert many["Replichore skew p-value"] < few["Replichore skew p-value"]
+        assert many["Prediction confident"] is True
+        assert few["Prediction confident"] is False
+
+    def test_block_length_is_clamped_to_the_sequence(self, tmp_path):
+        # block=10_000 on a 59-window frame must not produce a degenerate
+        # resample or divide by zero; it is clamped to n // 4.
+        df = _windows(tmp_path, SWITCH_SEQ)
+        result = predict_ori_ter_from_skew(df, win=WIN, step=STEP, block=10_000)
+        assert 0.0 < result["Replichore skew p-value"] <= 1.0
+
+    def test_too_short_to_bootstrap_reports_no_surrogates(self, tmp_path):
+        # Under 8 windows there is nothing to resample. Rather than invent a
+        # null, it declines: p = 1.0 and a surrogate count of 0 that says so.
+        short = LEADING * 100 + LAGGING * 100
+        _, result = _predict(tmp_path, short, win=600, step=120)
+        assert result["Bootstrap surrogates"] == 0
+        assert result["Replichore skew p-value"] == pytest.approx(1.0)
 
 
 class TestArtifacts:

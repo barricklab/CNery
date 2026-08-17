@@ -7,6 +7,8 @@
     "Separation (fraction of genome)": 0.3049,
     "Cumulative skew amplitude": 1.569,
     "Replichore skew t-statistic": 2.73,
+    "Replichore skew p-value": 0.44456,
+    "Bootstrap surrogates": 1000,
     "Prediction confident": false,
     "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
 }

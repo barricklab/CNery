@@ -56,6 +56,7 @@ from CNery.core import (
     TOTAL_ONLY_COLUMNS,
     _detect_delimiter,
     _read_coverage_table,
+    _skew_block_length,
     apply_otr_correction,
     fit_otr_bias,
     genome_id_from_path,
@@ -150,10 +151,11 @@ DATASETS = {
          # away -- a weak gradient that neither helps nor harms is the honest reading.
          # Neither plasmid clears the GC-skew gate, which is the expected answer:
          # a plasmid has no bidirectional replication origin, so there is no sign
-         # change for the cumulative curve to turn on. Both are caught by the
-         # replichore t-statistic (2.90 and 2.73 against a floor of 5) rather than
-         # by their size -- plasmid_1 has 232 windows and even lands inside the
-         # 35-65% separation band at 0.444, so separation alone would pass it.
+         # change for the cumulative curve to turn on. Both are rejected by the
+         # bootstrap (p = 0.36 and 0.44) rather than by their size -- plasmid_1
+         # even lands inside the 35-65% separation band at 0.444, so separation
+         # alone would pass it, and both get an adequate 21 and 16 blocks, so the
+         # rejection is on evidence rather than on having too little data.
          Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False,
                   skew_confident=False),
          Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False,
@@ -678,6 +680,27 @@ class TestGCSkewArtifacts:
             pytest.skip("no confident skew prediction on this sequence")
         assert 0.35 <= seq["skew"]["Separation (fraction of genome)"] <= 0.65
 
+    def test_p_value_agrees_with_the_verdict(self, seq):
+        # Every chromosome exhausts the bootstrap and reads back its floor of
+        # 1/(B+1); neither plasmid comes close (0.36 and 0.44). Asserted as a
+        # band rather than exactly, since p is a Monte Carlo estimate.
+        p = seq["skew"]["Replichore skew p-value"]
+        floor = 1 / (seq["skew"]["Bootstrap surrogates"] + 1)
+        if seq["seq"].skew_confident:
+            assert p == pytest.approx(floor, rel=0.01), "expected p at its floor"
+        else:
+            assert p > 0.1, "a sequence with no origin should be nowhere near significant"
+
+    def test_plasmids_are_rejected_on_evidence_not_on_size(self, seq):
+        # The bootstrap replaced a minimum-window gate, so it matters that the
+        # plasmids fail for the right reason. Both get an adequate number of
+        # blocks (21 and 16) and still land at p > 0.1 -- they are rejected
+        # because there is no replichore structure, not because they are short.
+        if seq["seq"].skew_confident:
+            pytest.skip("this sequence has a confident prediction")
+        n = seq["skew"]["Windows"]
+        assert n / _skew_block_length(n) >= 10, "too few blocks to conclude anything"
+
     def test_skew_json_matches_golden(self, seq, regenerate_goldens):
         from conftest import golden_compare
 
@@ -692,7 +715,7 @@ class TestGCSkewArtifacts:
             # facts are what a reviewer needs to see change.
             for key in ("Origin (bp)", "Terminus (bp)",
                         "Origin window index", "Terminus window index",
-                        "Windows", "Prediction confident"):
+                        "Windows", "Bootstrap surrogates", "Prediction confident"):
                 assert got[key] == want[key], key
 
         golden_compare(
