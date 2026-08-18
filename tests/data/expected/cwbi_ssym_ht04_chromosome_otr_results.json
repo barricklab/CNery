@@ -1,9 +1,9 @@
 {
     "Origin window": 3198001,
-    "Origin coverage (normalized)": 1.0421508046278034,
+    "Origin coverage (normalized)": 1.04213597130282,
     "Terminus window": 1596501,
-    "Terminus coverage (normalized)": 0.9691264470856757,
-    "Origin-to-Termius/Bias Ratio": 1.0753507014092165,
+    "Terminus coverage (normalized)": 0.9691250999817099,
+    "Origin-to-Termius/Bias Ratio": 1.0753368902760727,
     "Relative copy number": 1.0,
     "Correction type": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)",
     "Coverage fit r-squared": 0.0047,
@@ -17,9 +17,8 @@
     "Breakpoint source": "GC skew",
     "Residual structure score": -0.78,
     "Residual decorrelation length (bp)": 1677,
-    "Event kind": "inversion",
     "Event p-value": 0.00498,
-    "Event start (bp)": 18001,
-    "Event end (bp)": 62501,
+    "Event start (bp)": 35501,
+    "Event end (bp)": 68501,
     "Event exceeded censoring cap": false
 }

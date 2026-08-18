@@ -741,7 +741,15 @@ class TestResidualStructure:
 
 
 class TestEventCensoring:
-    """One censored refit, with every decision frozen on the uncensored series.
+    """Amplifications and deletions are censored from ONE refit of the tent.
+
+    Real copy-number events pull the fitted ramp toward themselves: measured,
+    adp1_mgd06_lb's free-fit origin lands inside its own CN-3 amplification and
+    cwbi_ssym_ht04's chromosome inside its CN-34 one. The GC-skew arm rescues the
+    coordinates on both but not the AMPLITUDE, because the anchors are still
+    solved on contaminated data.
+
+    Every decision is frozen on the uncensored series.
 
     The gate is frozen because an iterative version of this was prototyped and
     measured, and it manufactures significance. On ramp-free real sequences --
@@ -761,37 +769,50 @@ class TestEventCensoring:
     def test_difference_sigma_ignores_a_broad_event(self):
         """The normaliser must not be inflatable by the thing it is measuring.
 
-        This is why the detector cannot reuse _otr_cusum_range, whose total-
-        variance normaliser the event inflates 14x, flattening a quadratic
-        length-scaling to 1.00/1.42/2.03/2.42.
+        This is why the detector cannot reuse _otr_cusum_range, whose
+        total-variance normaliser a 2x amplification inflates from 0.26 to 0.48
+        across 5-30% of the genome, flattening the statistic from 1.00/1.76/
+        2.94/3.84 to 1.00/1.34/1.79/2.11.
         """
         rng = np.random.default_rng(2)
         r = rng.normal(0, 0.05, 2000)
         clean = _otr_diff_sigma(r)
         r_event = r.copy()
-        r_event[600:1200] += np.linspace(-0.5, 0.5, 600)   # a broad ramp
+        r_event[600:1200] += 0.8                            # a broad level shift
         assert _otr_diff_sigma(r_event) == pytest.approx(clean, rel=0.10)
         assert r_event.std() > 3 * r.std()                  # total variance is not
 
-    def test_detects_an_inversion_a_level_rule_cannot_see(self):
+    def test_detects_an_amplification(self):
         n = 1200
         df = self._tent(n=n)
         cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
         a, b = 400, 640                                     # 20% of the genome
-        cov[a:b] = cov[a:b][::-1]
-        df = df.copy()
-        df["gc_corr_norm_cov"] = cov
+        cov[a:b] *= 2.0
         series, w = _otr_decimate(cov, np.ones(n, dtype=bool))
         m = series.size
         ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
         _, resid, _ = _otr_tent_fit(series, ph[0], w)
-        ca, cb = a * m // n, b * m // n
-        # A level rule is blind: the mean shift is zero by construction.
-        assert abs(resid[ca:cb].mean()) < 0.5 * resid.std()
         ev = _otr_detect_event(resid, w, n_surrogates=200)
         assert ev["p"] <= OTR_EVENT_ALPHA
         lo, hi = ev["cells"]
-        assert lo < cb and hi > ca, "detected interval must overlap the inversion"
+        ca, cb = a * m // n, b * m // n
+        assert lo < cb and hi > ca, "detected interval must overlap the amplification"
+
+    def test_detects_a_deletion(self):
+        n = 1200
+        df = self._tent(n=n)
+        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
+        a, b = 400, 580
+        cov[a:b] *= 0.35
+        series, w = _otr_decimate(cov, np.ones(n, dtype=bool))
+        m = series.size
+        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
+        _, resid, _ = _otr_tent_fit(series, ph[0], w)
+        ev = _otr_detect_event(resid, w, n_surrogates=200)
+        assert ev["p"] <= OTR_EVENT_ALPHA
+        lo, hi = ev["cells"]
+        ca, cb = a * m // n, b * m // n
+        assert lo < cb and hi > ca, "detected interval must overlap the deletion"
 
     def test_declines_on_a_clean_tent(self):
         df = self._tent()
@@ -827,7 +848,7 @@ class TestEventCensoring:
         n = 1200
         df = self._tent(n=n)
         cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
-        cov[300:800] = cov[300:800][::-1]            # 42% of the genome
+        cov[300:800] *= 1.8                          # 42% of the genome
         df = df.copy()
         df["gc_corr_norm_cov"] = cov
         *_, detail = otr_fit(_prep(df), n_surrogates=200, event_add_cap=0.05)
@@ -843,6 +864,6 @@ class TestEventCensoring:
     def test_event_keys_are_null_when_nothing_was_applied(self, gc_corrected_flat):
         *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
-        assert detail["Event kind"] is None
+        assert detail["Event p-value"] is None
         assert detail["Event start (bp)"] is None
         assert detail["Event exceeded censoring cap"] is False

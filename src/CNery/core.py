@@ -1375,16 +1375,15 @@ def _otr_residual_structure(residual, phases, weights, block,
 def _otr_diff_sigma(residual):
     """Noise scale from successive differences, immune to broad events.
 
-    A short-lag difference cancels any smooth long-range structure, so an
-    amplification or an inversion cannot inflate it. That is the whole reason it
-    is here rather than the total residual variance _otr_cusum_range() uses.
+    A short-lag difference cancels any smooth long-range structure, so a broad
+    amplification or deletion cannot inflate it. That is the whole reason it is
+    here rather than the total residual variance _otr_cusum_range() uses.
 
-    Measured on an inversion grown from 5% to 30% of the genome: the raw CUSUM
-    peak scales quadratically with length (1.00, 4.00, 15.91, 33.44 against a
-    predicted 1, 4, 16, 36), but the total-variance sigma the event inflates
-    (0.0089 -> 0.1234, 14x) flattens the standardised statistic to
-    1.00/1.42/2.03/2.42. Normalised by this sigma instead -- which stays at
-    0.0010 throughout -- the scaling is preserved: 1.00/3.93/15.45/32.60.
+    Measured on a 2x amplification grown from 5% to 30% of the genome: the raw
+    CUSUM peak grows 1.00 -> 1.76 -> 2.93 -> 3.87, but the total-variance sigma
+    the event itself inflates (0.2599 -> 0.4762) flattens the standardised
+    statistic to 1.00/1.34/1.79/2.11. This sigma stays at 0.0010 throughout, so
+    the statistic tracks the event instead: 1.00/1.76/2.94/3.84.
 
     Do NOT "unify" this with _otr_cusum_range()'s normaliser. The two have
     opposite jobs: that statistic should absorb real copy-number events so they
@@ -1410,23 +1409,14 @@ def _otr_scan_prefixes(r, w):
 
 
 def _otr_interval_stats(pref, A, B, w_total, sigma):
-    """(level, inversion) standardised statistics for intervals [A, B).
+    """Standardised weighted mean shift over intervals [A, B).
 
-    Two statistics because the two event classes have different shapes, and one
-    of them is invisible to the other's test:
-
-      level     -- a weighted mean shift. Amplifications and deletions.
-      inversion -- the projection on the within-interval centred RAMP. An
-                   inversion mirrors the local replication gradient, giving
-                   residual s*(a + b - 2x): a line crossing zero at the segment
-                   midpoint, whose MEAN SHIFT IS EXACTLY ZERO. Measured at 0.22
-                   to 0.27 sd on real geometry, so the HMM calls CN = 1 straight
-                   through and every level-based rule is blind by construction.
-
-    Both are divided by the difference sigma, never by the total residual
-    variance the event itself inflates.
+    This is a LEVEL statistic: it finds amplifications and deletions, the two
+    event classes that shift a stretch of coverage away from the fitted tent.
+    Divided by the difference sigma, never by the total residual variance the
+    event itself inflates.
     """
-    P0, P1, Q0, Q1, Q2 = pref
+    P0, _, Q0, _, _ = pref
     S = P0[B] - P0[A]
     wi = Q0[B] - Q0[A]
     ok = wi > 0
@@ -1434,13 +1424,7 @@ def _otr_interval_stats(pref, A, B, w_total, sigma):
 
     frac = np.clip(wi_s / w_total, 0.0, 0.999)
     level = np.abs(S) / (sigma * np.sqrt(wi_s * (1.0 - frac)))
-
-    xbar = (Q1[B] - Q1[A]) / wi_s
-    num = (P1[B] - P1[A]) - xbar * S
-    den = (Q2[B] - Q2[A]) - xbar * (Q1[B] - Q1[A])
-    inv = np.abs(num) / (sigma * np.sqrt(np.where(den > 0, den, np.inf)))
-
-    return np.where(ok, level, 0.0), np.where(ok, inv, 0.0)
+    return np.where(ok, level, 0.0)
 
 
 def _otr_event_grid(m):
@@ -1455,21 +1439,19 @@ def _otr_scan(r, w, sigma, starts, widths, w_total, best=True):
     """Max standardised interval statistic over the grid (and where, if `best`)."""
     pref = _otr_scan_prefixes(r, w)
     A = starts[:, None]
-    level, inv = _otr_interval_stats(pref, A, A + widths[None, :], w_total, sigma)
-    T = np.maximum(level, inv)
+    T = _otr_interval_stats(pref, A, A + widths[None, :], w_total, sigma)
     if not best:
         return float(T.max())
     i, j = np.unravel_index(int(np.argmax(T)), T.shape)
-    kind = "level" if level[i, j] >= inv[i, j] else "inversion"
-    return float(T[i, j]), int(starts[i]), int(widths[j]), kind
+    return float(T[i, j]), int(starts[i]), int(widths[j])
 
 
 def _otr_detect_event(residual, weights, n_surrogates=OTR_EVENT_SURROGATES,
                       seed=0, alpha=OTR_EVENT_ALPHA):
-    """The strongest copy-number or inversion event in a tent's residual.
+    """The strongest copy-number event -- amplification or deletion -- in a residual.
 
-    Returns a dict with the interval in cells, which shape won, the statistic,
-    and a block-bootstrap p-value. The null re-runs the whole scan on every
+    Returns a dict with the interval in cells, the statistic, and a
+    block-bootstrap p-value. The null re-runs the whole scan on every
     surrogate, so the p-value already pays for having chosen the interval by
     looking at the data -- the stance _skew_bootstrap_p() and _otr_bootstrap_p()
     already take.
@@ -1477,18 +1459,18 @@ def _otr_detect_event(residual, weights, n_surrogates=OTR_EVENT_SURROGATES,
     BLOCKS ARE DRAWN FROM THE COMPLEMENT of the candidate interval, and the block
     length is measured there too. Measured, this is the difference between a
     working test and a broken one rather than a refinement: resample the whole
-    residual and the event's own blocks build the null, so a 20%-of-genome
-    inversion scoring T = 204 draws a null whose MEDIAN maximum is 154, giving
-    p = 0.06 on an event that is not remotely subtle. Excising the candidate puts
-    the null's 99th percentile at 73 and the p-value on its 1/(B+1) floor, and it
-    does not inflate no-event nulls (0.4-0.7 against 0.24-0.41), so nothing is
-    bought by contaminating it. Same trap _otr_residual_structure() documents for
-    its own null.
+    residual and the event's own blocks build the null, so a 2x amplification
+    over 20% of the genome scoring T = 1802 draws a null whose MEDIAN maximum is
+    1398 and whose 99th percentile is 2562, giving p = 0.18 on an event that is
+    not remotely subtle. Drawing from the complement puts the 99th percentile at
+    1679 and the p-value on its 1/(B+1) floor, and it does not inflate a no-event
+    null (0.52 against 0.39), so nothing is bought by contaminating it. Same trap
+    _otr_residual_structure() documents for its own null.
     """
     r = np.asarray(residual, dtype=float)
     w = np.asarray(weights, dtype=float)
     m = r.size
-    none = {"p": 1.0, "T": 0.0, "cells": None, "kind": None, "surrogates": 0}
+    none = {"p": 1.0, "T": 0.0, "cells": None, "surrogates": 0}
     if m < OTR_MIN_CELLS or w.sum() <= 0:
         return none
 
@@ -1498,7 +1480,7 @@ def _otr_detect_event(residual, weights, n_surrogates=OTR_EVENT_SURROGATES,
 
     w_total = float(w.sum())
     starts, widths = _otr_event_grid(m)
-    t_obs, a, width, kind = _otr_scan(r, w, sigma, starts, widths, w_total)
+    t_obs, a, width = _otr_scan(r, w, sigma, starts, widths, w_total)
 
     outside = np.ones(m, dtype=bool)
     outside[np.arange(a, a + width) % m] = False
@@ -1523,7 +1505,7 @@ def _otr_detect_event(residual, weights, n_surrogates=OTR_EVENT_SURROGATES,
 
     p = (at_least + 1) / (n_surrogates + 1)
     return {"p": float(p), "T": float(t_obs), "cells": (a, a + width),
-            "kind": kind, "surrogates": int(n_surrogates)}
+            "surrogates": int(n_surrogates)}
 
 
 def _otr_cells_to_windows(a, b, m, n):
@@ -1833,27 +1815,20 @@ def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
         "Residual decorrelation length (bp)": (
             None if decorr_bp is None else int(decorr_bp)
         ),
-        # The strongest copy-number or inversion event in the applied tent's
-        # residual. Detection NEVER changes a verdict -- see otr_fit()'s
-        # frozen-gate note. It censors this interval from ONE refit of the
-        # breakpoints and anchors, which is worth 70-87% of the breakpoint error
-        # on a large inversion and removes copy-number contamination from the
-        # fitted amplitude.
+        # The strongest copy-number event -- amplification or deletion -- in the
+        # applied tent's residual. Detection NEVER changes a verdict; see
+        # otr_fit()'s frozen-gate note. It censors this interval from ONE refit
+        # of the breakpoints and anchors, which takes copy-number contamination
+        # out of the fitted amplitude.
         #
-        # "Event kind" is the shape of the RESIDUAL over the detected interval,
-        # not a biological classification: "level" is a mean shift (an
-        # amplification or deletion) and "inversion" a mirrored replichore, whose
-        # mean shift is exactly zero and which no level-based test can see at all.
-        # It is only meaningful for events at least as wide as the narrowest
-        # scanned interval, OTR_EVENT_MIN_FRAC of the sequence. Below that the
-        # scan cannot localise the event and returns the best wide window
-        # containing it -- and a step sitting at an interval's edge projects onto
-        # a ramp, so the label flips. cwbi_ssym_ht04's chromosome is exactly that:
-        # a 2 kb amplification, 0.06% of the genome, reported as "inversion" over
-        # a 44.5 kb interval. The censoring still works there (the applied ratio
-        # goes 1.169 -> 1.075, which is the copy-number contamination coming out
-        # of the amplitude); only the label is unreliable.
-        "Event kind": (event or {}).get("kind"),
+        # The interval is only as sharp as the narrowest scanned width,
+        # OTR_EVENT_MIN_FRAC of the sequence. A smaller event cannot be localised
+        # and the scan returns the best wide window containing it:
+        # cwbi_ssym_ht04's chromosome carries a 2 kb amplification, 0.06% of the
+        # genome, and the reported interval is tens of kb wide. Censoring still
+        # does its job there -- the applied ratio goes 1.169 -> 1.075, which is
+        # the copy number coming out of the amplitude -- but do not read the
+        # bounds as the event's own.
         "Event p-value": _r((event or {}).get("p"), 5),
         "Event start (bp)": None if event_bp is None else int(event_bp[0]),
         "Event end (bp)": None if event_bp is None else int(event_bp[1]),
@@ -2198,12 +2173,13 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # itself once its surrogates come from the censored series. A cap does not
     # help; three of those four appeared after ONE round at ~2% censored.
     #
-    # What the refit does buy, measured against ground truth on an injected
-    # inversion: breakpoint error 65 -> 8 windows at ratio 2.05 (87% better) and
-    # 69 -> 20 at ratio 1.35 (70%), for inversions around 20% of the genome. It
-    # also removes copy-number contamination from the fitted AMPLITUDE, which the
-    # GC-skew arm cannot: on cwbi_ssym_ht04's chromosome roughly 40% of the ramp
-    # being divided out is amplification rather than replication.
+    # What the refit does buy is a fitted AMPLITUDE free of copy number, which
+    # the GC-skew arm cannot supply: it fixes the coordinates but the anchors are
+    # still solved on contaminated data. Measured, adp1_mgd06_lb's free-fit
+    # origin lands INSIDE its own CN-3 amplification and cwbi_ssym_ht04's
+    # chromosome inside its CN-34 one, and censoring takes CWBI's applied ratio
+    # from 1.169 to 1.075 -- roughly 40% of the ramp being divided out of that
+    # chromosome was copy number, not replication.
     event, event_windows, event_capped = None, None, False
     if grid_ok:
         applied_phase = _otr_normalize_phases(

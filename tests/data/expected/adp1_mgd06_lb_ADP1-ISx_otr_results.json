@@ -17,7 +17,6 @@
     "Breakpoint source": "GC skew",
     "Residual structure score": 1.03,
     "Residual decorrelation length (bp)": 43996,
-    "Event kind": "level",
     "Event p-value": 0.00498,
     "Event start (bp)": 2413501,
     "Event end (bp)": 2478001,

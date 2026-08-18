@@ -17,7 +17,6 @@
     "Breakpoint source": "coverage fit",
     "Residual structure score": 3.0,
     "Residual decorrelation length (bp)": 24302,
-    "Event kind": "level",
     "Event p-value": 0.00498,
     "Event start (bp)": 385501,
     "Event end (bp)": 460501,
