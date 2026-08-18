@@ -618,6 +618,24 @@ class TestOriginTerminus:
         else:
             assert data["Correction type"] == "Ori-ter coordinates fit by coverage"
 
+    def test_reported_ratio_reproduces_from_its_own_two_values(self, seq):
+        """The file's arithmetic must check out for a reader who does it by hand.
+
+        This was `yori / (yter + 0.001)`, a divide-by-zero guard that left the
+        printed ratio ~0.1% below what the two coverage values printed directly
+        above it give. yter is a least-squares anchor on a curve clipped at
+        0.1x the median coverage, so it cannot be zero and the guard bought
+        nothing but a file that contradicted itself.
+        """
+        if not seq["seq"].otr_detected:
+            pytest.skip("no ratio reported on this sequence")
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        assert data["Origin-to-Termius/Bias Ratio"] == pytest.approx(
+            data["Origin coverage (normalized)"] / data["Terminus coverage (normalized)"],
+            rel=1e-12,
+        )
+
     def test_skew_sourced_coordinates_agree_with_the_skew_file(self, seq):
         """The two JSONs now share a coordinate and must not be able to disagree."""
         if seq["seq"].otr_source != "GC skew":

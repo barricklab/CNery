@@ -1039,11 +1039,27 @@ OTR_LR_ALPHA = 0.05
 
 
 def _otr_decimate(y, keep, cells=OTR_SCORE_CELLS):
-    """Coverage on a uniform circular grid of cells, over UNCENSORED windows only.
+    """Coverage on a uniform circular grid of cells, with a WEIGHT per cell.
 
-    Each cell takes the mean of the unmasked windows falling in it. Cells with no
-    unmasked window at all -- only reachable inside a deletion longer than one
-    cell -- are filled by circular linear interpolation from their neighbours.
+    Returns (values, weights). Each cell takes the mean of the unmasked windows
+    falling in it, and its weight is HOW MANY there were. Everything downstream
+    scores with those weights, which does two things:
+
+      - A cell with no unmasked window at all contributes nothing, instead of
+        being filled by interpolation from its neighbours. Interpolating was
+        fabricating data that supports whatever trend the neighbours imply, and
+        it was not a rare corner: on CWBI's plasmid_1, 121 of 232 cells had no
+        unmasked window, so 52% of the scored series was invented and the
+        statistic read r-squared 0.175 against 0.085 on the real windows.
+      - A cell holding three windows now counts three times one holding one.
+        Equal-weighting cells silently reweighted the genome wherever censoring
+        was uneven, and it made the decimated statistic disagree with the
+        full-resolution objective otr_fit() actually minimises, which weights
+        per window.
+
+    The cell count is additionally capped at the number of unmasked windows:
+    asking for more cells than there are observations only manufactures empty
+    ones.
 
     Deliberately NOT `y[keep]` compacted into a contiguous circle. That would
     shorten a 20 kb deletion to zero width and bend the tent through the gap;
@@ -1054,25 +1070,24 @@ def _otr_decimate(y, keep, cells=OTR_SCORE_CELLS):
     y = np.asarray(y, dtype=float)
     keep = np.asarray(keep, dtype=bool)
     n = y.size
-    m = int(min(int(cells), n))
-    if m < 1:
-        return np.zeros(0, dtype=float)
+    good = keep & np.isfinite(y)
+    m = int(min(int(cells), n, max(int(good.sum()), 1)))
+    if m < 1 or not good.any():
+        return np.zeros(max(m, 0), dtype=float), np.zeros(max(m, 0), dtype=float)
 
     cell = (np.arange(n) * m) // n
-    good = keep & np.isfinite(y)
-    if not good.any():
-        return np.zeros(m, dtype=float)
+    total = np.bincount(cell[good], weights=y[good], minlength=m).astype(float)
+    weights = np.bincount(cell[good], minlength=m).astype(float)
 
-    total = np.bincount(cell[good], weights=y[good], minlength=m)
-    count = np.bincount(cell[good], minlength=m)
-    out = np.full(m, np.nan, dtype=float)
-    filled = count > 0
-    out[filled] = total[filled] / count[filled]
-
-    if not filled.all():
-        xp = np.flatnonzero(filled)
-        out = np.interp(np.arange(m, dtype=float), xp.astype(float), out[xp], period=float(m))
-    return out
+    values = np.empty(m, dtype=float)
+    filled = weights > 0
+    values[filled] = total[filled] / weights[filled]
+    # Empty cells are given the weighted mean purely so the series has no holes
+    # for the block bootstrap to move around; their weight is 0, so they never
+    # enter any r-squared, and a mean value landing on a weighted position under
+    # resampling is the least informative value it could carry.
+    values[~filled] = values[filled].mean() if filled.any() else 0.0
+    return values, weights
 
 
 def _otr_phase(m, x_ori, x_ter):
@@ -1085,20 +1100,26 @@ def _otr_phase(m, x_ori, x_ter):
     return _otr_design_matrix(np.arange(m, dtype=float), float(x_ori), float(x_ter), float(m))[:, 1]
 
 
-def _otr_normalize_phases(rows):
-    """Mean-centre and unit-normalise each phase row, so scoring is one matmul.
+def _otr_normalize_phases(rows, weights):
+    """Weighted-centre and weighted-unit-normalise each phase row.
 
-    With a centred, unit-norm u the squared correlation is just (u . y_c)^2 over
-    the total sum of squares -- no per-candidate division, no lstsq.
+    With `u` centred and scaled so that sum(w * u^2) == 1, the weighted squared
+    correlation against any series is just (sum(w * u * y_c))^2 / sum(w * y_c^2)
+    -- still one matmul per surrogate batch, no per-candidate division and no
+    lstsq, and now with cells weighted by how many real windows they hold.
     """
     P = np.atleast_2d(np.asarray(rows, dtype=float))
-    P = P - P.mean(axis=1, keepdims=True)
-    norms = np.linalg.norm(P, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return P / norms
+    w = np.asarray(weights, dtype=float)
+    sw = w.sum()
+    if sw <= 0:
+        return np.zeros_like(P)
+    P = P - (P * w).sum(axis=1, keepdims=True) / sw
+    scale = np.sqrt((P * P * w).sum(axis=1, keepdims=True))
+    scale[scale == 0] = 1.0
+    return P / scale
 
 
-def _otr_phase_grid(m, sep_lo=OTR_SEP_LO, sep_hi=OTR_SEP_HI,
+def _otr_phase_grid(m, weights, sep_lo=OTR_SEP_LO, sep_hi=OTR_SEP_HI,
                     n_origins=OTR_GRID_ORIGINS, n_seps=OTR_GRID_SEPARATIONS):
     """(R, m) normalised phase rows over the band-restricted breakpoint grid.
 
@@ -1118,23 +1139,37 @@ def _otr_phase_grid(m, sep_lo=OTR_SEP_LO, sep_hi=OTR_SEP_HI,
             xt = (xo + frac * m) % m
             rows.append(_otr_phase(m, xo, xt))
             bps.append((float(xo), float(xt)))
-    return _otr_normalize_phases(rows), bps
+    return _otr_normalize_phases(rows, weights), bps
 
 
-def _otr_grid_scores(Y, phases):
-    """Best tent r-squared for each column of `Y`, over every row of `phases`.
+def _otr_grid_scores(Y, phases, weights):
+    """Best weighted tent r-squared for each column of `Y`, over `phases`.
 
     `Y` is (m,) or (m, B); the return is (B,). This one function scores the
     OBSERVED series and every surrogate -- the observed call is simply B == 1 --
     so "observed and null were scored the same way" is a property of there being
     one code path, not a convention someone has to maintain.
+
+    `weights` are the per-cell window counts from _otr_decimate(), and they stay
+    FIXED at their lattice positions while the bootstrap resamples values. That
+    is the coherent pairing: where the repeats and deletions sit is a property
+    of the reference, and the null being simulated is "the same censoring
+    geometry, with the genome-scale trend destroyed" -- not "the censoring
+    happened somewhere else".
     """
     Y = np.asarray(Y, dtype=float)
     if Y.ndim == 1:
         Y = Y[:, None]
-    Yc = Y - Y.mean(axis=0, keepdims=True)
-    sst = np.einsum("ij,ij->j", Yc, Yc)
-    C = np.asarray(phases, dtype=float) @ Yc
+    w = np.asarray(weights, dtype=float)
+    sw = w.sum()
+    if sw <= 0:
+        return np.zeros(Y.shape[1], dtype=float)
+
+    Yc = Y - (w[:, None] * Y).sum(axis=0, keepdims=True) / sw
+    sst = w @ (Yc * Yc)
+    # Rows are already weight-normalised, so this is the weighted covariance and
+    # the denominator needs no per-row term.
+    C = (np.asarray(phases, dtype=float) * w) @ Yc
     best = np.max(C * C, axis=0)
     out = np.zeros_like(sst)
     nz = sst > 0
@@ -1191,7 +1226,7 @@ def _otr_block_indices(rng, m, block, size):
     return idx.reshape(size, n_blocks * block)[:, :m] % m
 
 
-def _otr_bootstrap_p(series, phases, observed, block,
+def _otr_bootstrap_p(series, phases, weights, observed, block,
                      n_surrogates=DEFAULT_OTR_SURROGATES, seed=0):
     """Circular block bootstrap p-value for a tent r-squared. Covers BOTH arms.
 
@@ -1234,30 +1269,37 @@ def _otr_bootstrap_p(series, phases, observed, block,
     while done < n_surrogates:
         size = min(chunk, n_surrogates - done)
         idx = _otr_block_indices(rng, m, block, size)
-        scores = _otr_grid_scores(series[idx].T, phases)
+        scores = _otr_grid_scores(series[idx].T, phases, weights)
         at_least += int(np.count_nonzero(scores >= observed))
         done += size
 
     return (at_least + 1) / (n_surrogates + 1), int(n_surrogates)
 
 
-def _otr_tent_fit(series, phase_row):
+def _otr_tent_fit(series, phase_row, weights):
     """(fitted, residual, r_squared) for one normalised phase row.
 
-    With a centred, unit-norm regressor the OLS fit is just the projection, so
-    this needs no lstsq and stays consistent with _otr_grid_scores() by
-    construction.
+    With a weight-centred, weight-unit-norm regressor the weighted least-squares
+    fit is just the projection, so this needs no lstsq and stays consistent with
+    _otr_grid_scores() by construction. Zero-weight cells get a fitted value like
+    any other -- the tent is defined everywhere -- but contribute to neither the
+    coefficient nor the r-squared.
     """
     y = np.asarray(series, dtype=float)
     u = np.asarray(phase_row, dtype=float)
-    yc = y - y.mean()
-    c = float(u @ yc)
-    fitted = y.mean() + c * u
-    sst = float(yc @ yc)
+    w = np.asarray(weights, dtype=float)
+    sw = w.sum()
+    if sw <= 0:
+        return y.copy(), np.zeros_like(y), 0.0
+    ybar = float(w @ y) / sw
+    yc = y - ybar
+    c = float(w @ (u * yc))
+    fitted = ybar + c * u
+    sst = float(w @ (yc * yc))
     return fitted, y - fitted, (c * c / sst if sst > 0 else 0.0)
 
 
-def _otr_lr_statistic(series, skew_phase, phases):
+def _otr_lr_statistic(series, skew_phase, phases, weights):
     """Lambda = m * ln(RSS_skew / RSS_free), plus the two r-squareds.
 
     The two OTR models are NESTED. Both fit the anchor VALUES by ordinary least
@@ -1283,8 +1325,8 @@ def _otr_lr_statistic(series, skew_phase, phases):
     biases the verdict toward the free fit.
     """
     m = np.asarray(series, dtype=float).size
-    r2_skew = float(_otr_grid_scores(series, np.atleast_2d(skew_phase))[0])
-    r2_free = float(_otr_grid_scores(series, phases)[0])
+    r2_skew = float(_otr_grid_scores(series, np.atleast_2d(skew_phase), weights)[0])
+    r2_free = float(_otr_grid_scores(series, phases, weights)[0])
     r2_free = max(r2_free, r2_skew)
     rss_skew, rss_free = 1.0 - r2_skew, 1.0 - r2_free
     if rss_free <= 0 or rss_skew <= 0:
@@ -1301,7 +1343,7 @@ def _otr_lr_statistic(series, skew_phase, phases):
     return max(0.0, m * float(np.log(rss_skew / rss_free))), r2_skew, r2_free
 
 
-def _otr_lr_bootstrap_p(series, skew_phase, phases, observed, block,
+def _otr_lr_bootstrap_p(series, skew_phase, phases, weights, observed, block,
                         n_surrogates=DEFAULT_OTR_SURROGATES, seed=0):
     """Bootstrap p-value for Lambda under the null "the GC-skew tent is the truth".
 
@@ -1336,7 +1378,7 @@ def _otr_lr_bootstrap_p(series, skew_phase, phases, observed, block,
     if m < OTR_MIN_CELLS:
         return 1.0, 0
 
-    fitted, residual, _ = _otr_tent_fit(series, skew_phase)
+    fitted, residual, _ = _otr_tent_fit(series, skew_phase, weights)
     if not np.isfinite(residual).all() or float(residual @ residual) <= 0:
         return 1.0, 0
 
@@ -1348,8 +1390,8 @@ def _otr_lr_bootstrap_p(series, skew_phase, phases, observed, block,
         size = min(chunk, n_surrogates - done)
         idx = _otr_block_indices(rng, m, block, size)
         surro = fitted[:, None] + residual[idx].T
-        r2s = _otr_grid_scores(surro, np.atleast_2d(skew_phase))
-        r2f = np.maximum(_otr_grid_scores(surro, phases), r2s)
+        r2s = _otr_grid_scores(surro, np.atleast_2d(skew_phase), weights)
+        r2f = np.maximum(_otr_grid_scores(surro, phases, weights), r2s)
         with np.errstate(divide="ignore", invalid="ignore"):
             lam = m * np.log((1.0 - r2s) / (1.0 - r2f))
         lam = np.where(np.isfinite(lam), np.maximum(lam, 0.0), 0.0)
@@ -1445,7 +1487,7 @@ def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
     }
 
 
-def _otr_skew_candidate(skew_result, df, series, phases, m):
+def _otr_skew_candidate(skew_result, df, series, phases, weights, m):
     """The GC-skew coordinates as an OTR candidate, or None.
 
     Four ways to get None, and they say different things:
@@ -1489,8 +1531,8 @@ def _otr_skew_candidate(skew_result, df, series, phases, m):
     o_cell = (o_win * m) / n
     t_cell = (t_win * m) / n
 
-    phase = _otr_normalize_phases(_otr_phase(m, o_cell, t_cell))
-    fitted, residual, r2 = _otr_tent_fit(series, phase[0])
+    phase = _otr_normalize_phases(_otr_phase(m, o_cell, t_cell), weights)
+    fitted, residual, r2 = _otr_tent_fit(series, phase[0], weights)
 
     # Anchor values at the skew's breakpoints, on the real windows rather than
     # the decimated ones -- these are what get reported and applied.
@@ -1571,16 +1613,17 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # refinement below, which is what keeps the tested tent and the applied
     # tent the same object. Getting this order wrong is what made them two
     # different searches over one objective.
-    series = _otr_decimate(y, fit_mask)
+    series, cell_w = _otr_decimate(y, fit_mask)
     m = series.size
     grid_ok = m >= OTR_MIN_CELLS
     if grid_ok:
-        phases, grid_bps = _otr_phase_grid(m)
-        proj = phases @ (series - series.mean())
+        phases, grid_bps = _otr_phase_grid(m, cell_w)
+        proj = (phases * cell_w) @ (series - float(cell_w @ series) / cell_w.sum())
         best_row = int(np.argmax(proj * proj))
-        s_free = float(_otr_grid_scores(series, phases)[0])
+        s_free = float(_otr_grid_scores(series, phases, cell_w)[0])
     else:
         phases, grid_bps, best_row = np.zeros((1, max(m, 1))), [(0.0, 0.0)], 0
+        cell_w = np.ones(max(m, 1), dtype=float)
         s_free = 0.0
 
     # ---- Refine, CONSTRAINED to the same band the grid searched ----------
@@ -1701,23 +1744,23 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # tent (the grid's), so the thing being gated and the thing being tested
     # were not the same object. They are now.
     if grid_ok:
-        _, resid_free, _ = _otr_tent_fit(series, phases[best_row])
+        _, resid_free, _ = _otr_tent_fit(series, phases[best_row], cell_w)
         block_free = _otr_block_length(m, _otr_autocorr_length(resid_free), block)
         p_free, surrogates = _otr_bootstrap_p(
-            series, phases, s_free, block_free, n_surrogates, seed
+            series, phases, cell_w, s_free, block_free, n_surrogates, seed
         )
     else:
         p_free, surrogates = 1.0, 0
 
     free_live = bool(p_free <= max_p)
 
-    skew = _otr_skew_candidate(skew_result, df, series, phases, m)
+    skew = _otr_skew_candidate(skew_result, df, series, phases, cell_w, m)
     p_skew, s_skew = None, None
     if skew is not None:
         s_skew = skew["r2"]
         block_skew = _otr_block_length(m, _otr_autocorr_length(skew["residual"]), block)
         p_skew, _ = _otr_bootstrap_p(
-            series, skew["phase"], s_skew, block_skew, n_surrogates, seed
+            series, skew["phase"], cell_w, s_skew, block_skew, n_surrogates, seed
         )
         if skew_max_p is not None and p_skew > skew_max_p:
             skew = None
@@ -1726,10 +1769,10 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # already earned their place -- it is not a substitute for the gates above.
     lam, p_lr = None, None
     if free_live and skew is not None:
-        lam, s_skew, s_free_cmp = _otr_lr_statistic(series, skew["phase"], phases)
+        lam, s_skew, s_free_cmp = _otr_lr_statistic(series, skew["phase"], phases, cell_w)
         block_lr = _otr_block_length(m, _otr_autocorr_length(skew["residual"]), block)
         p_lr, _ = _otr_lr_bootstrap_p(
-            series, skew["phase"][0], phases, lam, block_lr, n_surrogates, seed
+            series, skew["phase"][0], phases, cell_w, lam, block_lr, n_surrogates, seed
         )
         use_free = p_lr <= lr_alpha
     elif free_live:
@@ -1941,7 +1984,16 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         xter = df["win_st"].iloc[ter_idx]
         yori = f1[ori_idx]
         yter = f1[ter_idx]
-        OTR = yori / (yter + 0.001)
+        # Plain yori/yter, so the file's own three numbers agree. It used to be
+        # yori / (yter + 0.001), a divide-by-zero guard that put the reported
+        # ratio ~0.1% below what the two coverage values printed beside it give
+        # (1.06627 against 1.06733 on adp1) -- a reader checking the arithmetic
+        # found it wrong. The guard is also unnecessary here: yter is an
+        # anchor value from the least-squares fit and y_fit is clipped at
+        # otr_floor = 0.1 * median coverage in otr_fit(), so it cannot be zero.
+        # The explicit test is kept because "cannot" is doing work in that
+        # sentence, and a null is honest where a fabricated ratio is not.
+        OTR = float(yori / yter) if yter > 0 else None
     else:
         xori = df["win_st"].iloc[0]
         xter = df["win_end"].iloc[len(df) - 1]

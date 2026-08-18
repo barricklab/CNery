@@ -13,7 +13,7 @@ from CNery.core import (
     _otr_concentrated_rss, _otr_design_matrix, _otr_decimate, _otr_phase,
     _otr_phase_grid, _otr_grid_scores, _otr_normalize_phases, _otr_bootstrap_p,
     _otr_block_length, _otr_autocorr_length, _otr_lr_statistic,
-    _otr_lr_bootstrap_p,
+    _otr_lr_bootstrap_p, _otr_tent_fit,
 )
 
 def _ensure_dirs(base):
@@ -221,9 +221,11 @@ class TestSignificanceGate:
         y = rng.normal(1.0, 0.1, m) + 0.3 * _otr_phase(m, 50, 250)
         sst = float(((y - y.mean()) ** 2).sum())
         x = np.arange(m, dtype=float)
+        w = np.ones(m)
         for bp in [(10.0, 260.0), (300.0, 100.0), (0.0, 250.0), (123.4, 300.7)]:
             rss, _, _ = _otr_concentrated_rss(bp, x, y, float(m))
-            r2 = float(_otr_grid_scores(y, _otr_normalize_phases(_otr_phase(m, *bp)))[0])
+            phase = _otr_normalize_phases(_otr_phase(m, *bp), w)
+            r2 = float(_otr_grid_scores(y, phase, w)[0])
             assert 1.0 - rss / sst == pytest.approx(r2, abs=1e-10)
 
     def test_design_matrix_rows_sum_to_one(self):
@@ -236,9 +238,10 @@ class TestSignificanceGate:
         rng = np.random.default_rng(1)
         m = 200
         s = rng.normal(1.0, 0.1, m)
-        phases, _ = _otr_phase_grid(m)
-        one = _otr_grid_scores(s, phases)
-        many = _otr_grid_scores(np.column_stack([s, s, s]), phases)
+        w = np.ones(m)
+        phases, _ = _otr_phase_grid(m, w)
+        one = _otr_grid_scores(s, phases, w)
+        many = _otr_grid_scores(np.column_stack([s, s, s]), phases, w)
         assert one.shape == (1,)
         assert many.shape == (3,)
         assert np.allclose(many, one[0])
@@ -246,7 +249,9 @@ class TestSignificanceGate:
     def test_scoring_cost_is_capped(self):
         n = 20_000
         y = np.linspace(1.0, 2.0, n)
-        assert _otr_decimate(y, np.ones(n, dtype=bool)).size <= OTR_SCORE_CELLS
+        values, weights = _otr_decimate(y, np.ones(n, dtype=bool))
+        assert values.size <= OTR_SCORE_CELLS
+        assert weights.size == values.size
 
     def test_decimation_keeps_censored_windows_in_place(self):
         """A deletion must keep its WIDTH, not be compacted out of the circle."""
@@ -254,9 +259,58 @@ class TestSignificanceGate:
         y = np.ones(n)
         keep = np.ones(n, dtype=bool)
         keep[400:600] = False
-        out = _otr_decimate(y, keep, cells=100)
-        assert out.size == 100
-        assert np.isfinite(out).all()
+        values, weights = _otr_decimate(y, keep, cells=100)
+        assert values.size == weights.size
+        assert np.isfinite(values).all()
+        # The censored fifth of the genome still occupies a fifth of the
+        # lattice; it is zero-weighted, not removed.
+        assert (weights[40:60] == 0).all()
+        assert (weights[:40] > 0).all() and (weights[60:] > 0).all()
+
+    def test_censored_cells_carry_no_weight(self):
+        """Empty cells must not be INVENTED by interpolation.
+
+        They used to be filled by circular np.interp, which fabricated coverage
+        supporting whatever trend the neighbours implied. That was not a rare
+        corner: on CWBI's plasmid_1, 121 of 232 cells held no unmasked window,
+        so a majority of the scored series was invented and the statistic read
+        r-squared 0.175 against 0.085 on the real windows.
+        """
+        n = 600
+        rng = np.random.default_rng(11)
+        y = rng.normal(1.0, 0.05, n)
+        keep = np.ones(n, dtype=bool)
+        keep[200:400] = False
+        values, weights = _otr_decimate(y, keep, cells=60)
+        w = np.asarray(weights, dtype=float)
+        # Whatever value sits in a zero-weight cell, it cannot move any score.
+        phases, _ = _otr_phase_grid(values.size, w)
+        before = _otr_grid_scores(values, phases, w)
+        perturbed = values.copy()
+        perturbed[w == 0] += 100.0
+        assert _otr_grid_scores(perturbed, phases, w) == pytest.approx(before)
+
+    def test_cells_are_weighted_by_how_many_windows_they_hold(self):
+        """A cell holding three windows counts three times one holding one.
+
+        Equal-weighting cells reweighted the genome wherever censoring was
+        uneven, and made the decimated statistic disagree with the
+        full-resolution objective otr_fit() minimises, which weights per window.
+        """
+        n = 100
+        y = np.ones(n)
+        keep = np.ones(n, dtype=bool)
+        keep[:5] = False          # first cell loses 5 of its 10 windows
+        _, weights = _otr_decimate(y, keep, cells=10)
+        assert weights[0] == 5
+        assert (weights[1:] == 10).all()
+
+    def test_cell_count_never_exceeds_the_observations(self):
+        n = 500
+        keep = np.zeros(n, dtype=bool)
+        keep[:40] = True
+        values, weights = _otr_decimate(np.ones(n), keep, cells=400)
+        assert values.size <= 40
 
 
 class TestBootstrap:
@@ -271,9 +325,10 @@ class TestBootstrap:
 
     def test_p_value_is_a_probability(self):
         s = self._flat()
-        phases, _ = _otr_phase_grid(s.size)
-        obs = float(_otr_grid_scores(s, phases)[0])
-        p, b = _otr_bootstrap_p(s, phases, obs, 20, n_surrogates=200)
+        w = np.ones(s.size)
+        phases, _ = _otr_phase_grid(s.size, w)
+        obs = float(_otr_grid_scores(s, phases, w)[0])
+        p, b = _otr_bootstrap_p(s, phases, w, obs, 20, n_surrogates=200)
         assert 0.0 < p <= 1.0
         assert b == 200
 
@@ -304,8 +359,9 @@ class TestBootstrap:
     def test_too_short_to_bootstrap_declines(self):
         """Under OTR_MIN_CELLS there is nothing to resample; it says so."""
         s = self._flat(m=10)
-        phases, _ = _otr_phase_grid(10)
-        p, b = _otr_bootstrap_p(s, phases, 0.5, 3, n_surrogates=100)
+        w = np.ones(10)
+        phases, _ = _otr_phase_grid(10, w)
+        p, b = _otr_bootstrap_p(s, phases, w, 0.5, 3, n_surrogates=100)
         assert (p, b) == (1.0, 0)
 
     def test_block_length_grows_with_autocorrelation(self):
@@ -344,9 +400,9 @@ class TestBootstrap:
         rng = np.random.default_rng(3)
         series = 1.0 + 0.5 * phase + rng.normal(0, 0.05, m)
         raw_tau = _otr_autocorr_length(series)
-        norm = _otr_normalize_phases(phase)
-        yc = series - series.mean()
-        resid = series - (series.mean() + float(norm[0] @ yc) * norm[0])
+        w = np.ones(m)
+        norm = _otr_normalize_phases(phase, w)
+        _, resid, _ = _otr_tent_fit(series, norm[0], w)
         assert _otr_autocorr_length(resid) < raw_tau / 5
 
 
@@ -438,30 +494,30 @@ class TestBreakpointArbitration:
         """Grid snapping can otherwise put a nested model behind the free one."""
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03))
-        series = _otr_decimate(
+        series, w = _otr_decimate(
             df["gc_corr_norm_cov"].to_numpy(float), np.ones(n, dtype=bool)
         )
         m = series.size
-        phases, _ = _otr_phase_grid(m)
+        phases, _ = _otr_phase_grid(m, w)
         # A separation of 30% of the genome, outside the 35-65% band, so the
         # skew tent is genuinely not in the free model's search set.
-        skew_phase = _otr_normalize_phases(_otr_phase(m, 0, int(0.30 * m)))
-        lam, _, _ = _otr_lr_statistic(series, skew_phase, phases)
+        skew_phase = _otr_normalize_phases(_otr_phase(m, 0, int(0.30 * m)), w)
+        lam, _, _ = _otr_lr_statistic(series, skew_phase, phases, w)
         assert lam >= 0.0
 
     def test_identical_breakpoints_give_p_one(self):
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03))
-        series = _otr_decimate(
+        series, w = _otr_decimate(
             df["gc_corr_norm_cov"].to_numpy(float), np.ones(n, dtype=bool)
         )
         m = series.size
-        phases, _bps = _otr_phase_grid(m)
-        best = int(np.argmax(np.abs(phases @ (series - series.mean()))))
-        lam, _, _ = _otr_lr_statistic(series, phases[best], phases)
+        phases, _bps = _otr_phase_grid(m, w)
+        best = int(np.argmax(np.abs((phases * w) @ (series - series.mean()))))
+        lam, _, _ = _otr_lr_statistic(series, phases[best], phases, w)
         assert lam == pytest.approx(0.0, abs=1e-9)
         p, _ = _otr_lr_bootstrap_p(
-            series, phases[best], phases, lam,
+            series, phases[best], phases, w, lam,
             _otr_block_length(m, 5), n_surrogates=100
         )
         assert p == pytest.approx(1.0)

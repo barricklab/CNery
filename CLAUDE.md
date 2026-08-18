@@ -252,6 +252,13 @@ are rejected before `get_CNV.main` creates any output directory.
   median of `gc_corr_norm_cov`, and passed *into* `apply_otr_correction` rather than carried on the
   frame: it is one scalar per sequence, and a constant column would add 226–407 kB to an 8.3 MB
   `CNV.csv`.
+- `"Origin-to-Termius/Bias Ratio"` is plain `yori / yter`, so the file's own three numbers agree. It
+  used to be `yori / (yter + 0.001)` — a divide-by-zero guard that put the reported ratio ~0.1% below
+  what the two coverage values printed beside it give (1.06627 against 1.06733 on `adp1_mgd06_lb`),
+  so a reader checking the arithmetic found it wrong. `yter` is a least-squares anchor on a curve
+  already clipped at `otr_floor = 0.1 x` the median coverage, so it cannot be zero; the explicit
+  `yter > 0` test remains and emits `null` rather than a fabricated number.
+  `TestOriginTerminus::test_reported_ratio_reproduces_from_its_own_two_values` pins it.
 - **That JSON must stay strict JSON.** breseq parses it with nlohmann, which has no `allow_nan`, so a
   single bare `NaN` makes the whole file unparseable and silently costs it all OTR reporting.
   `_json_safe` maps non-finite values to `null` on the way out. Two further constraints from the same
@@ -318,6 +325,19 @@ are rejected before `get_CNV.main` creates any output directory.
   least-squares solve, which is what makes scoring a whole breakpoint grid across 1000 surrogates
   affordable. It is the *same* objective the Nelder–Mead search minimizes, not an approximation.
   Do not "simplify" `_otr_grid_scores` back into a loop over `minimize`.
+- **The decimated series carries a WEIGHT per cell, and empty cells weigh nothing.** `_otr_decimate`
+  returns `(values, weights)`, the weight being how many unmasked windows fell in that cell. Cells
+  with none used to be filled by circular `np.interp` — fabricating coverage that supports whatever
+  trend the neighbours imply, and not rarely: on CWBI's `plasmid_1`, 121 of 232 cells held no
+  unmasked window, so **52% of the scored series was invented** and the statistic read r² 0.175
+  (p = 0.034) against 0.120 (p = 0.099) once the fabrication was removed. The weighting also makes a
+  cell holding three windows count three times one holding one, which is what the full-resolution
+  objective does; equal-weighting cells silently reweighted the genome wherever censoring was uneven.
+  The cell count is capped at the number of unmasked windows, since asking for more cells than
+  observations only manufactures empty ones. In the bootstrap the **weights stay fixed at their
+  lattice positions while values are resampled** — where the repeats and deletions sit is a property
+  of the reference, and the null is "same censoring geometry, trend destroyed", not "the censoring
+  happened elsewhere".
 - **The free search is constrained to the band, and that constraint is load-bearing.** It is
   parametrised as `(x_ori, separation)` with `separation` a box bound, seeded from the grid's argmax
   and refined by Nelder–Mead. Unconstrained, this objective's global optimum is usually **not a tent
