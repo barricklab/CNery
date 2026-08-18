@@ -692,9 +692,22 @@ class TestOriginTerminus:
                 got = json.load(fh)
             with open(want_path) as fh:
                 want = json.load(fh)
-            assert got["Origin-to-Termius/Bias Ratio"] == want["Origin-to-Termius/Bias Ratio"]
+            # Detected-or-not is the structural claim and is compared exactly;
+            # the ratio itself is an optimizer output, so it gets a tolerance for
+            # the same reason "Relative copy number" does. Comparing it exactly
+            # made this golden fail on a 1e-6 change in the breakpoints, which is
+            # noise about the shape of the tent rather than a change in what
+            # CNery decided.
+            got_ratio, want_ratio = (got["Origin-to-Termius/Bias Ratio"],
+                                     want["Origin-to-Termius/Bias Ratio"])
+            assert isinstance(got_ratio, str) == isinstance(want_ratio, str)
+            if isinstance(want_ratio, str):
+                assert got_ratio == want_ratio
+            else:
+                assert got_ratio == pytest.approx(want_ratio, rel=1e-4)
             assert got["Origin window"] == want["Origin window"]
             assert got["Terminus window"] == want["Terminus window"]
+            assert got["Breakpoint source"] == want["Breakpoint source"]
             # A float, so compared with tolerance -- LOWESS and scipy.optimize drift
             # across library versions.
             assert got["Relative copy number"] == pytest.approx(

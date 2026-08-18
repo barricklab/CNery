@@ -318,6 +318,28 @@ are rejected before `get_CNV.main` creates any output directory.
   least-squares solve, which is what makes scoring a whole breakpoint grid across 1000 surrogates
   affordable. It is the *same* objective the Nelder–Mead search minimizes, not an approximation.
   Do not "simplify" `_otr_grid_scores` back into a loop over `minimize`.
+- **The free search is constrained to the band, and that constraint is load-bearing.** It is
+  parametrised as `(x_ori, separation)` with `separation` a box bound, seeded from the grid's argmax
+  and refined by Nelder–Mead. Unconstrained, this objective's global optimum is usually **not a tent
+  at all**: as separation → 0 the short arc vanishes and the regressor tends to
+  `1 - ((x - x_ori) mod L)/L`, a circular **sawtooth** — a straight line across the genome with one
+  free discontinuity. Same two parameters, strictly larger shape class (any monotone drift *plus* one
+  step), so RSS is monotone non-increasing as separation shrinks unless the coverage really is
+  V-shaped. Measured: fitting the pure sawtooth family alone reproduces the unconstrained optimum
+  (adp1 r² 0.1130 vs 0.1138, break at window 4820 vs 4821.2), and on adp1 that break sits on a real
+  2.7× amplification edge — it was absorbing a copy-number step, not a replication ramp. Over 40 flat
+  AR(1) nulls the unconstrained optimum landed below 5% separation 20 times and in-band 6.
+- **This was never an optimiser weakness.** Brute force (500×500 grid + local refinement + 600 random
+  restarts) confirms multi-start Nelder–Mead finds the exact global optimum on 6 of 8 authentic
+  sequences and misses by ≤0.16% on the other two. Do not "fix" the search; the constraint is what
+  matters. A fit pinned *at* the 0.35 bound is the honest signal that there is no interior optimum.
+- Two seeding details that cost real work before: seed `k` and seed `k+4` used to be
+  `(s, s+L/2)` and `(s+L/2, s)` — the same **unordered** pair, and the objective is symmetric under
+  swap, so four of nine starts returned bit-identical results. And scipy perturbs an exactly-zero
+  coordinate by an absolute `0.00025` instead of a relative 5%, which froze `x_ori` to a total
+  excursion of 0.002 windows on two sequences — a 1-D search in disguise. Seeds are now offset by
+  half a step so no coordinate is ever 0. The old masked argmax/argmin seed is gone: it converged to
+  a strictly worse minimum on five of eight sequences and never uniquely won.
 - The old gate was **separation plus a vacuous `bias_threshold`**: the label swap guarantees
   `y_ori >= y_ter`, so `ratio > 1.0` reduced to `y_ter > 0` and nothing ever tested the tent against
   a null. It is now separation **and** a circular block bootstrap at p ≤ 0.01, on a series decimated

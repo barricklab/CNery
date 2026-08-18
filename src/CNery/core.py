@@ -963,6 +963,13 @@ OTR_MAX_P = 0.01
 #: Origin and terminus must be roughly antipodal, consistent with bidirectional
 #: replication. predict_ori_ter_from_skew() defaults to this same band, so the
 #: two estimates are gated on one decision rather than two copies of it.
+#:
+#: These bound a SIGNED separation (x_ter - x_ori) mod L, which is how both
+#: _otr_phase_grid() and otr_fit()'s refinement use them, and there the two ends
+#: are distinct: s and L-s give the same unordered breakpoint pair. As a bound
+#: on CIRCULAR distance -- min(s, L-s), which cannot exceed L/2 -- only the 0.35
+#: end can ever bind, so do not reintroduce a `<= OTR_SEP_HI * genome_len` test
+#: on that quantity and expect it to do anything.
 OTR_SEP_LO, OTR_SEP_HI = 0.35, 0.65
 
 #: The coverage series is decimated to at most this many uniform circular cells
@@ -1378,15 +1385,15 @@ def _otr_lr_bootstrap_p(series, skew_phase, phases, observed, block,
 # coverage or a real deletion's near-zero coverage cannot distort the
 # fitted breakpoints or anchor values.
 #
-# The concentrated RSS surface has kinks wherever a window switches which
-# arc it belongs to, so Nelder-Mead is run from several starting points
-# spread evenly around the circle (each paired with its antipode, since
-# bidirectional replication puts ori/ter roughly opposite each other),
-# plus the masked argmax/argmin seed used previously, and the lowest-RSS
-# result across all starts is kept. This guards against a single bad seed
-# landing in a worse local optimum. Each fit is fast (well under a second
-# even at ~10,000 windows with the default 9 seeds), so the multi-start
-# adds negligible cost.
+# The search is a band-constrained multi-start: the exhaustive grid's argmax
+# plus n_seeds origins spread around the circle, each refined by Nelder-Mead
+# over (x_ori, separation), lowest RSS kept. Multi-start is for genuine
+# MULTIMODALITY -- CWBI's plasmid_1 has 74 distinct local minima over 111
+# usable windows -- and not, as this comment used to claim, for the kinks
+# where a window switches arcs. Those are real (2*n_fit lines in the parameter
+# plane, one per window per axis) but measured at ~0.03% of the local slope,
+# and with xatol=0.5 the simplex terminates inside a single smooth cell
+# without ever resolving one. Each fit is fast, so the multi-start is cheap.
 #
 # Because every distance here is computed modulo genome_len, the fit is
 # agnostic to where the genome's coordinate origin (position 0/1) happens
@@ -1546,8 +1553,6 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     o_idx_seed = int(np.nanargmax(y_for_max))
     t_idx_seed = int(np.nanargmin(y_for_min))
 
-    print(f'o_idx_seed:{o_idx_seed} and t_idx_seed: {t_idx_seed}')
-
     # Fit using only unmasked windows -- deletions/repeats never inform
     # the breakpoint search or the anchor-value least-squares solve.
     fit_mask = ~exclude
@@ -1560,26 +1565,92 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         print("OTR bias not detected (insufficient clean windows)")
         return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail()
 
-    # Multi-start: the masked argmax/argmin seed, plus n_seeds evenly
-    # spaced positions around the circle, each paired with its antipode.
-    seeds = [(o_idx_seed, t_idx_seed)]
+    # ---- The statistic's exhaustive grid, computed FIRST ------------------
+    #
+    # It both supplies the observed statistic for the bootstrap and seeds the
+    # refinement below, which is what keeps the tested tent and the applied
+    # tent the same object. Getting this order wrong is what made them two
+    # different searches over one objective.
+    series = _otr_decimate(y, fit_mask)
+    m = series.size
+    grid_ok = m >= OTR_MIN_CELLS
+    if grid_ok:
+        phases, grid_bps = _otr_phase_grid(m)
+        proj = phases @ (series - series.mean())
+        best_row = int(np.argmax(proj * proj))
+        s_free = float(_otr_grid_scores(series, phases)[0])
+    else:
+        phases, grid_bps, best_row = np.zeros((1, max(m, 1))), [(0.0, 0.0)], 0
+        s_free = 0.0
+
+    # ---- Refine, CONSTRAINED to the same band the grid searched ----------
+    #
+    # Parametrised as (x_ori, separation) rather than (x_ori, x_ter) so the
+    # band is a box constraint scipy can hold, instead of a filter applied to
+    # the answer afterwards. That matters more than it looks: unconstrained,
+    # this objective's global optimum is usually NOT a tent at all. As the
+    # separation goes to zero the short arc vanishes and the regressor tends to
+    # 1 - ((x - x_ori) mod L)/L -- a circular SAWTOOTH, a straight line across
+    # the whole genome with one free discontinuity. Same two parameters, but a
+    # strictly larger shape class: it fits any monotone drift plus one step,
+    # so RSS is monotone non-increasing as the separation shrinks unless the
+    # coverage really is V-shaped. Measured over 40 flat AR(1) nulls the free
+    # optimum landed below 5% separation 20 times and inside the band 6; on
+    # adp1_mgd06_lb it parks on a real 2.7x amplification edge and scores
+    # r-squared 0.114 against 0.049 for the best genuine tent, and on
+    # ltee_ara_m3_38k it comes to rest on the 1-window guard in
+    # _otr_concentrated_rss, which is the only thing stopping the descent.
+    #
+    # The old code let the search find that and then rejected it by separation
+    # afterwards -- so a degenerate optimum VETOED whatever real tent was
+    # there, rather than deferring to it. A 6% coverage step is enough to
+    # trigger it while the grid still reports p = 0.002.
+    lo_sep, hi_sep = OTR_SEP_LO * genome_len, OTR_SEP_HI * genome_len
+
+    def _rss_at(p):
+        return _otr_concentrated_rss((p[0], p[0] + p[1]), x_fit, y_fit_data, genome_len)[0]
+
+    # Seeds are (x_ori, separation). The grid argmax comes first -- it is a
+    # global search of the band, so the refinement starts from the right basin
+    # rather than hoping one of the spread seeds lands in it. The spread seeds
+    # are offset by half a step so no coordinate is ever exactly 0: scipy
+    # builds its initial simplex with a RELATIVE 5% perturbation except on an
+    # exactly-zero coordinate, which gets an absolute 0.00025 -- measured, that
+    # froze x_ori to a total excursion of 0.002 windows on two of the eight
+    # authentic sequences, a one-dimensional search in disguise.
+    #
+    # They are also no longer paired with antipodes. Separation is now its own
+    # coordinate, so seed k and seed k+4 used to be the same UNORDERED pair and
+    # returned bit-identical results on every sequence -- four of the nine
+    # starts bought nothing. The masked argmax/argmin seed is gone too: it
+    # converged to a strictly worse minimum on five of eight sequences and
+    # never uniquely won.
+    seeds = []
+    if grid_ok:
+        go, gt = grid_bps[best_row]
+        scale = genome_len / m
+        seeds.append((go * scale, ((gt - go) % m) * scale))
     for k in range(n_seeds):
-        s = (k / n_seeds) * genome_len
-        seeds.append((s, (s + genome_len / 2.0) % genome_len))
+        seeds.append((((k + 0.5) / n_seeds) * genome_len, 0.5 * genome_len))
 
     best = None
     for x0 in seeds:
+        x0 = (float(x0[0]), float(np.clip(x0[1], lo_sep, hi_sep)))
         res = minimize(
-            lambda p: _otr_concentrated_rss(p, x_fit, y_fit_data, genome_len)[0],
+            _rss_at,
             x0=list(x0),
             method="Nelder-Mead",
+            bounds=[(-genome_len, 2.0 * genome_len), (lo_sep, hi_sep)],
             options={"xatol": 0.5, "fatol": 1e-8, "maxiter": 2000},
         )
-        rss, y_ori_cand, y_ter_cand = _otr_concentrated_rss(res.x, x_fit, y_fit_data, genome_len)
+        cand = (res.x[0], res.x[0] + res.x[1])
+        rss, y_ori_cand, y_ter_cand = _otr_concentrated_rss(
+            cand, x_fit, y_fit_data, genome_len
+        )
         if not np.isfinite(rss):
             continue
         if best is None or rss < best[0]:
-            best = (rss, res.x[0], res.x[1], y_ori_cand, y_ter_cand)
+            best = (rss, cand[0], cand[1], y_ori_cand, y_ter_cand)
 
     if best is None:
         y_flat = np.repeat(np.mean(y), n)
@@ -1591,9 +1662,9 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # Orient the labels by the fitted anchor values: the origin is whichever
     # anchor came out higher. _otr_concentrated_rss() is symmetric under
     # swapping the two breakpoints -- the same tent, the same residuals, the
-    # same RSS -- and the seeds below are blind antipodal pairs, so which one
-    # is returned as x_ori is arbitrary, and everything downstream reads y_ori
-    # as the PEAK. Note _otr_skew_candidate() deliberately does NOT do this: its
+    # same RSS -- so which one comes back as x_ori is arbitrary, and everything
+    # downstream reads y_ori as the PEAK. Note _otr_skew_candidate() does NOT do
+    # this: its
     # labels come from the reference sequence, so an inversion there is evidence
     # against the prediction rather than a bookkeeping detail.
     if y_ori_opt < y_ter_opt:
@@ -1611,8 +1682,6 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     o_idx = int(round(x_ori_opt)) % n
     t_idx = int(round(x_ter_opt)) % n
 
-    print(f'fitted x_ori:{x_ori_opt:.2f} and x_ter: {x_ter_opt:.2f}')
-
     # ---- Is this tent real, and whose breakpoints do we believe? -----------
     #
     # There used to be a `magnitude_ok` here comparing the anchor ratio against
@@ -1623,25 +1692,24 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # divided by noise. Both statistics below are computed unconditionally, even
     # when the answer is no, so a rejected fit stays diagnosable from the JSON --
     # the same choice predict_ori_ter_from_skew() makes.
-    circular_dist = min(abs(x_ori_opt - x_ter_opt), genome_len - abs(x_ori_opt - x_ter_opt))
-    separation_ok = (OTR_SEP_LO * genome_len <= circular_dist <= OTR_SEP_HI * genome_len)
-
-    series = _otr_decimate(y, fit_mask)
-    m = series.size
-    phases, _ = _otr_phase_grid(m) if m >= OTR_MIN_CELLS else (np.zeros((1, max(m, 1))), [])
-
-    if m >= OTR_MIN_CELLS:
-        s_free = float(_otr_grid_scores(series, phases)[0])
-        best_row = int(np.argmax(np.abs(phases @ (series - series.mean()))))
+    #
+    # There is also no `separation_ok` any more, because there is nothing left
+    # for it to catch: the refinement above is box-constrained to the band, so
+    # every candidate it can return is in it by construction. It used to be a
+    # sanity filter on the optimiser's output masquerading as a property of the
+    # hypothesis -- and it was ANDed with a p-value computed from a DIFFERENT
+    # tent (the grid's), so the thing being gated and the thing being tested
+    # were not the same object. They are now.
+    if grid_ok:
         _, resid_free, _ = _otr_tent_fit(series, phases[best_row])
         block_free = _otr_block_length(m, _otr_autocorr_length(resid_free), block)
         p_free, surrogates = _otr_bootstrap_p(
             series, phases, s_free, block_free, n_surrogates, seed
         )
     else:
-        s_free, p_free, surrogates = 0.0, 1.0, 0
+        p_free, surrogates = 1.0, 0
 
-    free_live = bool(separation_ok and p_free <= max_p)
+    free_live = bool(p_free <= max_p)
 
     skew = _otr_skew_candidate(skew_result, df, series, phases, m)
     p_skew, s_skew = None, None
@@ -1655,9 +1723,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
             skew = None
 
     # The likelihood ratio only arbitrates between two candidates that have each
-    # already earned their place. Running it in place of the gates is the failure
-    # mode: fed an out-of-band Nelder-Mead spike against a band-restricted null,
-    # it hands a no-gradient sequence to the coverage fit at p = 0.001.
+    # already earned their place -- it is not a substitute for the gates above.
     lam, p_lr = None, None
     if free_live and skew is not None:
         lam, s_skew, s_free_cmp = _otr_lr_statistic(series, skew["phase"], phases)
@@ -1672,9 +1738,8 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         use_free = False
     else:
         y_fit = np.repeat(np.mean(y), n)
-        why = "separation %.3f outside band" % (circular_dist / genome_len) if not separation_ok \
-            else "p=%.4f" % p_free
-        print(f"OTR bias not detected ({why}; no usable GC-skew prediction)")
+        print(f"OTR bias not detected (coverage fit p={p_free:.4f}; "
+              "no usable GC-skew prediction)")
         return y, y_fit, o_idx, t_idx, False, _otr_detail(
             s_free=s_free, p_free=p_free, s_skew=s_skew, p_skew=p_skew,
             surrogates=surrogates, skew_result=skew_result, source="not corrected",
