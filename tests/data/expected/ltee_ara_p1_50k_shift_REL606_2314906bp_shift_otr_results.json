@@ -1,9 +1,9 @@
 {
-    "Origin window": 1516001,
-    "Origin coverage (normalized)": 1.1607355655918836,
-    "Terminus window": 3350001,
-    "Terminus coverage (normalized)": 0.8620853141951255,
-    "Origin-to-Termius/Bias Ratio": 1.3464277218033682,
+    "Origin window": 1592501,
+    "Origin coverage (normalized)": 1.1462272464190804,
+    "Terminus window": 3384501,
+    "Terminus coverage (normalized)": 0.8585461929150295,
+    "Origin-to-Termius/Bias Ratio": 1.3350792955324684,
     "Relative copy number": 1.0,
     "Correction type": "Ori-ter coordinates fit by coverage",
     "Coverage fit r-squared": 0.4267,
@@ -15,6 +15,11 @@
     "Coverage vs skew likelihood-ratio p-value": 0.003,
     "Bootstrap surrogates": 1000,
     "Breakpoint source": "coverage fit",
-    "Residual structure score": 2.62,
-    "Residual decorrelation length (bp)": 24302
+    "Residual structure score": 3.0,
+    "Residual decorrelation length (bp)": 24302,
+    "Event kind": "level",
+    "Event p-value": 0.00498,
+    "Event start (bp)": 385501,
+    "Event end (bp)": 460501,
+    "Event exceeded censoring cap": false
 }

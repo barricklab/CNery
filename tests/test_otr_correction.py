@@ -14,7 +14,8 @@ from CNery.core import (
     _otr_phase_grid, _otr_grid_scores, _otr_normalize_phases, _otr_bootstrap_p,
     _otr_block_length, _otr_autocorr_length, _otr_lr_statistic,
     _otr_lr_bootstrap_p, _otr_tent_fit, _otr_cusum_range,
-    _otr_residual_structure, OTR_STRUCTURE_SURROGATES,
+    _otr_residual_structure, OTR_STRUCTURE_SURROGATES, _otr_diff_sigma,
+    _otr_detect_event, _otr_cells_to_windows, OTR_EVENT_ALPHA,
 )
 
 def _ensure_dirs(base):
@@ -737,3 +738,111 @@ class TestResidualStructure:
         assert bias is True
         assert detail["Residual structure score"] is not None
         assert detail["Residual decorrelation length (bp)"] > 0
+
+
+class TestEventCensoring:
+    """One censored refit, with every decision frozen on the uncensored series.
+
+    The gate is frozen because an iterative version of this was prototyped and
+    measured, and it manufactures significance. On ramp-free real sequences --
+    each authentic sequence with its own best-fit tent divided out, so there is
+    no ramp by construction -- letting censoring feed back into the detection
+    p-value took the false-positive rate from 0/8 to 4/8 at a nominal 1%,
+    inventing ratios up to 1.26 from starting p-values as high as 0.918.
+    Excising 1-2% of the windows removes 87-98% of the variance the bootstrap
+    was calibrated against, and a null drawn from the censored series cannot
+    defend itself. A cap does not fix it; three of those four appeared after one
+    round at ~2% censored.
+    """
+
+    def _tent(self, n=1200, ratio=1.8, sd=0.03, rho=0.7, seed=6):
+        return _make_tent_df(n=n, o=300, t=900, ratio=ratio, sd=sd, rho=rho, seed=seed)
+
+    def test_difference_sigma_ignores_a_broad_event(self):
+        """The normaliser must not be inflatable by the thing it is measuring.
+
+        This is why the detector cannot reuse _otr_cusum_range, whose total-
+        variance normaliser the event inflates 14x, flattening a quadratic
+        length-scaling to 1.00/1.42/2.03/2.42.
+        """
+        rng = np.random.default_rng(2)
+        r = rng.normal(0, 0.05, 2000)
+        clean = _otr_diff_sigma(r)
+        r_event = r.copy()
+        r_event[600:1200] += np.linspace(-0.5, 0.5, 600)   # a broad ramp
+        assert _otr_diff_sigma(r_event) == pytest.approx(clean, rel=0.10)
+        assert r_event.std() > 3 * r.std()                  # total variance is not
+
+    def test_detects_an_inversion_a_level_rule_cannot_see(self):
+        n = 1200
+        df = self._tent(n=n)
+        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
+        a, b = 400, 640                                     # 20% of the genome
+        cov[a:b] = cov[a:b][::-1]
+        df = df.copy()
+        df["gc_corr_norm_cov"] = cov
+        series, w = _otr_decimate(cov, np.ones(n, dtype=bool))
+        m = series.size
+        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
+        _, resid, _ = _otr_tent_fit(series, ph[0], w)
+        ca, cb = a * m // n, b * m // n
+        # A level rule is blind: the mean shift is zero by construction.
+        assert abs(resid[ca:cb].mean()) < 0.5 * resid.std()
+        ev = _otr_detect_event(resid, w, n_surrogates=200)
+        assert ev["p"] <= OTR_EVENT_ALPHA
+        lo, hi = ev["cells"]
+        assert lo < cb and hi > ca, "detected interval must overlap the inversion"
+
+    def test_declines_on_a_clean_tent(self):
+        df = self._tent()
+        n = len(df)
+        series, w = _otr_decimate(df["gc_corr_norm_cov"].to_numpy(float),
+                                  np.ones(n, dtype=bool))
+        m = series.size
+        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
+        _, resid, _ = _otr_tent_fit(series, ph[0], w)
+        assert _otr_detect_event(resid, w, n_surrogates=200)["p"] > OTR_EVENT_ALPHA
+
+    def test_censoring_cannot_change_the_detection_p_value(self):
+        """THE guard. The p-value must come from the uncensored series alone.
+
+        Compare a run where the refit is allowed against one where it is
+        forbidden by setting the cap to zero: every decision field must be
+        bit-identical, and only the estimates may differ.
+        """
+        df = _prep(self._tent())
+        allowed = otr_fit(df, n_surrogates=200)[-1]
+        forbidden = otr_fit(df, n_surrogates=200, event_add_cap=0.0)[-1]
+        for key in ("Coverage fit p-value", "Coverage fit r-squared",
+                    "GC skew fit p-value", "Breakpoint source",
+                    "Coverage vs skew likelihood-ratio p-value"):
+            assert allowed[key] == forbidden[key], key
+
+    def test_the_cap_declines_rather_than_trims(self):
+        """At the cap the refit is refused outright, and says so.
+
+        Censoring only part of a too-large event would be the worst of both --
+        it removes real signal without removing the contamination.
+        """
+        n = 1200
+        df = self._tent(n=n)
+        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
+        cov[300:800] = cov[300:800][::-1]            # 42% of the genome
+        df = df.copy()
+        df["gc_corr_norm_cov"] = cov
+        *_, detail = otr_fit(_prep(df), n_surrogates=200, event_add_cap=0.05)
+        if detail["Event p-value"] is not None and detail["Event p-value"] <= OTR_EVENT_ALPHA:
+            assert detail["Event exceeded censoring cap"] is True
+
+    def test_cells_map_back_to_a_contiguous_window_interval(self):
+        """_otr_decimate's window -> cell map is monotone, so this is exact."""
+        m, n = 400, 1200
+        lo, hi = _otr_cells_to_windows(100, 150, m, n)
+        assert lo == 300 and hi == 450
+
+    def test_event_keys_are_null_when_nothing_was_applied(self, gc_corrected_flat):
+        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
+        assert bias is False
+        assert detail["Event kind"] is None
+        assert detail["Event start (bp)"] is None
+        assert detail["Event exceeded censoring cap"] is False

@@ -451,6 +451,49 @@ are rejected before `get_CNV.main` creates any output directory.
   of its cells carry the constant fill value and a run of identical values is a maximal CUSUM
   excursion. Both plasmids fall below `OTR_MIN_CELLS` and report `null` instead, which is the
   honest answer for a series that is mostly fill.
+- **Real events contaminate the OTR tent, and one censored refit removes it — but the gate stays
+  frozen.** Measured: `adp1_mgd06_lb`'s free-fit origin lands *inside* its own CN-3 amplification and
+  `cwbi_ssym_ht04`'s chromosome inside its CN-34 one. Censoring the detected event and refitting once
+  takes CWBI's applied ratio from **1.169 to 1.075** — roughly 40% of the ramp being divided out of
+  that chromosome was copy number, not replication — and moves `ltee_ara_p1_50k_shift`'s fitted origin
+  from 55 kb short of REL606's *oriC* to 21 kb over it. The GC-skew arm already supplied good
+  *coordinates* on the first two; what it cannot fix is the *amplitude*, because the anchors are
+  still solved on contaminated data.
+- **Every decision is taken on the uncensored series; censoring may refine an estimate and nothing
+  else.** This is not caution for its own sake. An iterative fit-censor-refit loop was prototyped and
+  measured, and on ramp-free real sequences — each authentic sequence with its own best-fit tent
+  divided out, so there is no ramp by construction — it took the OTR false-positive rate from
+  **0/8 to 4/8** at a nominal 1%, inventing a ratio of **1.26** on `ltee_ara_m3_32k_2rg` from a
+  starting p of 0.918. The mechanism: excising 1–2% of the *windows* removes **87–98% of the
+  variance** the bootstrap was calibrated against, and a null whose surrogates come from the censored
+  series cannot defend itself. A cap does not help — three of those four appeared after **one** round.
+  `test_censoring_cannot_change_the_detection_p_value` pins the separation.
+- **The detector normalises by a short-lag difference σ, never by `_otr_cusum_range`'s total
+  variance.** The two have opposite jobs and must not be unified: the residual-structure score should
+  *absorb* real copy-number events so they are not misread as tent misfit, while the detector must
+  *scale* with them. Measured on an inversion grown 5%→30% of the genome, the raw CUSUM peak scales
+  quadratically (1.00/4.00/15.91/33.44 against a predicted 1/4/16/36), but the total-variance σ the
+  event inflates 14× flattens it to 1.00/1.42/2.03/2.42; the difference σ, flat throughout, preserves
+  it at 1.00/3.93/15.45/32.60.
+- **The event bootstrap draws blocks from the COMPLEMENT of the candidate interval.** Resample the
+  whole residual and the event's own blocks build the null: a 20%-of-genome inversion scoring T = 204
+  draws a null whose *median* maximum is 154, giving p = 0.06 on something not remotely subtle.
+  Excising the candidate puts the null's 99th percentile at 73 and p on its floor, and does not
+  inflate no-event nulls (0.4–0.7 against 0.24–0.41).
+- **`"Event kind"` is a residual shape, not a biological classification, and it is unreliable below
+  the scan resolution.** The narrowest scanned interval is `OTR_EVENT_MIN_FRAC` of the sequence, so a
+  smaller event cannot be localised and the scan returns the best wide window containing it — and a
+  step at an interval's edge projects onto a ramp, flipping the label. CWBI's chromosome is exactly
+  that: a **2 kb** amplification (0.06% of the genome) reported as `"inversion"` over a 44.5 kb
+  interval. The censoring still worked there; only the label is wrong.
+- **Where this works at all.** Inversions are detectable *only through* the replication ramp, since
+  they mirror it — so the signal is proportional to the ramp and vanishes without one. Measured power
+  thresholds on the reported anchor ratio: ~1.35 for a 10%-of-genome inversion, ~1.10–1.20 for a 20%
+  one, ~2.5 for a 5% one. Only `ltee_ara_p5_75k_exp` (2.05) clears that in the corpus. Two structural
+  blind spots, both physics rather than tuning: an **ori-symmetric** inversion produces a 3e-4
+  residual because replication timing is symmetric about the axis (and those are the common class in
+  bacteria, from recombination between the rRNA operons flanking *oriC*), and a **terminus-spanning**
+  inversion is largely reparametrisable as a shifted terminus, so the refit absorbs it.
 - **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,
   not at a point, so a symmetric V must choose between matching the descent and matching the trough.
   On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the coverage fit puts its
