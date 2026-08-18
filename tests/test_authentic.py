@@ -636,6 +636,53 @@ class TestOriginTerminus:
             rel=1e-12,
         )
 
+    def test_residual_structure_is_reported_for_an_applied_tent(self, seq):
+        """Reported only -- nothing gates on it, so this pins presence and shape.
+
+        The score answers a question r-squared cannot: not how much variance the
+        tent explained, but whether what it FAILED to explain is structured. The
+        corpus separates cleanly -- five of the six corrected sequences read at or
+        below 1.03, and ltee_ara_p1_50k_shift reads 2.62 alone. That one is the
+        case CLAUDE.md already documents as the tent model's real limitation:
+        neither ori/ter estimate sits at the observed coverage trough, because a
+        single-kink tent cannot represent a terminus macrodomain. The diagnostic
+        rediscovers that independently and fires nowhere else, which is the
+        evidence it measures misspecification rather than noise.
+
+        Not compared against the golden as a float -- it rides on a bootstrap and
+        on scipy, and CLAUDE.md asks for structural assertions on drifty summary
+        statistics.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        score = data["Residual structure score"]
+        tau_bp = data["Residual decorrelation length (bp)"]
+        if not seq["seq"].otr_detected:
+            assert score is None and tau_bp is None
+            return
+        assert score is not None, "an applied tent must report its residual structure"
+        assert tau_bp > 0
+        # The floor the score is normalised against must be a real length, not
+        # the whole genome -- if it ever approaches the sequence length the
+        # bootstrap has nothing left to destroy.
+        assert tau_bp < 0.25 * seq["seq"].length
+
+    def test_only_p1_reads_as_structured(self, seq):
+        """The corpus-wide separation, as a per-sequence assertion.
+
+        Stated as a threshold rather than exact values because the score is a
+        bootstrap z: measured 2.62 on p1 against 1.03, 1.03, -0.27 and -0.78 on
+        the others, with a null sd near 0.9.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            score = json.load(fh)["Residual structure score"]
+        if score is None:
+            pytest.skip("no tent applied on this sequence")
+        if seq["name"] == "ltee_ara_p1_50k_shift":
+            assert score > 2.0, "p1's applied tent should read as structured"
+        else:
+            assert score < 2.0, f"unexpected residual structure: {score}"
+
     def test_skew_sourced_coordinates_agree_with_the_skew_file(self, seq):
         """The two JSONs now share a coordinate and must not be able to disagree."""
         if seq["seq"].otr_source != "GC skew":

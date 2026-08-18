@@ -13,7 +13,8 @@ from CNery.core import (
     _otr_concentrated_rss, _otr_design_matrix, _otr_decimate, _otr_phase,
     _otr_phase_grid, _otr_grid_scores, _otr_normalize_phases, _otr_bootstrap_p,
     _otr_block_length, _otr_autocorr_length, _otr_lr_statistic,
-    _otr_lr_bootstrap_p, _otr_tent_fit,
+    _otr_lr_bootstrap_p, _otr_tent_fit, _otr_cusum_range,
+    _otr_residual_structure, OTR_STRUCTURE_SURROGATES,
 )
 
 def _ensure_dirs(base):
@@ -551,3 +552,188 @@ class TestBreakpointArbitration:
         assert isinstance(data["Terminus window"], int)
         assert data["Coverage fit p-value"] is not None
         assert data["Breakpoint source"] == "not corrected"
+
+
+def _structure_at(df, o, t, cells=None, n_surrogates=200, seed=0, weighted=True):
+    """Score the residual of a tent pinned at (o, t) windows on this frame."""
+    from CNery.core import OTR_SCORE_CELLS
+    y = df["gc_corr_norm_cov"].to_numpy(float)
+    keep = np.ones(len(df), dtype=bool)
+    series, w = _otr_decimate(y, keep, cells=cells or OTR_SCORE_CELLS)
+    m = series.size
+    scale = m / len(df)
+    if not weighted:
+        w = np.ones(m)
+    phase = _otr_normalize_phases(_otr_phase(m, o * scale, t * scale), w)
+    _, resid, _ = _otr_tent_fit(series, phase[0], w)
+    block = _otr_block_length(m, _otr_autocorr_length(resid))
+    return _otr_residual_structure(
+        resid, phase, w, block, n_surrogates=n_surrogates, seed=seed
+    )[0]
+
+
+class TestResidualStructure:
+    """Is the applied tent the wrong SHAPE, as opposed to merely a weak fit?
+
+    Reported only -- nothing gates on it. r-squared says how much of the variance
+    a tent explains; this says whether what it failed to explain is structured.
+    A tent can score a respectable r-squared and still be systematically wrong
+    over a long stretch, which is exactly the ltee_ara_p1_50k_shift case: its
+    GC-skew tent explains 34% of the variance while leaving 1.4 Mb of same-sign
+    residual.
+
+    The reason none of the obvious statistics is used here is that coverage
+    residuals are nowhere near white even under a PERFECT fit -- measured
+    decorrelation lengths are 2-50 cells on good fits. Lag-1 correlation, tau,
+    Ljung-Box and a runs test all rank a merely weak fit above a genuinely biased
+    one, and bootstrap-normalising them changes nothing, because block resampling
+    preserves exactly the short-range correlation they measure.
+    """
+
+    def _noisy_tent(self, n=1000, o=250, t=750, rho=0.85, sd=0.05, seed=4):
+        return _make_tent_df(n=n, o=o, t=t, ratio=1.8, sd=sd, rho=rho, seed=seed)
+
+    def _mean_over_seeds(self, t, reps=4, **kw):
+        """Average over noise realisations.
+
+        The null has sd ~0.94, so a single realisation says almost nothing about
+        where the score is CENTRED -- asserting a threshold on one seed fails
+        roughly one run in six on correctly-calibrated input. Measured null over
+        6 seeds: mean -0.02, values spanning -1.15 to +1.18.
+        """
+        return float(np.mean([
+            _structure_at(self._noisy_tent(seed=4 + k), 250, t, n_surrogates=150, **kw)
+            for k in range(reps)
+        ]))
+
+    def test_a_correct_tent_is_centred_on_zero(self):
+        """Calibration: the right tent must not look structured."""
+        assert abs(self._mean_over_seeds(750)) < 1.0
+
+    def test_a_displaced_tent_scores_high(self):
+        true = self._mean_over_seeds(750)
+        displaced = self._mean_over_seeds(850)       # terminus off by 10%
+        assert displaced > true + 1.5
+        assert displaced > 2.0
+
+    def test_the_score_rises_with_displacement_then_saturates(self):
+        """A detector, not a ruler -- and the saturation is not a defect.
+
+        Measured mean over 6 seeds at 0 / 2.5 / 5 / 10 / 20 / 30% displacement:
+        -0.02, 2.06, 3.67, 2.79, 2.67, 2.52. It climbs steeply, peaks near 5%,
+        and plateaus around 2.5-2.8 rather than continuing to rise.
+
+        The cause is the same feedback that makes a real amplification safe: a
+        worse fit leaves a longer-correlated residual (tau goes 7 -> 15 -> 88 ->
+        171 cells across that range), which lengthens the bootstrap block, which
+        raises the null with it. So the number reliably says STRUCTURED, and does
+        not rank severity beyond a point. Read it as a flag, not a distance --
+        the real ltee_ara_p1_50k_shift reads 2.62, squarely in the plateau and
+        consistent with the 10.6%-of-genome displacement CLAUDE.md records.
+        """
+        near = self._mean_over_seeds(775)            # 2.5%
+        peak = self._mean_over_seeds(800)            # 5%
+        far = self._mean_over_seeds(950)             # 20%
+        assert near > 1.0
+        assert peak > near
+        assert far > 2.0                             # still clearly flagged
+
+    def test_a_real_amplification_is_not_read_as_misfit(self):
+        """The confound worth pinning, and the reason the block stays adaptive.
+
+        A copy-number event is structure the tent genuinely cannot explain, but
+        it is not evidence the BREAKPOINTS are wrong. It is partly absorbed
+        rather than flagged because it inflates the residual autocorrelation
+        length, which lengthens the bootstrap block, which raises the null with
+        it. Measured, a 2x amplification over 5% of the genome scores below a 5%
+        breakpoint displacement. This is bounded, not perfect: at 15% of the
+        genome a 2x amplification does reach displacement-like values, and
+        CLAUDE.md records that limit.
+        """
+        df = self._noisy_tent()
+        amp = df.copy()
+        cov = amp["gc_corr_norm_cov"].to_numpy(float).copy()
+        cov[400:450] *= 2.0
+        amp["gc_corr_norm_cov"] = cov
+        assert _structure_at(amp, 250, 750) < _structure_at(df, 250, 800)
+
+    def test_zero_weight_cells_must_not_drive_the_score(self):
+        """Fill values in censored cells are a long run of IDENTICAL numbers.
+
+        A run of identical values is a maximal CUSUM excursion, so scoring them
+        unweighted manufactures the loudest false positive in the corpus -- CWBI's
+        plasmid_1, 45% censored, reads 3.37 unweighted against 0.53 weighted,
+        louder than the one tent that is really misfit. Same shape of bug as the
+        np.interp fabrication that _otr_decimate no longer does.
+        """
+        df = self._noisy_tent()
+        cov = df["gc_corr_norm_cov"].to_numpy(float)
+        keep = np.ones(len(df), dtype=bool)
+        keep[300:700] = False                       # 40% censored
+        series, w = _otr_decimate(cov, keep)
+        m = series.size
+        assert (w == 0).sum() > 0.3 * m
+        phase = _otr_normalize_phases(_otr_phase(m, 0.25 * m, 0.75 * m), w)
+        _, resid, _ = _otr_tent_fit(series, phase[0], w)
+        block = _otr_block_length(m, _otr_autocorr_length(resid))
+        weighted = _otr_residual_structure(resid, phase, w, block, n_surrogates=200)[0]
+        flat = _otr_residual_structure(
+            resid, _otr_normalize_phases(_otr_phase(m, 0.25 * m, 0.75 * m), np.ones(m)),
+            np.ones(m), block, n_surrogates=200)[0]
+        assert weighted != pytest.approx(flat, abs=0.2)
+
+    def test_score_is_insensitive_to_the_cell_count(self):
+        """The raw statistic grows as sqrt(m); only the calibrated z is publishable."""
+        df = self._noisy_tent(n=4000, o=1000, t=3000)
+        scores = [_structure_at(df, 1000, 3000, cells=c) for c in (1000, 2000, 4000)]
+        assert max(scores) - min(scores) < 1.0
+
+    def test_is_deterministic_for_a_fixed_seed(self):
+        df = self._noisy_tent()
+        assert _structure_at(df, 250, 850) == _structure_at(df, 250, 850)
+
+    def test_cusum_range_is_rotation_invariant(self):
+        """Kuiper, not Kolmogorov-Smirnov -- the genome is circular.
+
+        max|C| would depend on where the reference's coordinate 1 falls, so a
+        circularly permuted copy of the same genome would score differently. The
+        same concern makes preprocess() mean-subtract before cumulating for
+        cum_gc_skew.
+        """
+        rng = np.random.default_rng(9)
+        m = 500
+        r = rng.normal(0, 1, m)
+        w = rng.integers(1, 4, m).astype(float)
+        r = r - (w @ r) / w.sum()                   # weight-centre, as the real one is
+        base = _otr_cusum_range(r, w)[0]
+        for shift in (1, 137, 250, 499):
+            rolled = _otr_cusum_range(np.roll(r, shift), np.roll(w, shift))[0]
+            assert rolled == pytest.approx(base, rel=1e-9)
+
+    def test_cusum_range_declines_degenerate_input(self):
+        assert _otr_cusum_range(np.zeros(10), np.ones(10)) == (0.0, 0, 0)
+        assert _otr_cusum_range(np.ones(10), np.zeros(10)) == (0.0, 0, 0)
+
+    def test_too_few_cells_reports_nothing(self):
+        """Both CWBI plasmids land here, which is the point.
+
+        m = 111 and 114 with 45% and 28% zero-weight cells; a score built on that
+        would be mostly fill values. Declining is the honest answer.
+        """
+        r = np.random.default_rng(0).normal(0, 1, 20)
+        w = np.ones(20)
+        phase = _otr_normalize_phases(_otr_phase(20, 5, 15), w)
+        assert _otr_residual_structure(r, phase, w, 5) == (None, None)
+
+    def test_not_reported_when_no_tent_was_applied(self, gc_corrected_flat):
+        """A tent that was never applied has no residual worth publishing."""
+        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
+        assert bias is False
+        assert detail["Residual structure score"] is None
+        assert detail["Residual decorrelation length (bp)"] is None
+
+    def test_reported_when_a_tent_was_applied(self):
+        *_, bias, detail = otr_fit(_prep(_make_tent_df(n=240)))
+        assert bias is True
+        assert detail["Residual structure score"] is not None
+        assert detail["Residual decorrelation length (bp)"] > 0

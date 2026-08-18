@@ -414,6 +414,43 @@ are rejected before `get_CNV.main` creates any output directory.
   ratio median 0.999, 95th pct 1.051, max 1.089). Setting it to 0.01 instead would rescue **zero**
   sequences; the fixed-breakpoint p-values run 0.001, 0.001, 0.213, 0.243, 0.328, 0.343, 0.615, 0.841
   with a clean gap, so nothing between 0.01 and 0.2 behaves differently.
+- **`"Residual structure score"` is reported, never gating.** r² says how much of the variance the
+  tent explained; this says whether what it *failed* to explain is structured — a tent can score a
+  respectable r² and still be systematically wrong over a long stretch. It is the weighted circular
+  CUSUM range (Kuiper's V) of the applied tent's residual, expressed as a z against a circular
+  block-bootstrap null. Read it as **< 1 unstructured, 1–2 mild, > 2 structured, > 3 strongly so**.
+  Measured on the corpus: `p1_50k_shift` 2.62, and `m3_38k` 1.03, `adp1` 1.03, `p5_75k_exp` −0.27,
+  `cwbi:chromosome` −0.78. The one that fires is the case the terminus-region bullet below already
+  documents, and it fires nowhere else.
+- **Why none of the obvious statistics is used for it.** Coverage residuals are nowhere near white
+  even under a perfect fit — measured decorrelation lengths are 2–50 cells (2–45 kb) on *good* fits.
+  So lag-1 ρ / Durbin–Watson, τ, Ljung–Box and a runs test all rank `adp1`'s merely *weak* fit above
+  `p1`'s genuinely *biased* one (ρ₁ 0.897 vs 0.736; Q 41,821 vs 24,671), and the runs test even gets
+  the sign of the difference backwards. Bootstrap-normalising them is *identically* uninformative
+  (z ≈ 0.6) because block resampling preserves exactly the short-range correlation they measure —
+  **τ is the floor, not the signal**, which is why it is published beside the score rather than as
+  it. The variance ratio V(b) reads z = 5–6 on the CWBI chromosome (r² = 0.005), and a
+  fixed-bandwidth Bartlett correction reads 2.3–2.8 on the two plasmids and cannot separate a 2×
+  amplification over 15% of the genome from a 10% terminus displacement.
+- **The `_replichore_t` overlap-deflation precedent does NOT transfer here.** On the decimated
+  lattice, cells are 719–1157 bp apart against 1000 bp windows, so adjacent cells share *zero* bases
+  — the analytic `win/step` factor is exactly 1.00 on four of eight sequences and 1.20–1.32 on the
+  rest, while the measured long-run-variance inflation of the same residuals is 2.5–46×. Overlap
+  explains 0–13% of what it would have to. Only the block bootstrap reproduces the intrinsic floor.
+- **The score is a detector, not a ruler.** Measured mean over 6 seeds at 0 / 2.5 / 5 / 10 / 20 / 30%
+  breakpoint displacement: −0.02, 2.06, 3.67, 2.79, 2.67, 2.52. It climbs steeply, peaks near 5% and
+  plateaus — because a worse fit leaves a longer-correlated residual (τ 7 → 171 cells across that
+  range), which lengthens the bootstrap block, which raises the null with it. The same feedback is
+  what keeps a real copy-number event from reading as misfit: a 2× amplification over 5% of the
+  genome scores below a 5% displacement. The honest limit is that at 15% of the genome a 2×
+  amplification does reach displacement-like values. The null itself is correctly centred (mean
+  −0.02, sd 0.94), which is why the synthetic tests average over seeds rather than assert on one.
+- The score's raw statistic grows as √m (4.21 → 9.84 as `OTR_SCORE_CELLS` goes 1000 → 8000) and is
+  **unpublishable**; the calibrated z is flat to ±0.06 across the same range. And it must be
+  **weighted**: unweighted, `plasmid_1` scores 3.37 — louder than the one real misfit — because 45%
+  of its cells carry the constant fill value and a run of identical values is a maximal CUSUM
+  excursion. Both plasmids fall below `OTR_MIN_CELLS` and report `null` instead, which is the
+  honest answer for a series that is mostly fill.
 - **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,
   not at a point, so a symmetric V must choose between matching the descent and matching the trough.
   On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the coverage fit puts its

@@ -14,5 +14,7 @@
     "Coverage vs skew likelihood ratio": null,
     "Coverage vs skew likelihood-ratio p-value": null,
     "Bootstrap surrogates": 1000,
-    "Breakpoint source": "not corrected"
+    "Breakpoint source": "not corrected",
+    "Residual structure score": null,
+    "Residual decorrelation length (bp)": null
 }

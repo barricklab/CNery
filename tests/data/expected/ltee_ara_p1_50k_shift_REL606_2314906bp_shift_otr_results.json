@@ -14,5 +14,7 @@
     "Coverage vs skew likelihood ratio": 548.83,
     "Coverage vs skew likelihood-ratio p-value": 0.003,
     "Bootstrap surrogates": 1000,
-    "Breakpoint source": "coverage fit"
+    "Breakpoint source": "coverage fit",
+    "Residual structure score": 2.62,
+    "Residual decorrelation length (bp)": 24302
 }

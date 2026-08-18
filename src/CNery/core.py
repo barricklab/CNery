@@ -1037,6 +1037,16 @@ OTR_SKEW_MAX_P = None
 #: 0.01..0.10, so this number currently decides nothing.
 OTR_LR_ALPHA = 0.05
 
+#: Surrogates for the residual-structure diagnostic. Deliberately NOT
+#: DEFAULT_OTR_SURROGATES: that number sizes a p-value whose floor of 1/(B+1) is
+#: load-bearing, while this one sizes a z-score whose only requirement is that
+#: its Monte-Carlo error sit below the published precision. Measured on
+#: ltee_ara_p1_50k_shift over 10 seeds, the score's standard deviation is 0.24 at
+#: B=100, 0.08 at B=400 and 0.04 at B=1000 -- 400 is already finer than the two
+#: decimals reported, and costs ~25 ms against the ~0.4 s the OTR bootstraps
+#: already spend.
+OTR_STRUCTURE_SURROGATES = 400
+
 
 def _otr_decimate(y, keep, cells=OTR_SCORE_CELLS):
     """Coverage on a uniform circular grid of cells, with a WEIGHT per cell.
@@ -1198,6 +1208,147 @@ def _otr_autocorr_length(residual, max_lag=400):
         if float(r[lag:] @ r[:-lag]) / denom < thresh:
             return lag
     return int(min(max_lag, max(1, n // 2)))
+
+
+def _otr_cusum_range(residual, weights):
+    """Kuiper's V for a weighted residual: how far its running sum wanders.
+
+    A fit that is merely NOISY scatters its residuals about zero and its running
+    sum stays near zero. A fit that is systematically WRONG over a stretch of
+    genome accumulates same-sign residuals, and the running sum walks away and
+    comes back. This measures that walk, scaled so it is comparable across
+    sequences.
+
+    Four choices here are load-bearing, and each has a plausible-looking
+    alternative that is wrong:
+
+    - The RANGE (max - min), not max|C|. The genome is circular, so max|C|
+      depends on where the reference's coordinate 1 happens to fall and a
+      circularly permuted copy of the same genome would score differently. The
+      range is rotation-invariant -- this is Kuiper's V rather than
+      Kolmogorov-Smirnov, and it is the same concern that makes preprocess()
+      subtract the mean skew before cumulating for `cum_gc_skew`.
+
+    - The sum accumulates w*r, not r. Under the weighted least-squares model
+      Var(r_i) = s^2 / w_i, so Var(sum of w_i r_i) = s^2 * sum(w_i): the partial
+      sum is Brownian in WEIGHT time, not in cell index. Dividing by sqrt(m)
+      instead of sqrt(sum w) is wrong by sqrt(mean w) ~ 1.4 here, and drifts with
+      how heavily the sequence is censored.
+
+    - s^2 divides by (m - 2), the two degrees of freedom the tent's anchors
+      remove. Using sum(w r^2)/sum(w) instead is wrong by mean w ~ 2.1, a factor
+      1.46 in the returned statistic.
+
+    - No re-centring. `w @ r` is already exactly 0, because
+      _otr_normalize_phases() weight-centres the regressor, so this is a genuine
+      bridge and Kuiper's asymptotics apply as-is. Subtracting the weighted mean
+      "to be safe" would subtract zero and hide that invariant from the next
+      reader.
+
+    Returns (statistic, argmax_cell, argmin_cell). The two indices bracket the
+    worst excursion and localise the misfit for free.
+    """
+    r = np.asarray(residual, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    m = r.size
+    sw = w.sum()
+    if m < 2 or sw <= 0:
+        return 0.0, 0, 0
+
+    s2 = float(w @ (r * r)) / max(m - 2, 1)
+    if not np.isfinite(s2) or s2 <= 0:
+        return 0.0, 0, 0
+
+    c = np.cumsum(w * r)
+    i_max, i_min = int(np.argmax(c)), int(np.argmin(c))
+    stat = float((c[i_max] - c[i_min]) / np.sqrt(s2 * sw))
+    return (stat if np.isfinite(stat) else 0.0), i_max, i_min
+
+
+def _otr_residual_structure(residual, phases, weights, block,
+                            n_surrogates=OTR_STRUCTURE_SURROGATES, seed=0):
+    """How structured the residual is, as a z against a block-bootstrap null.
+
+    REPORTED ONLY. Nothing gates on this, nothing selects a model with it.
+
+    The raw statistic cannot be published on its own: coverage residuals are
+    nowhere near white even under a perfect fit -- measured decorrelation lengths
+    are 2 to 50 cells (2-45 kb) on GOOD fits -- so the raw number reads "high"
+    everywhere and discriminates nothing. It also grows as sqrt(m), from 4.21 to
+    9.84 as OTR_SCORE_CELLS goes 1000 to 8000 on the same sequence. The z is flat
+    to +/-0.06 across that same range, which is what makes it reportable.
+
+    The null is the same circular block bootstrap the detection gate uses, and
+    for the same reason: block resampling PRESERVES short-range correlation while
+    destroying long-range, so the surrogate distribution is exactly the intrinsic
+    floor for this sequence. That is also why no simpler normalisation works.
+    Measured alternatives, on the one sequence where a tent is known to be
+    misfit (ltee_ara_p1_50k_shift, whose GC-skew terminus is 10.6% of the genome
+    from the coverage fit's, leaving 1.4 Mb of same-sign residual):
+
+      - raw statistic:      adp1_mgd06_lb, a merely WEAK fit, outscores it
+      - lag-1 / Durbin-Watson, tau, Ljung-Q, runs: all rank the weak fit above
+        the biased one, and bootstrap-normalising them is *identically*
+        uninformative (z ~ 0.6) because block resampling preserves exactly the
+        short-range correlation they measure -- tau is the FLOOR, not the signal
+      - variance ratio V(b): reads z = 5-6 on the CWBI chromosome, r^2 = 0.005
+      - Bartlett long-run variance at fixed bandwidth: reads 2.3-2.8 on the two
+        plasmids, and cannot separate a 2x amplification over 15% of the genome
+        from a 10% terminus displacement
+
+    `phases` decides whether the null re-selects a tent, exactly as in
+    _otr_bootstrap_p(): (R, m) for the coverage arm, whose breakpoints were
+    chosen by looking at this coverage, so every surrogate must be allowed to
+    choose its own; (1, m) for the GC-skew arm, whose breakpoints came from
+    `ref_base` and involved no selection. Nothing below branches on R. Holding
+    the phase fixed for the coverage arm would understate a data-chosen tent by
+    0.85 z.
+
+    Known limit, measured: a real copy-number event is partly absorbed rather
+    than flagged, because it inflates tau, which lengthens the block, which
+    raises the null with it. A 2x amplification over 5% of the genome reads 0.72
+    against a 5% breakpoint displacement's 1.55; but a 2x amplification over 15%
+    reaches 1.80, comparable to a 10% displacement. Large duplications are
+    bounded here, not invisible.
+
+    Returns (z, percentile), or (None, None) when there is too little to resample.
+    """
+    r = np.asarray(residual, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    m = r.size
+    if m < OTR_MIN_CELLS or w.sum() <= 0:
+        return None, None
+
+    observed, _, _ = _otr_cusum_range(r, w)
+    if observed <= 0:
+        return None, None
+
+    P = np.atleast_2d(np.asarray(phases, dtype=float))
+    Pw = P * w
+    sw = w.sum()
+    rng = np.random.default_rng(seed)
+
+    stats = np.empty(n_surrogates, dtype=float)
+    done = 0
+    chunk = max(1, min(250, n_surrogates))
+    while done < n_surrogates:
+        size = min(chunk, n_surrogates - done)
+        idx = _otr_block_indices(rng, m, block, size)
+        R = r[idx].T                                    # (m, size)
+        R = R - (w[:, None] * R).sum(axis=0, keepdims=True) / sw
+        # Let each surrogate fit -- and shed -- its own best tent, so the null
+        # carries the same selection advantage the observed residual already had.
+        C = Pw @ R                                      # (R, size)
+        best = np.argmax(C * C, axis=0)
+        R = R - P[best].T * C[best, np.arange(size)]
+        for j in range(size):
+            stats[done + j] = _otr_cusum_range(R[:, j], w)[0]
+        done += size
+
+    sd = float(stats.std())
+    z = (observed - float(stats.mean())) / sd if sd > 0 else 0.0
+    pct = float(np.count_nonzero(stats >= observed) + 1) / (n_surrogates + 1)
+    return (float(z) if np.isfinite(z) else None), pct
 
 
 def _otr_block_length(m, tau, block=None):
@@ -1453,7 +1604,7 @@ def _otr_lr_bootstrap_p(series, skew_phase, phases, weights, observed, block,
 # realistically noisy Poisson-sampled coverage.
 def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
                 lam=None, p_lr=None, surrogates=0, skew_result=None,
-                source="not corrected"):
+                source="not corrected", structure=None, decorr_bp=None):
     """The evidence behind the OTR verdict, ready for the results JSON.
 
     Written whatever the verdict, so a REJECTED fit stays diagnosable from the
@@ -1484,6 +1635,18 @@ def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
         "Coverage vs skew likelihood-ratio p-value": _r(p_lr, 5),
         "Bootstrap surrogates": int(surrogates),
         "Breakpoint source": source,
+        # Reported only -- nothing gates on either. The score says whether the
+        # applied tent is the wrong SHAPE (systematically off over a stretch)
+        # rather than merely a weak one; the decorrelation length is the floor it
+        # is normalised against, published so the score is auditable from the
+        # file alone. adp1_mgd06_lb's 45 kb against ltee_ara_p5_75k_exp's 20 kb is
+        # why adp1's much larger raw excursion is not the more alarming of the
+        # two. Roughly: < 1 unstructured, 1-2 mild, > 2 structured (about 6% of
+        # the time under the null), > 3 strongly structured.
+        "Residual structure score": _r(structure, 2),
+        "Residual decorrelation length (bp)": (
+            None if decorr_bp is None else int(decorr_bp)
+        ),
     }
 
 
@@ -1801,6 +1964,31 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     print(f"OTR bias detected, breakpoints from the {source}"
           + (f" (likelihood ratio p={p_lr:.4f})" if p_lr is not None else ""))
 
+    # How structured is what the APPLIED tent failed to explain? Computed on the
+    # winning candidate only -- a tent that was never applied has no residual
+    # worth publishing -- and never on the not-detected paths, where the bare
+    # _otr_detail() call already emits nulls. Reported, never gating.
+    structure, decorr_bp = None, None
+    if grid_ok:
+        if use_free:
+            struct_rows, struct_phase = phases, phases[best_row]
+        else:
+            struct_rows, struct_phase = skew["phase"], skew["phase"][0]
+        _, struct_resid, _ = _otr_tent_fit(series, struct_phase, cell_w)
+        struct_tau = _otr_autocorr_length(struct_resid)
+        structure, _ = _otr_residual_structure(
+            struct_resid, struct_rows, cell_w,
+            _otr_block_length(m, struct_tau, block), seed=seed,
+        )
+        # tau is in CELLS. One cell spans n/m windows, and one window advances
+        # `step` bp, so the reported length is comparable across sequences and
+        # across -w/-s -- which the cell count itself is not, since
+        # OTR_SCORE_CELLS caps it.
+        win_st = df["win_st"].to_numpy()
+        step_bp = float(win_st[1] - win_st[0]) if n > 1 else float(
+            df["win_end"].iloc[0] - win_st[0])
+        decorr_bp = int(round(struct_tau * (genome_len / m) * step_bp))
+
     y_fit = otr_predict(x, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt, genome_len)
     y_fit = np.clip(y_fit, otr_floor, None)
     y_corr = y / y_fit
@@ -1809,6 +1997,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         s_free=s_free, p_free=p_free, s_skew=s_skew, p_skew=p_skew,
         lam=lam, p_lr=p_lr, surrogates=surrogates,
         skew_result=skew_result, source=source,
+        structure=structure, decorr_bp=decorr_bp,
     )
 
 
