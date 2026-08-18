@@ -2842,11 +2842,14 @@ def plot_copy(df_cnv, pltstart, pltend, output):
         )
         df_plt = df_cnv
 
-    plt.figure(figsize=(10, 8))
-
-    fig, ax1 = plt.subplots()
-
-    # fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+    # ONE figure, at the same 10x8 the other four plotters use. There used to be a
+    # bare plt.figure(figsize=(10, 8)) here as well, which did two things wrong:
+    # the subplots() call below created a SECOND figure that savefig and close
+    # both acted on, so the first leaked -- one empty figure per call, which is
+    # what raised matplotlib's "More than 20 figures have been opened" on any run
+    # touching enough sequences -- and every CNV plot came out at matplotlib's
+    # default 6.4x4.8 rather than the 10x8 the code appeared to ask for.
+    fig, ax1 = plt.subplots(figsize=(10, 8))
 
     ax2 = ax1.twinx()
     ax1.patch.set_visible(False)
