@@ -256,6 +256,83 @@ stage — note `raw/G` is an intermediate, not a result:
   are kept beside them under `... (pass 1)` keys, so a verdict that changed under
   the censor is legible from the file alone.
 
+#### The fragment size is chosen from the data unless `-f` is given
+
+`frag` sets the neighbourhood each window's `gc_percent` is measured over. It
+models the sequenced fragment, which is where Illumina GC bias physically arises,
+so the right value is a property of the **library** — something a user may not
+know and cannot read off a coverage table. `-f` therefore defaults to `None`,
+meaning "scan"; passing a value pins it.
+
+**The grid.** `FRAG_SCAN_GRID` is
+`100, 150, 200, 250, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 2500`,
+filtered by `frag_candidates(win)` to those at or above the window size.
+
+- **The lower bound is `win`, and that is not a convention.** `preprocess`
+  measures GC over `max(frag, win)`, so every candidate at or below the window
+  size is the *same computation* — a 150 bp "fragment" and a 400 bp one are
+  bit-identical at `-w 500`. Offering them would let the scan choose between
+  duplicates and report the difference as signal.
+- **Roughly geometric** (ratios 1.20–1.50) because fragment-scale effects are
+  multiplicative: 150 → 200 changes the averaging window by 33%, 800 → 850 by 6%.
+  Deliberately coarsest at the low end, where the measured optima are shallow and
+  the argmin jitters, so finer spacing would offer resolution the data cannot
+  support.
+- **Fewer than `FRAG_SCAN_MIN_CANDIDATES = 4` survivors and the scan declines**
+  rather than choosing among near-duplicates. That is what happens at large `-w`.
+
+**The criterion is held-out prediction error, and the obvious alternative is
+circular.** Candidates are scored by 5-fold CV MSE of coverage predicted from the
+GC they imply. Judging instead by "how flat is the corrected coverage against GC"
+cannot work: the correction is a LOWESS of coverage *on* `gc_percent(frag)`, so it
+flattens that axis by construction whatever frag it was handed. Measured, every
+candidate looks best on its own axis — `adp1_mgd06_lb` reads 0.63% residual trend
+at its own 400 and 4.98% at 150, and at frag 150 it reads 0.62% and 1.88% the
+other way round.
+
+**Two confounds, both of which had to be controlled before the answer meant
+anything.** `frag_scan_target` handles all three parts:
+
+- **Copy number.** `cwbi_ssym_ht04`'s chromosome carries a CN-34 amplification
+  whose variance swamps every GC effect — held-out MSE 2.64 against 0.01–0.2
+  elsewhere, and an apparent optimum 0.04% deep, i.e. noise. Only windows the
+  first pass called CN = 1 are scored.
+- **Position.** At large frag, "GC" becomes a long-range average that tracks
+  genomic coordinate, so it can predict coverage by proxying the replication ramp
+  rather than by modelling chemistry. The fitted tent is divided out first.
+  Uncontrolled, the scan picks the top of the grid on two of eight sequences.
+- **Replicon level.** The scan is pooled, and `norm_raw_cov` is normalised against
+  the POOLED median, so CWBI's plasmids sit at 2.95× and 1.90× against a
+  chromosome at 1.0. At a large fragment size a short plasmid's GC is nearly
+  constant, which turns GC into a **replicon label** predicting those levels
+  perfectly. Measured, that alone made the integrated scan pick 2500; normalising
+  each sequence to its own median first brings it back to 400.
+
+**Selection and judging use different windows.** The winner is chosen on one half
+and tested against the default on the other. Testing the winner on the data that
+chose it is the classic selection-bias error — with 14 candidates a pure-noise
+series produced a "significant" improvement and selected 500 over the default. The
+default is kept unless the winner beats it out-of-sample by more than the standard
+error of the paired per-fold differences, so there is no invented threshold.
+
+**Measured on the corpus**, at the CLI defaults: `adp1_mgd06_lb` → 150 and
+`ltee_ara_p1_50k_shift` → 250 (the two deepest optima, 3.2% and 40%); the other
+four keep 400. `ltee_ara_m3_32k_2rg` is the instructive one — its best candidate
+is 500 but it does not survive the held-out test, which is right: its optimum is
+5% deep and flat, and its argmin jitters across four values on independent splits.
+
+**It runs AFTER pass 1, and a changed answer costs a second pass 1.** The scan
+needs the tent and the copy-number calls to control its confounds, so by the time
+a size is chosen the pooled GC curve was fitted against the *old* `gc_percent`.
+`apply_frag_size` rebuilds both together — a curve fitted on one GC axis and
+applied on another is not a correction — and `get_CNV.main` then re-runs pass 1.
+The provisional pass is silent; only the final one prints.
+
+**The goldens are unaffected because `tests/test_authentic.py` pins `frag`
+explicitly**, which counts as user-specified. The scan is exercised instead by
+`TestFragmentSizeScanAtCliDefaults`, which has to run at `-w 100`: at the goldens'
+`-w 1000` most candidates collapse into each other and the scan declines outright.
+
 #### The GC correction is an ESTIMATE, and the HMM is told how good a one
 
 `bias_offsets` hands `run_HMM` a LOWESS fit evaluated at each window's GC.

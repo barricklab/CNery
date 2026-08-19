@@ -16,9 +16,12 @@ from .core import (
     apply_otr_correction,
     plot_correction_stages,
     plot_gc_passes,
+    DEFAULT_FRAG_SIZE,
+    apply_frag_size,
     otr_ratio,
     pass1_summary,
     refit_gc_bias_pooled,
+    select_frag_size,
     stage_pass1,
     plot_otr_corr,
     predict_ori_ter_from_skew,
@@ -151,7 +154,7 @@ def main():
         "--frag-size",
         action="store",
         dest="f",
-        default=400,
+        default=None,
         required=False,
         type=int,
         help=(
@@ -159,7 +162,13 @@ def main():
             "over this many bases centred on each window, because GC bias acts at "
             "fragment scale rather than at whatever window size was asked for. "
             "Ignored when it is smaller than -w, which is then used instead. "
-            "Default: 400."
+            "LEAVE IT UNSET and the value is chosen from the data: candidate "
+            "sizes are scored by how well the GC they imply predicts held-out "
+            "coverage, on windows with the replication ramp divided out and the "
+            "copy number called 1. That default is kept unless a candidate "
+            "beats it by more than the measurement's own standard error, and "
+            "the choice is reported. Pass a value to pin it. Default when the "
+            "scan declines: 400."
         ),
     )
     parser.add_argument(
@@ -265,13 +274,23 @@ def main():
     # Origin and terminus of replication are always inferred from the coverage profile
 
     # process every coverage table given in one pass
+    # `-f` unset means "choose it from the data". The scan needs a first pass to
+    # control its confounds, so preprocessing starts at the default and the
+    # fragment size is revisited once there is a tent and a set of calls.
+    scan_frag = options.f is None
+    frag_in_use = DEFAULT_FRAG_SIZE if scan_frag else options.f
+
     per_genome = process_multi_genome(
         coverage_inputs,
         output_prefix=out_dir,
         win=options.w,
         step=options.s,
-        frag=options.f,
+        frag=frag_in_use,
+        collect_gc_flags=scan_frag,
     )
+    gc_flags = {}
+    if scan_frag:
+        per_genome, gc_flags = per_genome
     # process_multi_genome already:
     #   - reads and preprocesses each coverage table
     #   - pools all genomes, masks redundant/deletion windows, and does
@@ -297,6 +316,18 @@ def main():
         start, end = regions.get(genome_id, (0, 0))
         plot_copy(df_cnv, start, end, output=out_dir)
         print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
+
+    def _report_frag(smpl, detail):
+        """Say which fragment size is in force, and on what evidence."""
+        if not detail.get("Fragment size scanned"):
+            print(f"{smpl}: fragment size {detail['Fragment size']} bp "
+                  f"({detail.get('Fragment size reason', 'not scanned')}).")
+            return
+        chosen = detail["Fragment size"]
+        best = detail.get("Fragment size selected")
+        print(f"{smpl}: fragment size {chosen} bp -- scanned "
+              f"{len(detail['Fragment size candidates'])} candidates, best "
+              f"{best}; {detail.get('Fragment size reason', '')}")
 
     def _fmt_ratio(value):
         return "none" if value is None else f"{value:.4f}"
@@ -387,67 +418,100 @@ def main():
         st = staged[genome_id]
         return pass1_summary(st["otr"], st["df"])
 
-    staged = {}
+    # ---- Pass 1, and the fragment size it makes choosable --------------------
+    skews = {}
 
-    for genome_id, df_b2c in per_genome.items():
-        print(f"Processing genome: {genome_id}")
+    def run_pass1(frames, quiet=False):
+        """Every sequence through pass 1. `quiet` is for the provisional run the
+        fragment scan needs, whose output nobody should see."""
+        out = {}
+        for genome_id, df_b2c in frames.items():
+            if not quiet:
+                print(f"Processing genome: {genome_id}")
 
-        # Origin/terminus from the reference's own cumulative GC skew. This sits
-        # ahead of the --bias branch on purpose: it reads only the sequence, so
-        # unlike the coverage-derived OTR results it is available in all four
-        # modes, including the ones that never call apply_otr_correction().
-        #
-        # fit_otr_bias() takes it as a second candidate: when the coverage fit
-        # cannot clear its own significance gate, or when it can but a
-        # likelihood-ratio test says it is no better than a tent hinged here,
-        # these coordinates supply the correction instead. Under --bias gc/none
-        # nothing consumes it and it is still reported.
-        skew_result = predict_ori_ter_from_skew(
-            df_b2c, win=options.w, step=options.s
-        )
-        write_gc_skew_results(skew_result, out_dir, genome_id)
-        plot_gc_skew(df_b2c, out_dir, skew_result)
-        if skew_result["Prediction confident"]:
-            print(
-                f"{smpl} ({genome_id}): GC skew predicts origin "
-                f"{skew_result['Origin (bp)']}, terminus "
-                f"{skew_result['Terminus (bp)']}."
+            # Origin/terminus from the reference's own cumulative GC skew. This sits
+            # ahead of the --bias branch on purpose: it reads only the sequence, so
+            # unlike the coverage-derived OTR results it is available in all four
+            # modes, including the ones that never call apply_otr_correction().
+            #
+            # fit_otr_bias() takes it as a second candidate: when the coverage fit
+            # cannot clear its own significance gate, or when it can but a
+            # likelihood-ratio test says it is no better than a tent hinged here,
+            # these coordinates supply the correction instead. Under --bias gc/none
+            # nothing consumes it and it is still reported.
+            skew_result = skews.get(genome_id)
+            if skew_result is None:
+                skew_result = predict_ori_ter_from_skew(
+                    df_b2c, win=options.w, step=options.s
+                )
+                skews[genome_id] = skew_result
+            if not quiet:
+                write_gc_skew_results(skew_result, out_dir, genome_id)
+                plot_gc_skew(df_b2c, out_dir, skew_result)
+            if not quiet:
+                if skew_result["Prediction confident"]:
+                    print(
+                        f"{smpl} ({genome_id}): GC skew predicts origin "
+                        f"{skew_result['Origin (bp)']}, terminus "
+                        f"{skew_result['Terminus (bp)']}."
+                    )
+                else:
+                    print(
+                        f"{smpl} ({genome_id}): GC skew origin/terminus prediction is "
+                        f"low confidence; see GC_skew/ for the values and curve."
+                    )
+
+            df_corr, otr_fit_result, _ori, _ter = correct_one(
+                df_b2c, genome_id, skew_result, second=False
             )
-        else:
-            print(
-                f"{smpl} ({genome_id}): GC skew origin/terminus prediction is "
-                f"low confidence; see GC_skew/ for the values and curve."
+            if not quiet:
+                if otr_fit_result is not None:
+                    _report_otr(smpl, genome_id, otr_fit_result, pass_no=1)
+                elif options.bias == "gc":
+                    print(f"{smpl} ({genome_id}): GC bias vs coverage handled "
+                          f"(pooled fit).")
+
+            # Provisional calls, written nowhere. Their only job is the censor below.
+            df_called = run_HMM(
+                df_corr, out_dir,
+                deletion_coverage_fraction=options.deletion_coverage_fraction,
+                bias=options.bias, change_rate=options.change_rate, write=False,
             )
+            df_staged, cn_applied = stage_pass1(df_called)
+            n_censored = int(df_staged["is_cn_variant"].sum())
+            if quiet:
+                pass
+            elif cn_applied:
+                print(f"{smpl} ({genome_id}): pass 1 complete; {n_censored} window(s) "
+                      f"called CN != 1 will be censored from the pass-2 fits.")
+            else:
+                print(f"{smpl} ({genome_id}): pass 1 complete; CN censor NOT applied "
+                      f"-- it would leave under half the windows. Pass 2 censors as "
+                      f"pass 1 did.")
 
-        df_corr, otr_fit_result, _ori, _ter = correct_one(
-            df_b2c, genome_id, skew_result, second=False
+            out[genome_id] = {
+                "df": df_staged, "otr": otr_fit_result, "skew": skew_result,
+                "ratio": otr_ratio(otr_fit_result),
+                "cn_applied": cn_applied, "cn_censored": n_censored,
+            }
+        return out
+
+    staged = run_pass1(per_genome, quiet=scan_frag)
+
+    if scan_frag:
+        # The scan is scored on coverage with the ramp divided out and the copy
+        # number called 1, which is why it cannot run before now -- and why a
+        # changed fragment size invalidates the GC curve pass 1 just fitted, so
+        # that pass runs again on the new axis.
+        frag_in_use, frag_detail = select_frag_size(
+            {g: st["df"] for g, st in staged.items()},
+            gc_flags, options.w, DEFAULT_FRAG_SIZE,
         )
-        if otr_fit_result is not None:
-            _report_otr(smpl, genome_id, otr_fit_result, pass_no=1)
-        elif options.bias == "gc":
-            print(f"{smpl} ({genome_id}): GC bias vs coverage handled (pooled fit).")
-
-        # Provisional calls, written nowhere. Their only job is the censor below.
-        df_called = run_HMM(
-            df_corr, out_dir,
-            deletion_coverage_fraction=options.deletion_coverage_fraction,
-            bias=options.bias, change_rate=options.change_rate, write=False,
-        )
-        df_staged, cn_applied = stage_pass1(df_called)
-        n_censored = int(df_staged["is_cn_variant"].sum())
-        if cn_applied:
-            print(f"{smpl} ({genome_id}): pass 1 complete; {n_censored} window(s) "
-                  f"called CN != 1 will be censored from the pass-2 fits.")
-        else:
-            print(f"{smpl} ({genome_id}): pass 1 complete; CN censor NOT applied "
-                  f"-- it would leave under half the windows. Pass 2 censors as "
-                  f"pass 1 did.")
-
-        staged[genome_id] = {
-            "df": df_staged, "otr": otr_fit_result, "skew": skew_result,
-            "ratio": otr_ratio(otr_fit_result),
-            "cn_applied": cn_applied, "cn_censored": n_censored,
-        }
+        _report_frag(smpl, frag_detail)
+        if frag_in_use != DEFAULT_FRAG_SIZE:
+            per_genome = apply_frag_size(per_genome, gc_flags, options.w,
+                                         frag_in_use)
+        staged = run_pass1(per_genome)
 
     # ---- Pooled GC refit, between the passes ---------------------------------
     #

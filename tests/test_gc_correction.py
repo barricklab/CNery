@@ -2,6 +2,15 @@ import pytest
 import numpy as np
 import pandas as pd
 from CNery.core import (
+    DEFAULT_FRAG_SIZE,
+    FRAG_SCAN_GRID,
+    FRAG_SCAN_MIN_CANDIDATES,
+    frag_candidates,
+    frag_scan_target,
+    gc_percent_for_frag,
+    preprocess,
+    reference_gc_flags,
+    select_frag_size,
     _gc_curve_tau,
     apply_gc_correction,
     fit_gc_bias,
@@ -231,3 +240,191 @@ class TestPooledUncertaintyComposition:
         d = refit_gc_bias_pooled({"a": self._frame("a")})[0]["a"]
         assert np.all(d["gc_corr_tau"] >= d["gc_corr_tau_pass1"] - 1e-12)
         assert np.all(d["gc_corr_tau"] >= d["gc_corr_tau_pass2"] - 1e-12)
+
+
+class TestFragmentCandidates:
+    """Which fragment sizes are worth scoring at all."""
+
+    def test_the_lower_bound_is_the_window_size(self):
+        """preprocess() measures GC over max(frag, win), so every candidate at or
+        below the window size is the SAME computation -- not a candidate, a
+        duplicate. Offering them would let the scan "choose" between identical
+        options and report a difference that is pure noise."""
+        for win in (100, 250, 600):
+            assert all(f >= win for f in frag_candidates(win))
+
+    def test_candidates_come_from_the_published_grid(self):
+        assert set(frag_candidates(100)) <= set(FRAG_SCAN_GRID)
+
+    def test_the_default_is_on_the_grid(self):
+        """Otherwise "did any candidate beat the default" compares the default
+        against something the grid cannot express."""
+        assert DEFAULT_FRAG_SIZE in FRAG_SCAN_GRID
+
+    def test_the_grid_is_increasing_and_geometric_ish(self):
+        grid = list(FRAG_SCAN_GRID)
+        assert grid == sorted(set(grid))
+        ratios = [b / a for a, b in zip(grid, grid[1:])]
+        assert all(1.15 < r < 1.6 for r in ratios), ratios
+
+    def test_a_large_window_collapses_the_grid(self):
+        """At -w 2000 almost nothing is distinguishable, and the caller declines
+        rather than pretending to choose."""
+        assert len(frag_candidates(2000)) < FRAG_SCAN_MIN_CANDIDATES
+
+    def test_the_cli_default_window_leaves_plenty(self):
+        assert len(frag_candidates(100)) >= FRAG_SCAN_MIN_CANDIDATES
+
+
+class TestGcPercentForFrag:
+    """The scan recomputes gc_percent from prefix sums instead of re-running
+    preprocess(). If the two ever disagree, every candidate is scored against a
+    GC definition the pipeline would not actually use."""
+
+    def _table(self, n=4000, seed=0):
+        rng = np.random.default_rng(seed)
+        bases = rng.choice(list("ACGT"), n, p=[0.3, 0.2, 0.2, 0.3])
+        return pd.DataFrame(
+            {"ref_base": bases,
+             "unique_cov": rng.poisson(60, n).astype(float),
+             "redundant_cov": np.zeros(n)},
+            index=np.arange(1, n + 1))
+
+    @pytest.mark.parametrize("win,frag", [(100, 400), (100, 150), (100, 2000),
+                                          (200, 600), (500, 150)])
+    def test_it_reproduces_preprocess_exactly(self, win, frag):
+        raw = self._table()
+        df = preprocess(raw, win=win, step=win, frag=frag)
+        flags = reference_gc_flags(raw)
+        off = df["win_st"].to_numpy(dtype=np.int64) - int(df["win_st"].min())
+        np.testing.assert_allclose(
+            gc_percent_for_frag(flags, off, win, frag),
+            df["gc_percent"].to_numpy(dtype=float), atol=1e-12)
+
+    def test_a_fragment_below_the_window_is_the_window(self):
+        """The clamp, from the other side: 150 and 400 are identical at -w 500."""
+        raw = self._table()
+        flags = reference_gc_flags(raw)
+        off = np.arange(0, 3000, 500, dtype=np.int64)
+        np.testing.assert_array_equal(
+            gc_percent_for_frag(flags, off, 500, 150),
+            gc_percent_for_frag(flags, off, 500, 400))
+
+    def test_it_wraps_circularly(self):
+        """A window at the very start draws its padding from the far end."""
+        raw = self._table(n=1000)
+        flags = reference_gc_flags(raw)
+        got = gc_percent_for_frag(flags, np.array([0]), 100, 600)
+        assert 0.0 <= float(got[0]) <= 1.0
+
+
+class TestFragmentScanTarget:
+    """What the scan is allowed to score."""
+
+    def _frame(self, n=400):
+        """A sequence sitting at 2x the pooled median, with a real ramp in its
+        coverage and the tent that describes it."""
+        rng = np.random.default_rng(0)
+        tent = np.linspace(0.9, 1.1, n)
+        return pd.DataFrame({
+            "genome_id": "a",
+            "norm_raw_cov": 2.0 * tent * rng.normal(1.0, 0.01, n),
+            "otr_gc_corr_fact": tent,
+            "exclude_from_fit": np.r_[np.ones(20, bool), np.zeros(n - 20, bool)],
+            "is_cn_variant": np.r_[np.zeros(n - 30, bool), np.ones(30, bool)],
+        })
+
+    def test_censored_and_cn_variant_windows_are_dropped(self):
+        _t, keep = frag_scan_target(self._frame())
+        assert not keep[:20].any() and not keep[-30:].any()
+        assert keep[20:-30].all()
+
+    def test_it_is_normalised_to_this_sequences_own_level(self):
+        """The scan pools every sequence, and norm_raw_cov is normalised against
+        the POOLED median -- so CWBI's plasmids sit at 2.95x and 1.90x against a
+        chromosome at 1.0. At a large fragment size a short plasmid's GC is
+        nearly constant, which turns GC into a REPLICON LABEL predicting those
+        levels. Measured, that alone made the scan pick the top of the grid.
+        """
+        target, keep = frag_scan_target(self._frame())
+        assert np.median(target[keep]) == pytest.approx(1.0, abs=1e-9)
+
+    def test_the_ramp_is_divided_out(self):
+        """Otherwise a large-frag GC predicts coverage by proxying position --
+        the replication ramp -- rather than by modelling fragment chemistry."""
+        df = self._frame()
+        target, keep = frag_scan_target(df)
+        raw = df["norm_raw_cov"].to_numpy()
+        assert np.std(target[keep]) < 0.5 * np.std(raw[keep] / np.median(raw[keep]))
+
+
+class TestFragmentSelection:
+    """Choosing the size, and declining to."""
+
+    def _reference(self, n=30000, seed=1):
+        rng = np.random.default_rng(seed)
+        # Long-wavelength GC structure, so different fragment scales genuinely
+        # see different things.
+        x = np.arange(n)
+        p_gc = 0.5 + 0.18 * np.sin(2 * np.pi * x / 1500)
+        return (rng.random(n) < p_gc)
+
+    def _windows(self, flags, win=100, true_frag=None, strength=0.0, seed=2):
+        n = flags.size
+        starts = np.arange(0, n - win + 1, win, dtype=np.int64)
+        rng = np.random.default_rng(seed)
+        cov = np.ones(starts.size)
+        if true_frag is not None:
+            gc = gc_percent_for_frag(flags, starts, win, true_frag)
+            cov = 1.0 + strength * (gc - gc.mean()) / max(gc.std(), 1e-9)
+        cov = cov * rng.normal(1.0, 0.02, starts.size)
+        return pd.DataFrame({
+            "genome_id": "a",
+            "win_st": starts + 1,
+            "norm_raw_cov": cov,
+            "exclude_from_fit": np.zeros(starts.size, bool),
+            "is_cn_variant": np.zeros(starts.size, bool),
+        })
+
+    def test_it_recovers_a_known_fragment_size(self):
+        """GROUND TRUTH. Coverage is generated so its GC bias acts at exactly one
+        fragment scale; the scan has to find it. Everything else here tests the
+        machinery -- this tests whether the idea works."""
+        flags = self._reference()
+        for true_frag in (200, 800):
+            df = self._windows(flags, true_frag=true_frag, strength=0.30)
+            frag, detail = select_frag_size({"a": df}, {"a": flags}, 100,
+                                            DEFAULT_FRAG_SIZE, repeats=3)
+            assert detail["Fragment size scanned"]
+            grid = frag_candidates(100)
+            i_true = min(range(len(grid)), key=lambda k: abs(grid[k] - true_frag))
+            i_got = grid.index(frag)
+            assert abs(i_got - i_true) <= 1, (
+                f"true {true_frag}, selected {frag}, grid {grid}")
+
+    def test_it_keeps_the_default_when_gc_carries_nothing(self):
+        """Pure noise: no candidate can beat any other, so the default stands."""
+        flags = self._reference()
+        df = self._windows(flags, true_frag=None)
+        frag, detail = select_frag_size({"a": df}, {"a": flags}, 100,
+                                        DEFAULT_FRAG_SIZE, repeats=3)
+        assert frag == DEFAULT_FRAG_SIZE
+        assert "default kept" in detail["Fragment size reason"]
+
+    def test_it_declines_when_the_window_is_too_large(self):
+        flags = self._reference()
+        df = self._windows(flags, win=100)
+        frag, detail = select_frag_size({"a": df}, {"a": flags}, 2000,
+                                        DEFAULT_FRAG_SIZE, repeats=2)
+        assert frag == DEFAULT_FRAG_SIZE
+        assert detail["Fragment size scanned"] is False
+        assert "candidate" in detail["Fragment size reason"]
+
+    def test_the_report_carries_the_evidence(self):
+        flags = self._reference()
+        df = self._windows(flags, true_frag=250, strength=0.30)
+        _frag, detail = select_frag_size({"a": df}, {"a": flags}, 100,
+                                         DEFAULT_FRAG_SIZE, repeats=3)
+        assert detail["Fragment size candidates"] == frag_candidates(100)
+        assert len(detail["Fragment size picks per split"]) == 3
+        assert detail["Fragment size improvement se"] is not None

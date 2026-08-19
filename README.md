@@ -273,6 +273,15 @@ cut -f1,2 data/reference.fasta.fai
 
 Given an output folder `CNV_out/`, `CNery` writes:
 
+The `-f` fragment size is optional. GC bias acts at the scale of the sequenced
+fragment, so that size belongs to the library rather than to the analysis — and
+it is not something a coverage table shows you. Left unset, CNery scores
+candidate sizes by how well the GC each implies predicts held-out coverage (with
+the replication ramp divided out and copy-number variants excluded, so neither
+can be mistaken for a GC effect) and reports what it chose. The 400 bp default is
+kept unless a candidate beats it by more than the measurement's own error. Pass
+`-f` to pin it.
+
 CNery corrects coverage and calls copy number in **two passes**. The first runs GC
 correction, origin-to-terminus correction and the HMM as usual. The second repeats
 both fits with every window the first pass did not call single-copy excluded from

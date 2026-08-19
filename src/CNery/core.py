@@ -530,6 +530,311 @@ def plottable(df):
     return np.ones(len(df), dtype=bool)
 
 
+#: Fragment-size scan. GC bias acts at the scale of the sequenced fragment, so
+#: `frag` is a property of the LIBRARY -- something a user may simply not know.
+#: These bound a grid of candidates to score against the data.
+#:
+#: The upper bound is a modelling statement, not a convenience. Above ~1 kb an
+#: Illumina fragment is rare, and "GC over 2 kb" stops being a fragment property
+#: and becomes a long-range positional average that proxies the replication ramp.
+#: Measured: scanning to 2000 against RAW coverage picks 2000 -- the edge -- on
+#: two of eight sequences, for exactly that reason.
+#: The fragment size used when the user pins none and the scan declines.
+DEFAULT_FRAG_SIZE = 400
+FRAG_SCAN_MAX = 2500
+#: Candidate fragment sizes, filtered by the caller to those the window size
+#: leaves distinguishable.
+#:
+#: Roughly geometric -- step ratios run 1.20 to 1.50 -- because fragment-scale
+#: effects are multiplicative: 150 -> 200 changes the averaging window by 33%,
+#: 800 -> 850 by 6%, so linear spacing would over-resolve the top and
+#: under-resolve the bottom. DELIBERATELY COARSEST AT THE LOW END, where the
+#: measured optima are shallow and the argmin jitters, so finer spacing would
+#: offer resolution the data cannot support. Round numbers a user can match
+#: against a library prep, not artefacts of a float multiply.
+FRAG_SCAN_GRID = (100, 150, 200, 250, 300, 400, 500, 600, 800,
+                  1000, 1200, 1500, 2000, 2500)
+FRAG_SCAN_MIN_CANDIDATES = 4
+#: Independent CV splits. The argmin genuinely jitters where the optimum is
+#: shallow (measured: four distinct answers across eight splits on
+#: ltee_ara_m3_32k_2rg), so the selection is a median over repeats rather than
+#: one split's argmin.
+FRAG_SCAN_REPEATS = 5
+FRAG_SCAN_FOLDS = 5
+#: Windows the cross-validation scores. The scan is pooled across every sequence
+#: in the run, so this caps a cost that would otherwise grow with the genome.
+FRAG_SCAN_MAX_WINDOWS = 12000
+
+
+def frag_candidates(win, lo=None, hi=FRAG_SCAN_MAX, grid=FRAG_SCAN_GRID):
+    """Fragment sizes worth scoring, given the window size.
+
+    THE LOWER BOUND IS `win`, AND THAT IS NOT ARBITRARY. preprocess() measures GC
+    over `max(frag, win)` bases, so every candidate at or below the window size
+    produces BIT-IDENTICAL gc_percent -- they are not candidates, they are
+    duplicates of each other. At -w 1000 a 150 bp "fragment" and a 400 bp one are
+    the same computation, which is also why a large -w collapses this grid and
+    the caller then declines to scan.
+    """
+    lo = int(win if lo is None else lo)
+    return [int(f) for f in grid if lo <= f <= int(hi)]
+
+
+def reference_gc_flags(df):
+    """Per-base G-or-C flags for a coverage table, for the fragment scan.
+
+    Kept as a bool array rather than the prefix sum: 1 byte per base against 8,
+    which is 4.6 MB instead of 37 MB on REL606, and the cumsum is cheap when a
+    candidate actually needs it.
+    """
+    bases = normalize_coverage_columns(df)["ref_base"].to_numpy().astype(str)
+    return (bases == "G") | (bases == "C")
+
+
+def gc_percent_for_frag(gc_flags, win_st0, win, frag):
+    """gc_percent for every window at this fragment size.
+
+    Mirrors preprocess() exactly -- max(frag, win) bases CENTRED on the window,
+    drawn circularly -- but from prefix sums, so rescanning a dozen candidates
+    costs a dozen array passes instead of a dozen preprocess() runs.
+
+    `win_st0` is each window's start as a 0-based offset into the reference,
+    i.e. `df["win_st"] - start_coord`.
+    """
+    flags = np.asarray(gc_flags, dtype=bool)
+    n = flags.size
+    if n == 0:
+        return np.zeros(np.asarray(win_st0).size, dtype=float)
+
+    pad = max((max(int(frag), int(win)) - int(win)) // 2, 0)
+    cum = np.concatenate(([0], np.cumsum(flags)))
+    total = int(cum[-1])
+
+    lo = np.asarray(win_st0, dtype=np.int64) - pad
+    hi = np.asarray(win_st0, dtype=np.int64) + int(win) + pad     # half-open
+    span = int(win) + 2 * pad
+
+    def prefix(idx):
+        whole, rem = np.divmod(idx, n)
+        return whole * total + cum[rem]
+
+    return (prefix(hi) - prefix(lo)) / float(span)
+
+
+def _frag_cv_errors(gc, cov, folds=FRAG_SCAN_FOLDS, seed=0,
+                    cap=FRAG_SCAN_MAX_WINDOWS):
+    """Per-fold held-out MSE of coverage predicted from GC.
+
+    Out-of-sample on purpose. The in-sample alternative -- how flat the corrected
+    coverage looks against GC -- is CIRCULAR: the correction is a LOWESS of
+    coverage on gc_percent(frag), so it flattens that axis by construction
+    whatever frag it was given. Measured, every candidate looks best on its own
+    axis (adp1 reads 0.63% residual trend at its own 400 and 4.98% at 150; at
+    frag 150 it reads 0.62% and 1.88% the other way round). Held-out prediction
+    error is the only comparison that is not rigged.
+    """
+    rng = np.random.default_rng(seed)
+    gc = np.asarray(gc, dtype=float)
+    cov = np.asarray(cov, dtype=float)
+    n = gc.size
+    if n > cap:
+        idx = rng.choice(n, cap, replace=False)
+        gc, cov, n = gc[idx], cov[idx], cap
+    if n < 10 * folds:
+        return None
+
+    fold = rng.integers(0, folds, n)
+    span = float(gc.max() - gc.min())
+    loess = sm.nonparametric.lowess
+    out = []
+    for j in range(folds):
+        train, test = fold != j, fold == j
+        if train.sum() < 20 or test.sum() < 5:
+            return None
+        fit = loess(cov[train], gc[train], frac=0.3, it=1,
+                    delta=0.0005 * span if span > 0 else 0.0,
+                    is_sorted=False, missing="none", return_sorted=True)
+        pred = np.interp(gc[test], fit[:, 0], fit[:, 1])
+        out.append(float(np.mean((cov[test] - pred) ** 2)))
+    return out
+
+
+def frag_scan_target(df):
+    """The series the fragment scan is scored against, for one sequence.
+
+    Coverage with the replication ramp divided out, on windows the first pass
+    called CN = 1. BOTH exclusions are load-bearing, and the scan gives the wrong
+    answer without them:
+
+      - COPY NUMBER. cwbi_ssym_ht04's chromosome carries a CN-34 amplification
+        whose variance swamps every GC effect -- its held-out MSE is 2.64 against
+        0.01-0.2 elsewhere, and its apparent optimum is 0.04% deep, i.e. noise.
+      - POSITION. At large frag, "GC" becomes a long-range average that tracks
+        genomic coordinate, so it can predict coverage by proxying the
+        replication ramp rather than by modelling fragment chemistry. Scanning
+        raw coverage picks the top of the range on two of eight sequences.
+
+    Measured, controlling for both moves every optimum to the interior of the
+    grid, and makes the three sequences of one sample -- which share a library
+    and so must share a fragment size -- agree where they had not.
+
+    Returns (target, keep) with `keep` the windows worth scoring.
+    """
+    raw = df["norm_raw_cov"].to_numpy(dtype=float)
+    tent = np.ones(len(df), dtype=float)
+    if "otr_gc_corr_fact" in df.columns:
+        tent = df["otr_gc_corr_fact"].to_numpy(dtype=float)
+        finite = np.isfinite(tent) & (tent > 0)
+        tent = tent / (np.median(tent[finite]) if finite.any() else 1.0)
+        tent = np.where(finite, tent, 1.0)
+    target = raw / tent
+
+    keep = np.isfinite(target) & (target > 0)
+    for column in ("exclude_from_fit", "is_cn_variant"):
+        if column in df.columns:
+            keep &= ~df[column].to_numpy(dtype=bool)
+
+    # NORMALISED TO THIS SEQUENCE'S OWN LEVEL, because the scan pools every
+    # sequence in the run. norm_raw_cov is normalised against the POOLED median,
+    # so CWBI's plasmids sit at 2.95x and 1.90x against a chromosome at 1.0 --
+    # and at a large fragment size a short plasmid's GC is nearly constant, which
+    # turns GC into a REPLICON LABEL that predicts those level differences
+    # perfectly. Measured, that alone made the scan pick the top of the grid.
+    if keep.any():
+        level = float(np.median(target[keep]))
+        if np.isfinite(level) and level > 0:
+            target = target / level
+    return target, keep
+
+
+def select_frag_size(per_genome, gc_flags, win, default_frag,
+                     repeats=FRAG_SCAN_REPEATS, seed=0):
+    """Choose the library's fragment size from the data. Returns (frag, detail).
+
+    POOLED, like both GC fits: GC bias belongs to the sequencing chemistry, so
+    one fragment size describes the run rather than a different one reaching each
+    reference.
+
+    THE SELECTION IS A MEDIAN OVER INDEPENDENT CV SPLITS, not one split's argmin.
+    Where the optimum is shallow the argmin genuinely jitters -- measured, four
+    distinct answers across eight splits on ltee_ara_m3_32k_2rg, whose optimum is
+    flat to 0.7% between 100 and 400. A single split would report that jitter as
+    an answer.
+
+    THE DEFAULT IS KEPT UNLESS THE IMPROVEMENT BEATS ITS OWN UNCERTAINTY. The
+    margin is the standard error of the paired per-fold differences, so there is
+    no invented threshold: a candidate has to win by more than the noise in the
+    measurement that chose it.
+    """
+    detail = {"Fragment size scanned": False, "Fragment size": int(default_frag)}
+    candidates = frag_candidates(win)
+    if len(candidates) < FRAG_SCAN_MIN_CANDIDATES:
+        detail["Fragment size reason"] = (
+            f"window size {int(win)} leaves only {len(candidates)} distinct "
+            "candidate(s); GC is measured over max(frag, win)")
+        return int(default_frag), detail
+
+    columns, targets = [], []
+    for genome_id, df in per_genome.items():
+        flags = gc_flags.get(genome_id)
+        if flags is None or "win_st" not in df:
+            continue
+        target, keep = frag_scan_target(df)
+        if not keep.any():
+            continue
+        win_st0 = df["win_st"].to_numpy(dtype=np.int64) - int(df["win_st"].min())
+        # win_st is 1-based from the table's own first coordinate; the offset of
+        # the first window is what makes it 0-based into the reference.
+        columns.append((flags, win_st0[keep], keep))
+        targets.append(target[keep])
+    if not targets:
+        detail["Fragment size reason"] = "no windows survived censoring"
+        return int(default_frag), detail
+
+    target = np.concatenate(targets)
+    gc_by_frag = {f: np.concatenate([gc_percent_for_frag(flags, w, win, f)
+                                     for flags, w, _k in columns])
+                  for f in candidates}
+
+    # SELECT ON ONE HALF OF THE WINDOWS, JUDGE ON THE OTHER.
+    #
+    # Testing the winner against the default on the data that chose it is the
+    # classic selection-bias error: the winner's margin is large partly BECAUSE
+    # it was picked for being large, so with 14 candidates a pure-noise series
+    # produces a "significant" improvement. Measured, exactly that -- coverage
+    # with no GC signal at all selected 500 over the default and passed the
+    # standard-error test. Splitting makes the margin an honest out-of-sample
+    # quantity.
+    rng = np.random.default_rng(seed)
+    half = rng.random(target.size) < 0.5
+    if half.sum() < 100 or (~half).sum() < 100:
+        detail["Fragment size reason"] = "too few windows to select and judge apart"
+        return int(default_frag), detail
+
+    picks = []
+    for r in range(repeats):
+        means = {}
+        for f in candidates:
+            got = _frag_cv_errors(gc_by_frag[f][half], target[half], seed=seed + r)
+            if got is None:
+                detail["Fragment size reason"] = "too few windows to cross-validate"
+                return int(default_frag), detail
+            means[f] = float(np.mean(got))
+        picks.append(min(means, key=means.get))
+    chosen = int(np.median(picks))
+    chosen = min(candidates, key=lambda f: (abs(f - chosen), f))
+
+    # Nearest grid point to the default, so "did it beat the default" is asked of
+    # something the grid can actually express.
+    baseline = min(candidates, key=lambda f: (abs(f - int(default_frag)), f))
+
+    detail.update({
+        "Fragment size scanned": True,
+        "Fragment size candidates": candidates,
+        "Fragment size selected": chosen,
+        "Fragment size default": int(default_frag),
+        "Fragment size picks per split": picks,
+    })
+    if chosen == baseline:
+        detail["Fragment size reason"] = "the default is the best candidate"
+        return int(default_frag), detail
+
+    judged = ~half
+    diffs = []
+    for r in range(repeats):
+        a = _frag_cv_errors(gc_by_frag[baseline][judged], target[judged], seed=seed + r)
+        b = _frag_cv_errors(gc_by_frag[chosen][judged], target[judged], seed=seed + r)
+        if a is None or b is None:
+            detail["Fragment size reason"] = "too few windows to judge the choice"
+            return int(default_frag), detail
+        diffs.extend(np.asarray(a) - np.asarray(b))       # >0 means chosen wins
+    diffs = np.asarray(diffs, dtype=float)
+    margin = float(diffs.mean())
+    stderr = float(diffs.std(ddof=1) / np.sqrt(diffs.size)) if diffs.size > 1 else 0.0
+    detail["Fragment size improvement"] = _round(margin, 6)
+    detail["Fragment size improvement se"] = _round(stderr, 6)
+
+    if margin > stderr and margin > 0:
+        detail["Fragment size"] = chosen
+        detail["Fragment size reason"] = (
+            "selected: beats the default on held-out windows by more than its "
+            "own standard error")
+        return chosen, detail
+
+    detail["Fragment size"] = int(default_frag)
+    detail["Fragment size reason"] = (
+        "default kept: the best candidate did not beat it on held-out windows by "
+        "more than the noise in the measurement")
+    return int(default_frag), detail
+
+
+def _round(value, nd):
+    try:
+        return round(float(value), nd)
+    except (TypeError, ValueError):
+        return None
+
+
 def gc_cor_plots(df, output):
     genome_ids = sorted(df["genome_id"].unique())
     if len(genome_ids) > 1:
@@ -1113,12 +1418,52 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
     return df
 
 
+def _pooled_gc_stage(df_pooled):
+    """mask -> fit -> apply, on one pooled frame. Extracted because the fragment
+    scan can change `gc_percent`, and everything fitted against the old axis then
+    has to be refitted against the new one."""
+    df_pooled = mask_coverage_windows(df_pooled)
+    return apply_gc_correction(df_pooled, fit_gc_bias(df_pooled))
+
+
+def apply_frag_size(per_genome, gc_flags, win, frag):
+    """Recompute gc_percent at a new fragment size and redo the pooled GC stage.
+
+    The first pass has to happen before the scan can run -- it needs the tent and
+    the copy-number calls to control its confounds -- so by the time a fragment
+    size is chosen, `gc_corr_fact` was fitted against the OLD gc_percent. Both
+    have to be rebuilt together: a curve fitted on one GC axis and applied on
+    another is not a correction, it is a shuffle.
+
+    `norm_raw_cov` is deliberately NOT recomputed. It is the pooled median
+    normalisation, which has nothing to do with the fragment size.
+    """
+    out = {}
+    for genome_id, df in per_genome.items():
+        df = df.copy()
+        flags = gc_flags.get(genome_id)
+        if flags is not None and "win_st" in df and len(df):
+            win_st0 = (df["win_st"].to_numpy(dtype=np.int64)
+                       - int(df["win_st"].min()))
+            df["gc_percent"] = gc_percent_for_frag(flags, win_st0, win, frag)
+        out[genome_id] = df
+
+    ids = list(out)
+    pooled = _pooled_gc_stage(pd.concat([out[g] for g in ids], ignore_index=True))
+    for genome_id in ids:
+        sub_df = pooled[pooled["genome_id"] == genome_id].copy()
+        sub_df.reset_index(drop=True, inplace=True)
+        out[genome_id] = sub_df
+    return out
+
+
 def process_multi_genome(
     coverage_inputs,
     output_prefix,
     win=100,
     step=100,
     frag=400,
+    collect_gc_flags=False,
 ):
     """
     Preprocess every coverage table, pool them for GC correction, plot the pooled bias,
@@ -1136,20 +1481,24 @@ def process_multi_genome(
     """
 
     preprocessed = {}
+    gc_flags = {}
     for genome_id, path in coverage_inputs.items():
         df_raw = read_coverage_table(path)
         df_pre = preprocess(df_raw, win=win, step=step, frag=frag)
         df_pre["genome_id"] = genome_id
         preprocessed[genome_id] = df_pre
+        # Per-base G-or-C flags, kept only when the caller intends to scan
+        # fragment sizes -- 1 byte per base, so 4.6 MB on REL606, against the
+        # 37 MB a prefix sum would cost.
+        if collect_gc_flags:
+            gc_flags[genome_id] = reference_gc_flags(df_raw)
 
     df_pooled = pd.concat(preprocessed.values(), ignore_index=True)
 
     global_median = df_pooled["read_count_cov"].median()
     df_pooled["norm_raw_cov"] = df_pooled["read_count_cov"] / global_median
 
-    df_pooled = mask_coverage_windows(df_pooled)
-    gc_fit = fit_gc_bias(df_pooled)
-    df_pooled = apply_gc_correction(df_pooled, gc_fit)
+    df_pooled = _pooled_gc_stage(df_pooled)
 
     gc_cor_plots(df_pooled, output_prefix)
 
@@ -1159,6 +1508,8 @@ def process_multi_genome(
         df_g.reset_index(drop=True, inplace=True)
         per_genome_corrected[genome_id] = df_g
 
+    if collect_gc_flags:
+        return per_genome_corrected, gc_flags
     return per_genome_corrected
 
 

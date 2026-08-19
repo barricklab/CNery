@@ -71,7 +71,10 @@ from CNery.core import (
     resolve_coverage_inputs,
     plot_gc_passes,
     run_HMM,
+    DEFAULT_FRAG_SIZE,
+    frag_candidates,
     pass1_summary,
+    select_frag_size,
     refit_gc_bias_pooled,
     stage_pass1,
     write_gc_skew_results,
@@ -284,10 +287,13 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
     for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
 
-    per_genome = process_multi_genome(
+    per_genome, gc_flags = process_multi_genome(
         resolve_coverage_inputs([str(path)]),
         output_prefix=str(out),
         win=win, step=step, frag=frag,
+        # The fragment scan needs the reference to rescore candidates. Kept here
+        # so the scan can be exercised without paying for a second pipeline run.
+        collect_gc_flags=True,
     )
 
     # Mirrors get_CNV.main(): one number per sequence, computed across ALL of them
@@ -317,7 +323,7 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
         df_staged, cn_applied = stage_pass1(run_HMM(df_otr, str(out), write=False))
         staged[seq_id] = df_staged
         frames[seq_id] = {"gc": df_gc, "skew": skew, "res1": res1,
-                          "cn_applied": cn_applied,
+                          "cn_applied": cn_applied, "staged": df_staged,
                           "pass1_keys": pass1_summary(res1, df_staged)}
 
     # ---- Pooled GC refit, between the passes ---------------------------------
@@ -344,7 +350,8 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
         f["otr"] = df_final
         f["cnv"] = run_HMM(df_final, str(out))
 
-    return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
+    return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames,
+            "gc_flags": gc_flags, "win": win}
 
 
 @pytest.fixture(scope="session")
@@ -1172,3 +1179,76 @@ class TestOffsetUncertaintyAtCliDefaults:
         assert 0 in states, "the deletion must still be called"
         assert 3 in states, "the CN-3 amplification must still be called"
         assert max(states) >= 10, f"the high-copy block is gone; states {states}"
+
+
+class TestFragmentSizeScanAtCliDefaults:
+    """Choosing the library's fragment size from the data instead of asking.
+
+    `-f` sets the neighbourhood each window's gc_percent is measured over. It
+    models the sequenced fragment, which is where Illumina GC bias physically
+    arises, so the right value is a property of the LIBRARY -- something a user
+    may simply not know and cannot read off a coverage table. Left unset, CNery
+    scores candidate sizes by how well the GC they imply predicts HELD-OUT
+    coverage.
+
+    Everything here runs at the CLI's windowing, because the scan needs
+    `frag > win` to have any resolution at all: preprocess() measures GC over
+    max(frag, win), so at the goldens' -w 1000 most candidates are the same
+    computation and the scan declines outright.
+    """
+
+    def _scan(self, pipeline, repeats=3):
+        staged = {s: f["staged"] for s, f in pipeline["frames"].items()}
+        return select_frag_size(staged, pipeline["gc_flags"], pipeline["win"],
+                                DEFAULT_FRAG_SIZE, repeats=repeats)
+
+    def test_the_scan_runs_at_this_windowing(self, cli_default_pipelines):
+        frag, detail = self._scan(cli_default_pipelines["ltee_ara_m3_32k_2rg"])
+        assert detail["Fragment size scanned"] is True
+        assert frag in frag_candidates(CLI_WIN)
+
+    def test_it_never_lands_on_the_top_of_the_grid(self, cli_default_pipelines):
+        """The confound signature, and the reason the target has the replication
+        ramp divided out and is normalised per sequence.
+
+        At a large fragment size "GC" stops being a fragment property: it becomes
+        a long-range positional average that can predict coverage by proxying the
+        replication ramp, and on a short replicon it becomes nearly constant and
+        so acts as a REPLICON LABEL for that sequence's copy-number level. Either
+        one makes the top of the grid win. Measured, scanning raw pooled coverage
+        picked 2500 on cwbi_ssym_ht04; with both controlled it picks 400.
+        """
+        for name in CLI_DEFAULT_DATASETS:
+            frag, _detail = self._scan(cli_default_pipelines[name])
+            assert frag < max(frag_candidates(CLI_WIN)), name
+
+    def test_a_multi_replicon_sample_agrees_with_its_own_chromosome(
+            self, cli_default_pipelines):
+        """Not asserted here for cwbi -- it is not in the CLI-default fixture --
+        but the property that matters is that the scan is POOLED: one library,
+        one fragment size. This pins that a single call covers every sequence."""
+        pipeline = cli_default_pipelines["adp1_mgd06_lb"]
+        _frag, detail = self._scan(pipeline)
+        assert detail["Fragment size candidates"] == frag_candidates(CLI_WIN)
+
+    def test_the_choice_is_reproducible(self, cli_default_pipelines):
+        """Seeded, so a given input always gives the same answer -- otherwise a
+        rerun could silently change every downstream call."""
+        pipeline = cli_default_pipelines["ltee_ara_m3_32k_2rg"]
+        assert self._scan(pipeline)[0] == self._scan(pipeline)[0]
+
+    def test_it_declines_at_the_goldens_windowing(self, cli_default_pipelines):
+        """THE PROPERTY THAT KEEPS THE GOLDENS VALID. At -w 1000 the candidates
+        collapse, and the scan says so rather than choosing among duplicates."""
+        pipeline = cli_default_pipelines["ltee_ara_m3_32k_2rg"]
+        staged = {s: f["staged"] for s, f in pipeline["frames"].items()}
+        frag, detail = select_frag_size(staged, pipeline["gc_flags"], 2000,
+                                        DEFAULT_FRAG_SIZE, repeats=2)
+        assert frag == DEFAULT_FRAG_SIZE
+        assert detail["Fragment size scanned"] is False
+
+    def test_a_pinned_size_is_honoured(self, cli_default_pipelines):
+        """The fixture itself is the assertion: it passes an explicit frag, so no
+        scan ran, and every golden in this suite was produced that way."""
+        assert cli_default_pipelines["adp1_mgd06_lb"]["frames"]["ADP1-ISx"]["gc"][
+            "gc_percent"].notna().all()
