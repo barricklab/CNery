@@ -176,12 +176,6 @@ over the 1st–99th GC percentile:
   the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
   to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
   correction the first over-applied to the replication ramp.
-- **The fit also excludes `is_event`.** `apply_otr_correction` publishes the interval the censored
-  refit removed as an `is_event` column — empty when no event fired, and also when one fired but
-  exceeded the cap, since the refit declined it there. Without this, the amplification judged too
-  distorting to leave in the tent fit is full-weight input to the GC fit immediately afterwards.
-  Measured effect is small (curve moves ≤ 0.3%, no call changes) because the LOWESS is already
-  robust; it is there for consistency, not magnitude.
 - **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
   offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
   near-invariant to how the two factors split it. This is a reporting-quality
@@ -321,17 +315,17 @@ are rejected before `get_CNV.main` creates any output directory.
   so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
   three columns and the assert is fatal.
 - `corr_plots/<sample><seq_id>_correction_stages.pdf` is the per-sequence **before/after** diagnostic:
-  one row per fitting *change* — GC, OTR, and the censored refit — each with its own censoring strip
-  beneath it. It is emitted in **all four `--bias` modes**, and **self-creates its directory** rather
+  one row per fitting *change* — GC and OTR — each with its own censoring strip beneath it. It is emitted in **all four `--bias` modes**, and **self-creates its directory** rather
   than being added to `out_subdirs`, which is what lets the self-creation test assert something
   instead of passing vacuously. Three things about it are load-bearing:
-  - **Censoring is not static, so one shared track would hide the only change there is.** `is_event`
-    cannot exist before the round-0 OTR fit, because it is detected from that fit's residual, so the
-    set grows exactly once — at the refit. The GC and OTR strips come out identical, which is the
-    useful reading: those two fits saw the same data. (`is_deletion`/`is_redundant` are computed once
-    in `mask_coverage_windows` on *uncorrected* coverage and never revisited, so "≤10% of the global
-    median" means something different near the origin than near the terminus; the strips make that
-    frozen-ness legible rather than implicit.)
+  - **The censoring strip is drawn per row even though the rows agree today.** Both fits exclude
+    the same `is_deletion | is_redundant` set, so the two strips come out identical — which is the
+    useful reading, not a redundancy: those fits saw the same data. A step that ever sees a
+    different set then shows it where it applies rather than in one detached track.
+    (`is_deletion`/`is_redundant` are computed once in `mask_coverage_windows` on *uncorrected*
+    coverage and never revisited, so "≤10% of the global median" means something different near
+    the origin than near the terminus; the strips make that frozen-ness legible rather than
+    implicit.)
   - **The in-band metric is divided by `censored_median_coverage` first.** Without it the measure
     reads **0.000 for every stage and both denominators** on both CWBI plasmids — `norm_raw_cov` is
     normalised against the *pooled* median while they sit at 2.95× and 1.90× — and three empty bars
@@ -533,46 +527,27 @@ are rejected before `get_CNV.main` creates any output directory.
   of its cells carry the constant fill value and a run of identical values is a maximal CUSUM
   excursion. Both plasmids fall below `OTR_MIN_CELLS` and report `null` instead, which is the
   honest answer for a series that is mostly fill.
-- **Copy-number events contaminate the OTR tent, and one censored refit removes it — but the gate
-  stays frozen.** Measured: `adp1_mgd06_lb`'s free-fit origin lands *inside* its own CN-3
-  amplification and `cwbi_ssym_ht04`'s chromosome inside its CN-34 one. Censoring the detected event
-  and refitting once takes CWBI's applied ratio from **1.169 to 1.075** — roughly 40% of the ramp
-  being divided out of that chromosome was copy number, not replication — and moves
-  `ltee_ara_p1_50k_shift`'s fitted origin from 55 kb short of REL606's *oriC* to 21 kb over it. The
-  GC-skew arm already supplied good *coordinates* on the first two; what it cannot fix is the
-  *amplitude*, because the anchors are still solved on contaminated data.
-- **Every decision is taken on the uncensored series; censoring may refine an estimate and nothing
-  else.** This is not caution for its own sake. An iterative fit-censor-refit loop was prototyped and
-  measured, and on ramp-free real sequences — each authentic sequence with its own best-fit tent
-  divided out, so there is no ramp by construction — it took the OTR false-positive rate from
-  **0/8 to 4/8** at a nominal 1%, inventing a ratio of **1.26** on `ltee_ara_m3_32k_2rg` from a
-  starting p of 0.918. The mechanism: excising 1–2% of the *windows* removes **87–98% of the
-  variance** the bootstrap was calibrated against, and a null whose surrogates come from the censored
-  series cannot defend itself. A cap does not help — three of those four appeared after **one** round.
-  `test_censoring_cannot_change_the_detection_p_value` pins the separation.
-- **The detector normalises by a short-lag difference σ, never by `_otr_cusum_range`'s total
-  variance.** The two have opposite jobs and must not be unified: the residual-structure score should
-  *absorb* real copy-number events so they are not misread as tent misfit, while the detector must
-  *scale* with them. Measured on a 2× amplification grown 5%→30% of the genome, the raw CUSUM peak
-  grows 1.00/1.76/2.93/3.87, but the total-variance σ the event inflates (0.26 → 0.48) flattens the
-  statistic to 1.00/1.34/1.79/2.11; the difference σ, flat at 0.0010 throughout, preserves
-  1.00/1.76/2.94/3.84.
-- **The event bootstrap draws blocks from the COMPLEMENT of the candidate interval.** Resample the
-  whole residual and the event's own blocks build the null: a 2× amplification over 20% of the genome
-  scoring T = 1802 draws a null with median 1398 and 99th percentile 2562, giving **p = 0.18** on
-  something not remotely subtle. Drawing from the complement puts the 99th percentile at 1679 and p on
-  its floor, and does not inflate a no-event null (0.52 against 0.39).
-- **The reported interval is only as sharp as the narrowest scanned width**, `OTR_EVENT_MIN_FRAC` of
-  the sequence. A smaller event cannot be localised and the scan returns the best wide window
-  containing it — `cwbi_ssym_ht04`'s chromosome carries a **2 kb** amplification (0.06% of the genome)
-  and the reported bounds are tens of kb wide. The censoring still does its job there; the bounds are
-  not the event's own.
+- **Copy-number events contaminate the tent, and censoring them back out is harder than it looks.**
+  Measured: `adp1_mgd06_lb`'s free-fit origin lands *inside* its own CN-3 amplification and
+  `cwbi_ssym_ht04`'s chromosome inside its CN-34 one, and excising the amplification takes CWBI's
+  applied ratio from 1.169 to 1.075 — roughly 40% of the ramp being divided out of that chromosome
+  is copy number, not replication. The GC-skew arm can supply good *coordinates* in that situation;
+  what it cannot fix is the *amplitude*, because the anchors are still solved on contaminated data.
+  **Nothing in the pipeline corrects for this today**, and a fix must not be an iterative
+  fit-censor-refit loop: one was prototyped and measured, and on ramp-free real sequences — each
+  authentic sequence with its own best-fit tent divided out, so there is no ramp by construction —
+  it took the OTR false-positive rate from **0/8 to 4/8** at a nominal 1%, inventing a ratio of
+  **1.26** on `ltee_ara_m3_32k_2rg` from a starting p of 0.918. The mechanism: excising 1–2% of the
+  *windows* removes **87–98% of the variance** the bootstrap was calibrated against, and a null
+  whose surrogates come from the censored series cannot defend itself. A cap does not help — three
+  of those four appeared after **one** round. Whatever replaces this, the detection decision must
+  stay frozen on the uncensored series.
 - **Inversions are deliberately not detected.** They are visible in coverage only *through* the
   replication ramp, which they mirror, and their mean residual is exactly zero — so the HMM calls
   CN = 1 straight through and only a slope-shaped statistic could see them. Detecting them was
-  prototyped and dropped: it added a second statistic whose shape label was unreliable below the scan
-  resolution, and on the authentic corpus it changed no result the level statistic does not already
-  find. Two structural blind spots would have remained regardless, both physics rather than tuning: an
+  prototyped and dropped: the shape label was unreliable below the scan resolution, and on the
+  authentic corpus it changed no result. Two structural blind spots would remain regardless, both
+  physics rather than tuning: an
   **ori-symmetric** inversion produces a 3e-4 residual because replication timing is symmetric about
   the axis, and a **terminus-spanning** one is largely reparametrisable as a shifted terminus.
 - **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,

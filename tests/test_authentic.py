@@ -175,13 +175,16 @@ DATASETS = {
     # so n_states comes out 39. Of the 79 chromosome windows above 10x, 76 ARE
     # redundant and correctly censored -- these three are not.
     "cwbi_ssym_ht04": Spec(
-        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_source="GC skew"),
-         # This one changed twice. The chromosome's COVERAGE fit is a marginal
-         # 1.217 that fails the significance gate outright (p = 0.28), and it used
-         # to be applied anyway -- a wash that moved windows within 20% of
-         # single-copy from 91.8% to 91.5%. The GC-skew arm now supplies the
-         # breakpoints instead, at ratio 1.169, and the correction finally helps
-         # (91.8% -> 92.5%), which is why otr_tightens is no longer False here.
+        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_tightens=False,
+                  otr_source="GC skew"),
+         # The chromosome's COVERAGE fit is a marginal 1.217 that fails the
+         # significance gate outright (p = 0.28), so the GC-skew arm supplies the
+         # breakpoints instead, at ratio 1.169. The correction is still a wash --
+         # windows within 20% of single-copy go 91.8% -> 91.3% -- which is what
+         # otr_tightens=False records. Its fitted amplitude is known to be
+         # contaminated by the CN-34 amplification at 59,501 sitting near the
+         # origin; an event-censoring refit was tried and removed as too clumsy,
+         # so that contamination is currently carried rather than corrected.
          # Neither plasmid clears the GC-skew gate, which is the expected answer:
          # a plasmid has no bidirectional replication origin, so there is no sign
          # change for the cumulative curve to turn on. Both are rejected by the

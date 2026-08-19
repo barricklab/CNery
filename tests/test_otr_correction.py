@@ -14,8 +14,7 @@ from CNery.core import (
     _otr_phase_grid, _otr_grid_scores, _otr_normalize_phases, _otr_bootstrap_p,
     _otr_block_length, _otr_autocorr_length, _otr_lr_statistic,
     _otr_lr_bootstrap_p, _otr_tent_fit, _otr_cusum_range,
-    _otr_residual_structure, OTR_STRUCTURE_SURROGATES, _otr_diff_sigma,
-    _otr_detect_event, _otr_cells_to_windows, OTR_EVENT_ALPHA,
+    _otr_residual_structure, OTR_STRUCTURE_SURROGATES,
     _stage_rows, _in_band_fractions, _censor_bins, plot_correction_stages,
     _correction_chain,
 )
@@ -187,13 +186,13 @@ class TestSignificanceGate:
     """
 
     def test_flat_noise_is_rejected(self, gc_corrected_flat):
-        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
+        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
         assert detail["Coverage fit p-value"] > OTR_MAX_P
         assert detail["Breakpoint source"] == "not corrected"
 
     def test_true_ramp_is_accepted(self):
-        *_, bias, detail, _r0 = otr_fit(_prep(_make_tent_df(n=240)))
+        *_, bias, detail = otr_fit(_prep(_make_tent_df(n=240)))
         assert bias is True
         assert detail["Coverage fit p-value"] <= OTR_MAX_P
         assert detail["Coverage fit r-squared"] > 0.5
@@ -210,7 +209,7 @@ class TestSignificanceGate:
             rng = np.random.default_rng(100 + seed)
             df = _make_tent_df(n=240, ratio=1.0, sd=0.05, seed=100 + seed)
             df["gc_corr_norm_cov"] = rng.normal(1.0, 0.05, len(df))
-            *_, bias, _, _r0 = otr_fit(_prep(df), n_surrogates=200)
+            *_, bias, _ = otr_fit(_prep(df), n_surrogates=200)
             accepted += int(bias)
         assert accepted <= 2, f"{accepted}/12 pure-noise sequences accepted"
 
@@ -340,26 +339,26 @@ class TestBootstrap:
 
     def test_p_value_floors_at_one_over_b_plus_one(self):
         df = _prep(_make_tent_df(n=400, sd=0.01))
-        *_, detail, _r0 = otr_fit(df, n_surrogates=200)
+        *_, detail = otr_fit(df, n_surrogates=200)
         assert detail["Bootstrap surrogates"] == 200
         assert detail["Coverage fit p-value"] == pytest.approx(1 / 201, abs=1e-5)
 
     def test_more_surrogates_lowers_the_floor(self):
         df = _prep(_make_tent_df(n=400, sd=0.01))
-        coarse = otr_fit(df, n_surrogates=100)[-2]["Coverage fit p-value"]
-        fine = otr_fit(df, n_surrogates=500)[-2]["Coverage fit p-value"]
+        coarse = otr_fit(df, n_surrogates=100)[-1]["Coverage fit p-value"]
+        fine = otr_fit(df, n_surrogates=500)[-1]["Coverage fit p-value"]
         assert fine < coarse
 
     def test_is_deterministic_for_a_fixed_seed(self):
         df = _prep(_make_tent_df(n=240))
-        a = otr_fit(df, n_surrogates=200)[-2]
-        b = otr_fit(df, n_surrogates=200)[-2]
+        a = otr_fit(df, n_surrogates=200)[-1]
+        b = otr_fit(df, n_surrogates=200)[-1]
         assert a == b
 
     def test_seed_changes_only_the_p_value(self):
         df = _prep(_make_tent_df(n=240))
-        a = otr_fit(df, n_surrogates=200, seed=1)[-2]
-        b = otr_fit(df, n_surrogates=200, seed=2)[-2]
+        a = otr_fit(df, n_surrogates=200, seed=1)[-1]
+        b = otr_fit(df, n_surrogates=200, seed=2)[-1]
         assert a["Coverage fit r-squared"] == b["Coverage fit r-squared"]
 
     def test_too_short_to_bootstrap_declines(self):
@@ -442,7 +441,7 @@ class TestBreakpointArbitration:
         """Skew coordinates equal to the truth must survive the ratio test."""
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
-        *_, bias, detail, _r0 = otr_fit(
+        *_, bias, detail = otr_fit(
             df, n_surrogates=200, skew_result=_skew(100, 300, n)
         )
         assert bias is True
@@ -453,7 +452,7 @@ class TestBreakpointArbitration:
         """A terminus 10% of the genome away loses; that is the p1 case."""
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
-        *_, bias, detail, _r0 = otr_fit(
+        *_, bias, detail = otr_fit(
             df, n_surrogates=200, skew_result=_skew(100, 340, n)
         )
         assert bias is True
@@ -474,7 +473,7 @@ class TestBreakpointArbitration:
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.8))
         # Terminus displaced by 1% of the genome -- the regime where the two
         # estimates genuinely agree and the bootstrap should say so.
-        *_, detail, _r0 = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 304, n))
+        *_, detail = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 304, n))
         lam = detail["Coverage vs skew likelihood ratio"]
         p_boot = detail["Coverage vs skew likelihood-ratio p-value"]
         assert chi2.sf(lam, 2) < 0.01
@@ -490,7 +489,7 @@ class TestBreakpointArbitration:
         """
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03))
-        *_, o_idx, t_idx, bias, detail, _r0 = otr_fit(
+        *_, o_idx, t_idx, bias, detail = otr_fit(
             df, n_surrogates=200, skew_result=_skew(300, 100, n)
         )
         assert detail["Breakpoint source"] != "GC skew"
@@ -732,145 +731,16 @@ class TestResidualStructure:
 
     def test_not_reported_when_no_tent_was_applied(self, gc_corrected_flat):
         """A tent that was never applied has no residual worth publishing."""
-        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
+        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
         assert detail["Residual structure score"] is None
         assert detail["Residual decorrelation length (bp)"] is None
 
     def test_reported_when_a_tent_was_applied(self):
-        *_, bias, detail, _r0 = otr_fit(_prep(_make_tent_df(n=240)))
+        *_, bias, detail = otr_fit(_prep(_make_tent_df(n=240)))
         assert bias is True
         assert detail["Residual structure score"] is not None
         assert detail["Residual decorrelation length (bp)"] > 0
-
-
-class TestEventCensoring:
-    """Amplifications and deletions are censored from ONE refit of the tent.
-
-    Real copy-number events pull the fitted ramp toward themselves: measured,
-    adp1_mgd06_lb's free-fit origin lands inside its own CN-3 amplification and
-    cwbi_ssym_ht04's chromosome inside its CN-34 one. The GC-skew arm rescues the
-    coordinates on both but not the AMPLITUDE, because the anchors are still
-    solved on contaminated data.
-
-    Every decision is frozen on the uncensored series.
-
-    The gate is frozen because an iterative version of this was prototyped and
-    measured, and it manufactures significance. On ramp-free real sequences --
-    each authentic sequence with its own best-fit tent divided out, so there is
-    no ramp by construction -- letting censoring feed back into the detection
-    p-value took the false-positive rate from 0/8 to 4/8 at a nominal 1%,
-    inventing ratios up to 1.26 from starting p-values as high as 0.918.
-    Excising 1-2% of the windows removes 87-98% of the variance the bootstrap
-    was calibrated against, and a null drawn from the censored series cannot
-    defend itself. A cap does not fix it; three of those four appeared after one
-    round at ~2% censored.
-    """
-
-    def _tent(self, n=1200, ratio=1.8, sd=0.03, rho=0.7, seed=6):
-        return _make_tent_df(n=n, o=300, t=900, ratio=ratio, sd=sd, rho=rho, seed=seed)
-
-    def test_difference_sigma_ignores_a_broad_event(self):
-        """The normaliser must not be inflatable by the thing it is measuring.
-
-        This is why the detector cannot reuse _otr_cusum_range, whose
-        total-variance normaliser a 2x amplification inflates from 0.26 to 0.48
-        across 5-30% of the genome, flattening the statistic from 1.00/1.76/
-        2.94/3.84 to 1.00/1.34/1.79/2.11.
-        """
-        rng = np.random.default_rng(2)
-        r = rng.normal(0, 0.05, 2000)
-        clean = _otr_diff_sigma(r)
-        r_event = r.copy()
-        r_event[600:1200] += 0.8                            # a broad level shift
-        assert _otr_diff_sigma(r_event) == pytest.approx(clean, rel=0.10)
-        assert r_event.std() > 3 * r.std()                  # total variance is not
-
-    def test_detects_an_amplification(self):
-        n = 1200
-        df = self._tent(n=n)
-        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
-        a, b = 400, 640                                     # 20% of the genome
-        cov[a:b] *= 2.0
-        series, w = _otr_decimate(cov, np.ones(n, dtype=bool))
-        m = series.size
-        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
-        _, resid, _ = _otr_tent_fit(series, ph[0], w)
-        ev = _otr_detect_event(resid, w, n_surrogates=200)
-        assert ev["p"] <= OTR_EVENT_ALPHA
-        lo, hi = ev["cells"]
-        ca, cb = a * m // n, b * m // n
-        assert lo < cb and hi > ca, "detected interval must overlap the amplification"
-
-    def test_detects_a_deletion(self):
-        n = 1200
-        df = self._tent(n=n)
-        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
-        a, b = 400, 580
-        cov[a:b] *= 0.35
-        series, w = _otr_decimate(cov, np.ones(n, dtype=bool))
-        m = series.size
-        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
-        _, resid, _ = _otr_tent_fit(series, ph[0], w)
-        ev = _otr_detect_event(resid, w, n_surrogates=200)
-        assert ev["p"] <= OTR_EVENT_ALPHA
-        lo, hi = ev["cells"]
-        ca, cb = a * m // n, b * m // n
-        assert lo < cb and hi > ca, "detected interval must overlap the deletion"
-
-    def test_declines_on_a_clean_tent(self):
-        df = self._tent()
-        n = len(df)
-        series, w = _otr_decimate(df["gc_corr_norm_cov"].to_numpy(float),
-                                  np.ones(n, dtype=bool))
-        m = series.size
-        ph = _otr_normalize_phases(_otr_phase(m, 300 * m / n, 900 * m / n), w)
-        _, resid, _ = _otr_tent_fit(series, ph[0], w)
-        assert _otr_detect_event(resid, w, n_surrogates=200)["p"] > OTR_EVENT_ALPHA
-
-    def test_censoring_cannot_change_the_detection_p_value(self):
-        """THE guard. The p-value must come from the uncensored series alone.
-
-        Compare a run where the refit is allowed against one where it is
-        forbidden by setting the cap to zero: every decision field must be
-        bit-identical, and only the estimates may differ.
-        """
-        df = _prep(self._tent())
-        allowed = otr_fit(df, n_surrogates=200)[-2]
-        forbidden = otr_fit(df, n_surrogates=200, event_add_cap=0.0)[-2]
-        for key in ("Coverage fit p-value", "Coverage fit r-squared",
-                    "GC skew fit p-value", "Breakpoint source",
-                    "Coverage vs skew likelihood-ratio p-value"):
-            assert allowed[key] == forbidden[key], key
-
-    def test_the_cap_declines_rather_than_trims(self):
-        """At the cap the refit is refused outright, and says so.
-
-        Censoring only part of a too-large event would be the worst of both --
-        it removes real signal without removing the contamination.
-        """
-        n = 1200
-        df = self._tent(n=n)
-        cov = df["gc_corr_norm_cov"].to_numpy(float).copy()
-        cov[300:800] *= 1.8                          # 42% of the genome
-        df = df.copy()
-        df["gc_corr_norm_cov"] = cov
-        *_, detail, _r0 = otr_fit(_prep(df), n_surrogates=200, event_add_cap=0.05)
-        if detail["Event p-value"] is not None and detail["Event p-value"] <= OTR_EVENT_ALPHA:
-            assert detail["Event exceeded censoring cap"] is True
-
-    def test_cells_map_back_to_a_contiguous_window_interval(self):
-        """_otr_decimate's window -> cell map is monotone, so this is exact."""
-        m, n = 400, 1200
-        lo, hi = _otr_cells_to_windows(100, 150, m, n)
-        assert lo == 300 and hi == 450
-
-    def test_event_keys_are_null_when_nothing_was_applied(self, gc_corrected_flat):
-        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
-        assert bias is False
-        assert detail["Event p-value"] is None
-        assert detail["Event start (bp)"] is None
-        assert detail["Event exceeded censoring cap"] is False
 
 
 class TestCorrectionStagesPlot:
@@ -967,33 +837,14 @@ class TestCorrectionStagesPlot:
         assert dens.mean() == pytest.approx(0.10)
 
     def test_the_drawn_progression_is_the_real_one(self):
-        """Each step's "after" must be the next step's "before", and the last
-        must be exactly what the pipeline wrote.
-
-        This is not automatic. `otr_gc_corr_norm_cov` is produced by dividing by
-        the FINAL, post-refit tent, so naming that column as the OTR step's
-        output skips straight past the round-0 fit and leaves the refit row
-        decomposing something already shown rather than continuing the chain.
-        _correction_chain() reconstructs the round-0 intermediate so the figure
-        can honestly claim to show a progression.
-        """
+        """Each step's "after" must be the next step's "before"."""
         df = self._frame()
-        y0 = np.full(len(df), 1.10)
-        y1 = np.full(len(df), 1.05)
-        res = {"y_fit_round0": y0, "y_fit": y1, "detail": {}}
-        steps = _correction_chain(df, res, "all")
-        assert len(steps) == 3
+        steps = _correction_chain(df, None, "all")
+        assert len(steps) == 2
         for a, b in zip(steps, steps[1:]):
             assert np.allclose(a[2], b[1]), "chain must close"
         assert np.allclose(steps[0][1], df["norm_raw_cov"].to_numpy(float))
         assert np.allclose(steps[-1][2], df["otr_gc_corr_norm_cov"].to_numpy(float))
-
-    def test_no_refit_row_when_the_refit_changed_nothing(self):
-        """A row claiming a change that did not happen is worse than no row."""
-        df = self._frame()
-        same = np.full(len(df), 1.10)
-        res = {"y_fit_round0": same, "y_fit": same.copy(), "detail": {}}
-        assert len(_correction_chain(df, res, "all")) == 2
 
 
 class TestSecondGCPass:
@@ -1065,44 +916,3 @@ class TestSecondGCPass:
         out, _ = second_gc_pass(frames)
         assert len(out["a"]) == 300 and len(out["b"]) == 120
         assert set(out) == {"a", "b"}
-
-    def test_the_detected_event_is_excluded_from_the_fit(self):
-        """An amplification too distorting for the tent is not fit-worthy here.
-
-        The OTR refit censors the detected event; without this the same windows
-        are full-weight input to the GC fit immediately afterwards, which is not
-        a position anything else in the pipeline takes. Measured on the authentic
-        corpus the effect is small -- the curve moves at most 0.3% and no
-        copy-number call changes -- because the LOWESS is already robust. It is
-        here for consistency, not for magnitude.
-        """
-        n = 400
-        base = self._frame("a", n=n, gc_slope=0.0)
-        # a hard amplification over a narrow, high-GC stretch
-        cov = base["otr_gc_corr_norm_cov"].to_numpy(float).copy()
-        cov[320:360] *= 3.0
-        base["otr_gc_corr_norm_cov"] = cov
-        base["is_event"] = np.zeros(n, bool)
-
-        flagged = base.copy()
-        flagged.loc[320:359, "is_event"] = True
-
-        f_off = second_gc_pass({"a": base})[0]["a"]["gc_corr_fact_pass2"].to_numpy()
-        f_on = second_gc_pass({"a": flagged})[0]["a"]["gc_corr_fact_pass2"].to_numpy()
-        assert not np.allclose(f_off, f_on), "flagging the event must change the fit"
-
-    def test_an_event_over_the_cap_is_not_excluded(self):
-        """apply_otr_correction publishes is_event only when the refit used it.
-
-        When the event exceeded the censoring cap the refit declined it, so
-        nothing downstream should act as though it had been removed.
-        """
-        import tempfile
-        out = tempfile.mkdtemp()
-        os.makedirs(os.path.join(out, "OTR_corr"), exist_ok=True)
-        res = fit_otr_bias(_prep(_make_tent_df(n=240)), out,
-                           n_surrogates=200, event_add_cap=0.0)
-        d, _, _ = apply_otr_correction(res, out)
-        if not res["detail"]["Event exceeded censoring cap"]:
-            pytest.skip("no event large enough to hit the cap on this frame")
-        assert not d["is_event"].to_numpy(bool).any()
