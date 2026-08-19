@@ -739,32 +739,38 @@ def process_multi_genome(
 
 
 def plot_otr_corr(df, output, ori, ter):
-
+    
     genome_id = str(df["genome_id"][0])
     samplename = output.strip().split('/')[-1] + genome_id
-    saveplt = str(output+"/OTR_corr/")
-  
-    plt.figure(figsize=(10, 8))
-    plt.scatter(df["win_st"],df["norm_raw_cov"], color="gray", label="Raw reads",s=8, alpha = 0.2)
-    plt.scatter(df["win_st"],df["gc_corr_norm_cov"], color="black", label="GC corrected", marker = '*', s=15, alpha = 0.5)
-    plt.scatter(df["win_st"],df["otr_gc_corr_norm_cov"], color = 'orange', label="Ori/Ter bias corrected", s = 20, alpha = 0.85, 
-                marker = mplt.markers.MarkerStyle(marker = 'o', fillstyle = 'full'))
-    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color = "black", label = "OTR-bias-fit-line")
-    plt.plot(df["win_st"],df["gc_cor_med_fil"], color="blue", label="Med-fil")
-    
-    plt.axvline(x=ter, color='r', linestyle=':', label=f'Terminus: {ter}')
-    plt.axvline(x=ori, color='r', linestyle=':', label=f'Origin: {ori}')
-    plt.xlabel("Window (Genomic position)")
-    plt.ylabel("Normalized read coverage")
-    plt.title(f'{samplename}_Ori/Ter bias correction')
-    plt.legend(loc = 'upper right')
+    saveplt = str(output + "/OTR_corr/")
+    os.makedirs(saveplt, exist_ok=True)
 
-    plt_full_path = os.path.join(saveplt,'%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
-    plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
-    
-    df.reset_index(drop = True)
-    
-    plt.close()
+    fig, ax = plt.subplots(figsize=(12, 7))
+    ax.scatter(df["win_st"], df["norm_raw_cov"], color="#B0B0B0", linewidth=0.9,
+            alpha=0.7, label="Raw coverage (before)", zorder=1)
+    ax.plot(df["win_st"], df["gc_cor_med_fil"], color="#A95024", linewidth=1.1,
+            alpha=0.9, label="Median-filtered (fit seed)", zorder=2)
+    ax.plot(df["win_st"], df["otr_gc_corr_norm_cov"], color="#A242DE", linewidth=1.4,
+            alpha=0.95, label="OTR-corrected coverage (after)", zorder=4)
+    ax.plot(df["win_st"], df["otr_gc_corr_fact"], color="black", linewidth=2.2,
+                label="Fitted OTR trend", zorder=3)
+
+    ax.axvline(x=ori, color="#2CA02C", linestyle=":", linewidth=1.8,
+               label=f"Origin ({int(ori)})", zorder=5)
+    ax.axvline(x=ter, color="#9467BD", linestyle=":", linewidth=1.8,
+               label=f"Terminus ({int(ter)})", zorder=5)
+
+    ax.set_xlabel("Genomic position (window start)")
+    ax.set_ylabel("Normalized read coverage")
+    ax.set_title(f"{samplename}: Origin/Terminus bias correction (before vs. after)")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
+
+    plt_full_path = os.path.join(saveplt, '%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
+    fig.savefig(plt_full_path, format='pdf', bbox_inches='tight')
+
+    df.reset_index(drop=True)
+
+    plt.close(fig)
 
 
 def otr_predict(x, x_ori, x_ter, y_ori, y_ter, genome_len):
@@ -1263,14 +1269,17 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     
     genome_id = str(df_cnv["genome_id"][0])
     samplename = output.strip().split('/')[-1] + genome_id
-    # samplename = sample.strip().split('.')[0]
-    saveplt = str(output+"/CNV_plt/")
-    
+    saveplt = str(output + "/CNV_plt/")
+
     win_st = df_cnv["win_st"]
     win_end = df_cnv["win_end"]
 
-    # Check if the region of the genome to plot is defined:
+    # Median is computed from the FULL (uncropped) sequence so the CN<->read-count
+    # scale factor stays fixed regardless of --region -- a region crop must not
+    # change what "CN=1" means on the read-count axis.
+    med = df_cnv["read_count_cov"].median()
 
+    # Check if the region of the genome to plot is defined:
     if pltstart == 0 and pltend == 0:
         df_plt = df_cnv
     elif pltstart == 0 and pltend > 0:
@@ -1280,7 +1289,7 @@ def plot_copy(df_cnv, pltstart, pltend, output):
         stidx = find_nearest(win_st, pltstart)
         df_plt = df_cnv.iloc[stidx:]
     else:
-        stidx =find_nearest(win_st,pltstart)
+        stidx = find_nearest(win_st, pltstart)
         endidx = find_nearest(win_end, pltend)
         df_plt = df_cnv.iloc[stidx:endidx]
 
@@ -1295,59 +1304,49 @@ def plot_copy(df_cnv, pltstart, pltend, output):
         )
         df_plt = df_cnv
 
-    plt.figure(figsize=(10, 8))
+    fig, ax1 = plt.subplots(figsize=(12, 7))
 
-    fig, ax1 = plt.subplots()
+    ax1.scatter(df_plt["win_st"], df_plt["read_count_cov"], color="#B0B0B0",
+            s=8, alpha=0.7, label="Raw read counts (before)", zorder=1)
+    ax1.plot(df_plt["win_st"], df_plt["otr_gc_corr_rdcnt_cov"], color="#4C78A8",
+             linewidth=1.2, alpha=0.95, label="Corrected read counts (after)", zorder=2)
 
-    # fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+    # Flag redundant/repeat windows on the corrected series without breaking the
+    # "corrected coverage is a line, not points" rule: overlay the SAME series,
+    # masked to NaN everywhere except is_redundant windows, so matplotlib only
+    # draws over those segments. Small markers are added on this overlay so an
+    # isolated single flagged window (too short to render as a visible line
+    # segment on its own) still shows up.
+    if "is_redundant" in df_plt.columns and df_plt["is_redundant"].any():
+        redundant_overlay = df_plt["otr_gc_corr_rdcnt_cov"].where(df_plt["is_redundant"])
+        ax1.plot(df_plt["win_st"], redundant_overlay, color="#6EEF92",
+                 linewidth=0.75, alpha=0.95, marker="o", markersize=1.5,
+                 label="Corrected (redundant/repeat window)", zorder=3)
 
-    ax2 = ax1.twinx()
-    ax1.patch.set_visible(False)
+    cn_on_readcount_scale = df_plt["prob_copy_number"] * med
+    ax1.step(df_plt["win_st"], cn_on_readcount_scale, where="mid", color="#E45756",
+              linewidth=2.0, label="Predicted copy number", zorder=4)
 
-    ax1.set_zorder(2)  # Higher than ax2
-    ax2.set_zorder(1)  # Lower than ax1
+    ax1.set_xlabel("Genomic position (window start)")
+    ax1.set_ylabel("Read counts")
 
-    
-    ax2.scatter(df_plt["win_st"],df_plt["read_count_cov"], color="gray", label="Raw reads",s=10, alpha = 0.2)
-    ax2.scatter(df_plt["win_st"],df_plt["otr_gc_corr_rdcnt_cov"], color="orange", label="Corrected reads",s=5, alpha = 0.5,
-                marker = mplt.markers.MarkerStyle(marker = 'o', fillstyle = 'none'))
-    ax1.scatter(df_plt["win_st"],df_plt["prob_copy_number"], color="red", label="Predicted Copy Number", marker="_", s = 30)
+    # Secondary axis is the exact inverse of the CN->read-count rescaling above, so
+    # the two axes are mathematically locked: a copy number of N on the right always
+    # lines up with N * median read counts on the left, no independent ranging.
+    ax2 = ax1.secondary_yaxis(
+        'right',
+        functions=(lambda y: y / med if med else y, lambda y: y * med)
+    )
+    ax2.set_ylabel("Copy number (#)")
+    ax2.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    delta = int(df_plt['read_count_cov'].median()*0.5)
-    
-    ax1.yaxis.set_major_locator(ticker.MultipleLocator(2))
-    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
-    ax1.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+    ax1.set_title(f"{samplename}: Copy-number calls (before vs. after correction)")
+    ax1.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
 
-    n_ticks = len(ax1.get_yticks())
-    ax2.yaxis.set_major_locator(ticker.LinearLocator(n_ticks))
-    ax2.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+    plt_full_path = os.path.join(saveplt, '%s_copy_numbers.pdf' % samplename)
+    fig.savefig(plt_full_path, format='pdf', bbox_inches='tight')
 
-    
-    ax2.set_ylim(int(df_plt['read_count_cov'].min() - delta), int(df_plt['read_count_cov'].max() + delta))
-    ax1.set_ylim(int(df_plt['otr_gc_corr_norm_cov'].min() - 1), int(df_plt['otr_gc_corr_norm_cov'].max() + 1))
-
-    
-    ax1.set_xlabel("Window (Genomic position)")
-    ax1.yaxis.label.set_color('red')
-    ax2.set_ylabel("Read Counts (/)")
-    ax1.set_ylabel("Copy Number (#)")
-    
-    plt.title(f'{samplename}_Copy Number Prediction')
-    
-    handles_ax1, labels_ax1 = ax1.get_legend_handles_labels()
-    handles_ax2, labels_ax2 = ax2.get_legend_handles_labels()
-
-    # Combine handles and labels
-    handles = handles_ax1 + handles_ax2
-    labels = labels_ax1 + labels_ax2
-
-    ax1.legend(handles, labels, loc='best')
-    
-    plt_full_path = os.path.join(saveplt,'%s_copy_numbers.pdf' % samplename)
-    plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
-    
-    plt.close()    
+    plt.close(fig)
 
 #Probability calculations for the Emission and Transition matrices
 def solve_pr(mean, variance):
