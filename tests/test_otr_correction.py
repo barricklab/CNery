@@ -23,6 +23,8 @@ from CNery.core import (
     add_cn_censor,
     otr_ratio,
     pass1_summary,
+    _cnv_axis_limits,
+    _cnv_axis_ticks,
     plot_copy,
     plottable,
     refit_gc_bias_pooled,
@@ -1218,3 +1220,124 @@ class TestRepeatWindowsAreNotDrawn:
         assert plt.get_fignums() == []
         assert os.path.exists(
             os.path.join(out, "CNV_plt", "runa_copy_numbers.pdf"))
+
+
+class TestCopyNumberPlotAxes:
+    """The CN line has to pass through the coverage it describes.
+
+    plot_copy twins two axes: copy number on the left, read counts on the right.
+    They are the SAME scale in different units -- otr_gc_corr_rdcnt_cov is the
+    corrected coverage times the median read depth -- so the right axis must be
+    the left one times that median. Setting them independently, which is what the
+    code did, left the alignment to chance: measured, the CN-1 line landed 56%
+    too high on ltee_ara_m3_32k_2rg and 92% too high on cwbi_ssym_ht04's
+    chromosome.
+    """
+
+    def _frame(self, n=300, median=170.0, amp=slice(100, 140), amp_cn=3):
+        cn = np.ones(n)
+        cn[amp] = amp_cn
+        counts = median * cn
+        return pd.DataFrame({
+            "genome_id": "a",
+            "win_st": np.arange(n) * 100,
+            "win_end": np.arange(n) * 100 + 100,
+            "read_count_cov": counts,
+            "otr_gc_corr_norm_cov": cn,
+            "otr_gc_corr_rdcnt_cov": counts,
+            "prob_copy_number": cn.astype(int),
+            "is_redundant": np.zeros(n, bool),
+            "is_deletion": np.zeros(n, bool),
+        })
+
+    def test_the_two_axes_are_one_scale(self):
+        df = self._frame()
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        scale = float(df["read_count_cov"].median())
+        assert lo2 == pytest.approx(lo1 * scale)
+        assert hi2 == pytest.approx(hi1 * scale)
+
+    def test_neither_axis_goes_negative(self):
+        """A read count cannot be negative and neither can a copy number.
+        Padding the bottom the way the top is padded put a "-85 reads" tick on
+        the axis."""
+        df = self._frame()
+        (lo1, _hi1), (lo2, _hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        assert lo1 == 0.0 and lo2 == 0.0
+
+    def test_zero_coverage_is_still_inside_the_axis(self):
+        """Real deletions sit at zero, and they have to remain visible."""
+        df = self._frame()
+        df.loc[:9, "read_count_cov"] = 0.0
+        df.loc[:9, "otr_gc_corr_rdcnt_cov"] = 0.0
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        assert lo2 <= 0.0 <= hi2 and lo1 <= 0.0 <= hi1
+
+    def test_copy_number_one_lands_on_the_median_coverage(self):
+        """The whole point, stated directly."""
+        df = self._frame()
+        scale = float(df["read_count_cov"].median())
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        fraction = (1.0 - lo1) / (hi1 - lo1)
+        assert lo2 + fraction * (hi2 - lo2) == pytest.approx(scale)
+
+    @pytest.mark.parametrize("amp_cn", [2, 3, 12])
+    def test_every_state_lands_on_the_coverage_it_describes(self, amp_cn):
+        df = self._frame(amp_cn=amp_cn)
+        scale = float(df["read_count_cov"].median())
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        for k in (1, amp_cn):
+            fraction = (k - lo1) / (hi1 - lo1)
+            assert lo2 + fraction * (hi2 - lo2) == pytest.approx(k * scale)
+
+    def test_the_range_covers_both_drawn_series(self):
+        """Raw and corrected reads are both plotted; neither may fall off."""
+        df = self._frame()
+        df.loc[0, "read_count_cov"] = 4000.0
+        (_lo1, _hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        assert lo2 <= df["read_count_cov"].min()
+        assert hi2 >= df["read_count_cov"].max()
+        assert hi2 >= df["otr_gc_corr_rdcnt_cov"].max()
+
+    def test_the_scale_comes_from_every_window_not_the_drawn_ones(self):
+        """otr_gc_corr_rdcnt_cov was built with the all-window median in
+        run_HMM, so using the drawn subset's median instead would reintroduce the
+        same class of mismatch wherever repeats are excluded."""
+        df = self._frame()
+        df.loc[:49, "is_redundant"] = True
+        df.loc[:49, "read_count_cov"] = 5000.0
+        drawn = df[~df["is_redundant"].astype(bool)]
+        (_lo1, hi1), (_lo2, hi2) = _cnv_axis_limits(df, drawn, delta=85.0)
+        assert hi2 / hi1 == pytest.approx(float(df["read_count_cov"].median()))
+
+    def test_a_degenerate_frame_does_not_divide_by_zero(self):
+        df = self._frame()
+        df["read_count_cov"] = 0.0
+        df["otr_gc_corr_rdcnt_cov"] = 0.0
+        (lo1, hi1), _ = _cnv_axis_limits(df, df, delta=1.0)
+        assert np.isfinite(lo1) and np.isfinite(hi1)
+
+    def test_the_two_rulers_are_labelled_at_the_same_heights(self):
+        """Tying the scales is not enough: the ticks have to correspond too.
+
+        The right axis used to carry a LinearLocator with the same NUMBER of
+        ticks as the left but no relation to their positions, so a copy number of
+        2 -- 339 reads here -- sat beside a right-axis tick reading 381.
+        """
+        df = self._frame()
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        scale = float(df["read_count_cov"].median())
+        cn, reads = _cnv_axis_ticks([0, 2, 4, 6, 8, 10], lo1, hi1, lo2, hi2)
+        assert len(cn) == len(reads)
+        for c, r in zip(cn, reads):
+            assert r == pytest.approx(c * scale)
+
+    def test_ticks_outside_the_range_are_dropped(self):
+        df = self._frame()
+        (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        cn, _reads = _cnv_axis_ticks([-4, 0, 2, 1e6], lo1, hi1, lo2, hi2)
+        assert all(lo1 <= t <= hi1 for t in cn)
+
+    def test_a_degenerate_range_still_yields_ticks(self):
+        cn, reads = _cnv_axis_ticks([0, 1], 0.0, 0.0, 0.0, 0.0)
+        assert len(cn) == len(reads) >= 2

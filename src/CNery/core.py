@@ -3677,6 +3677,64 @@ def plot_gc_skew(df, output, result):
     return plt_full_path
 
 
+def _cnv_axis_ticks(candidate_cn_ticks, lo1, hi1, lo2, hi2):
+    """(copy-number ticks, read-count ticks) at the SAME heights.
+
+    The two axes of the CNV plot are one scale in different units, so they have
+    to be labelled at the same physical positions -- otherwise a reader taking a
+    coverage off the right axis for a state marked on the left gets a number the
+    plot does not mean.
+    """
+    scale = ((hi2 - lo2) / (hi1 - lo1)) if hi1 > lo1 else 1.0
+    cn = [float(t) for t in candidate_cn_ticks if lo1 <= t <= hi1]
+    if len(cn) < 2:
+        cn = [float(lo1), float(hi1)]
+    return cn, [lo2 + (t - lo1) * scale for t in cn]
+
+
+def _cnv_axis_limits(df_cnv, drawn, delta):
+    """Limits for plot_copy's twinned axes: ((CN lo, hi), (read count lo, hi)).
+
+    ONE SCALE, TWO LABELS. The read-count axis is the copy-number axis multiplied
+    by the median read depth, because that is exactly how otr_gc_corr_rdcnt_cov
+    was formed (run_HMM: corrected coverage * that median). Deriving the second
+    from the first is what makes a copy number of k land on the coverage a copy
+    number of k actually produces.
+
+    The two used to be set INDEPENDENTLY -- one from corrected coverage, the
+    other from raw counts, each with its own padding -- so nothing tied them
+    together and any alignment was accidental. Measured, it was wrong everywhere:
+    the CN-1 line was drawn 56% too high on ltee_ara_m3_32k_2rg and 92% too high
+    on cwbi_ssym_ht04's chromosome, and the coverage those calls describe read as
+    CN 0.23-0.46 instead of 1.00. The line did not pass through the data it was
+    labelling.
+
+    `scale` comes from EVERY window rather than the drawn ones, because that is
+    the median run_HMM used when it built otr_gc_corr_rdcnt_cov.
+    """
+    scale = float(df_cnv["read_count_cov"].median())
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+
+    shown = np.concatenate([
+        drawn["read_count_cov"].to_numpy(dtype=float),
+        drawn["otr_gc_corr_rdcnt_cov"].to_numpy(dtype=float),
+    ]) if len(drawn) else np.array([0.0])
+    shown = shown[np.isfinite(shown)]
+    if not shown.size:
+        shown = np.array([0.0])
+
+    # FLOORED AT ZERO, both of them. A read count cannot be negative and neither
+    # can a copy number, so padding the bottom the way the top is padded put a
+    # "-85 reads" tick on the axis and invited the reader to believe the scale
+    # meant something there. Windows at zero coverage -- real deletions, and the
+    # CN-0 calls that describe them -- sit on the bottom edge, which is where
+    # zero belongs.
+    lo2 = 0.0
+    hi2 = float(shown.max()) + delta
+    return (lo2, hi2 / scale), (lo2, hi2)
+
+
 def plot_copy(df_cnv, pltstart, pltend, output):
     
     genome_id = str(df_cnv["genome_id"][0])
@@ -3747,24 +3805,59 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     ax2.scatter(drawn["win_st"], drawn["otr_gc_corr_rdcnt_cov"], color="orange",
                 label="Corrected reads", s=5, alpha=0.5,
                 marker=mplt.markers.MarkerStyle(marker="o", fillstyle="none"))
-    ax1.scatter(drawn["win_st"], drawn["prob_copy_number"], color="red",
-                label="Predicted Copy Number", marker="_", s=30)
+    # COPY-NUMBER CALLS AS SEGMENTS, AT THEIR TRUE EXTENT.
+    #
+    # They used to be one scatter marker per window ("_", s=30), whose width is
+    # fixed in POINTS rather than in data units. Measured at this figure size,
+    # 5.5 pt is 44 kb of genome: a 1-window CN-0 call was drawn 440x too wide, a
+    # 7-window CN-12 block 63x, and a 26-window deletion 17x. The marks bled
+    # across neighbouring features, which is what made deletion and
+    # amplification calls appear to overlap regions they do not cover.
+    #
+    # Drawn from df_plt rather than `drawn` because a copy-number call is a
+    # property of the SEGMENT: it genuinely spans the repeat windows this figure
+    # does not plot coverage for, and breaking the line there would suggest the
+    # segment stops where only the evidence does.
+    #
+    # It is also 29 lines instead of 46,298 markers.
+    cn_all = df_plt["prob_copy_number"].to_numpy()
+    win_a = df_plt["win_st"].to_numpy()
+    win_b = df_plt["win_end"].to_numpy()
+    edges = np.r_[0, np.flatnonzero(np.diff(cn_all) != 0) + 1, len(cn_all)]
+    for a, b in zip(edges[:-1], edges[1:]):
+        ax1.hlines(cn_all[a], win_a[a], win_b[b - 1], color="red", linewidth=1.6,
+                   zorder=6)
+    ax1.plot([], [], color="red", linewidth=1.6, label="Predicted Copy Number")
 
     delta = int(drawn["read_count_cov"].median() * 0.5)
     
+    (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df_cnv, drawn, delta)
+    ax1.set_ylim(lo1, hi1)
+    ax2.set_ylim(lo2, hi2)
+
     ax1.yaxis.set_major_locator(ticker.MultipleLocator(2))
-    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
+    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
     ax1.yaxis.set_minor_locator(ticker.MultipleLocator(1))
 
-    n_ticks = len(ax1.get_yticks())
-    ax2.yaxis.set_major_locator(ticker.LinearLocator(n_ticks))
-    ax2.yaxis.set_minor_locator(ticker.MultipleLocator(1))
-
-    
-    # Scaled to what is DRAWN. Scaling to every window is what let one repeat
-    # pile-up at 18x compress every real call into the bottom twentieth of the axis.
-    ax2.set_ylim(int(drawn['read_count_cov'].min() - delta), int(drawn['read_count_cov'].max() + delta))
-    ax1.set_ylim(int(drawn['otr_gc_corr_norm_cov'].min() - 1), int(drawn['otr_gc_corr_norm_cov'].max() + 1))
+    # THE RIGHT AXIS IS LABELLED AT THE LEFT AXIS'S TICKS, times the median depth.
+    #
+    # It used to carry a LinearLocator with the same NUMBER of ticks as the left
+    # axis but no relation to their POSITIONS, so the two rulers disagreed: a
+    # copy number of 2 is 339 reads on ltee_ara_m3_32k_2rg, while the right
+    # axis's second tick read 381. Tying the SCALES is not enough on its own --
+    # anyone reading a coverage off the right axis for a state marked on the left
+    # still got a number the plot does not mean.
+    #
+    # And the minor locator was MultipleLocator(1) -- one minor tick per READ, so
+    # roughly 3,000 of them across this range. That is what drew the right spine
+    # as a solid black bar on every CNV plot, and what raised matplotlib's
+    # "Locator attempting to generate 5800 ticks ... exceeds MAXTICKS" on every
+    # run.
+    ticks_cn, ticks_reads = _cnv_axis_ticks(ax1.get_yticks(), lo1, hi1, lo2, hi2)
+    ax1.yaxis.set_major_locator(ticker.FixedLocator(ticks_cn))
+    ax2.yaxis.set_major_locator(ticker.FixedLocator(ticks_reads))
+    ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
+    ax2.yaxis.set_minor_locator(ticker.NullLocator())
 
     
     ax1.set_xlabel("Window (Genomic position)")
