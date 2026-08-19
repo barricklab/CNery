@@ -998,7 +998,7 @@ def pass1_summary(otr_fit_result, df_staged):
         "Coverage fit r-squared (pass 1)": detail.get("Coverage fit r-squared"),
         "Coverage fit p-value (pass 1)": detail.get("Coverage fit p-value"),
         "Breakpoint source (pass 1)": detail.get("Breakpoint source"),
-        "Origin-to-Termius/Bias Ratio (pass 1)": otr_ratio(otr_fit_result),
+        "Origin-to-Terminus/Bias Ratio (pass 1)": otr_ratio(otr_fit_result),
         "Windows censored as CN != 1": censored,
         "Refit on CN=1 windows": bool(censored),
     }
@@ -2365,10 +2365,12 @@ def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
     value is rounded here and passed through _json_safe() on the way out, so a
     missing statistic emits `null` and never a bare NaN.
 
-    These are additions only. "Origin-to-Termius/Bias Ratio" keeps its name and
-    its typo, and "Origin window"/"Terminus window" stay non-null, because
-    breseq parses this file with nlohmann and adding keys is the only change
-    that is safe there.
+    These are additions only, and "Origin window"/"Terminus window" stay
+    non-null, because breseq parses this file with nlohmann and adding keys is
+    the only change that is safe there. The one exception already taken is
+    "Origin-to-Terminus/Bias Ratio", spelled correctly as of this release: the
+    key was "Termius" for breseq's benefit, and fixing the spelling knowingly
+    breaks that reader until it is updated to match.
     """
     def _r(v, nd):
         return None if v is None or not np.isfinite(v) else round(float(v), nd)
@@ -2965,7 +2967,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         "Origin coverage (normalized)": yori,
         "Terminus window": int(xter),
         "Terminus coverage (normalized)": yter,
-        "Origin-to-Termius/Bias Ratio": OTR,
+        "Origin-to-Terminus/Bias Ratio": OTR,
         "Relative copy number": relative_copy_number,
         "Correction type": correction_type,
     }

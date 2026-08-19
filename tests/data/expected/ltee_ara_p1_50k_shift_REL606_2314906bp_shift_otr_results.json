@@ -3,7 +3,7 @@
     "Origin coverage (normalized)": 1.1592542356223314,
     "Terminus window": 3401501,
     "Terminus coverage (normalized)": 0.8650973597021152,
-    "Origin-to-Termius/Bias Ratio": 1.3400274808623913,
+    "Origin-to-Terminus/Bias Ratio": 1.3400274808623913,
     "Relative copy number": 1.0,
     "Correction type": "Ori-ter coordinates fit by coverage",
     "Coverage fit r-squared": 0.6443,
@@ -20,7 +20,7 @@
     "Coverage fit r-squared (pass 1)": 0.4267,
     "Coverage fit p-value (pass 1)": 0.001,
     "Breakpoint source (pass 1)": "coverage fit",
-    "Origin-to-Termius/Bias Ratio (pass 1)": 1.3464277218033682,
+    "Origin-to-Terminus/Bias Ratio (pass 1)": 1.3464277218033682,
     "Windows censored as CN != 1": 456,
     "Refit on CN=1 windows": true
 }

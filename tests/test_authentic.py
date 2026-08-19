@@ -670,7 +670,7 @@ class TestOriginTerminus:
         # Read what the run PRODUCED, not the golden -- asserting that the golden says what
         # the golden says would be circular and would pass no matter what the code did.
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
-            ratio = json.load(fh)["Origin-to-Termius/Bias Ratio"]
+            ratio = json.load(fh)["Origin-to-Terminus/Bias Ratio"]
         if seq["seq"].otr_detected:
             assert ratio != "Not detected", "expected OTR correction to fire"
             assert float(ratio) > 1.0, f"origin should out-cover terminus, got {ratio}"
@@ -714,7 +714,7 @@ class TestOriginTerminus:
             pytest.skip("no ratio reported on this sequence")
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
             data = json.load(fh)
-        assert data["Origin-to-Termius/Bias Ratio"] == pytest.approx(
+        assert data["Origin-to-Terminus/Bias Ratio"] == pytest.approx(
             data["Origin coverage (normalized)"] / data["Terminus coverage (normalized)"],
             rel=1e-12,
         )
@@ -857,8 +857,8 @@ class TestOriginTerminus:
             # made this golden fail on a 1e-6 change in the breakpoints, which is
             # noise about the shape of the tent rather than a change in what
             # CNery decided.
-            got_ratio, want_ratio = (got["Origin-to-Termius/Bias Ratio"],
-                                     want["Origin-to-Termius/Bias Ratio"])
+            got_ratio, want_ratio = (got["Origin-to-Terminus/Bias Ratio"],
+                                     want["Origin-to-Terminus/Bias Ratio"])
             assert isinstance(got_ratio, str) == isinstance(want_ratio, str)
             if isinstance(want_ratio, str):
                 assert got_ratio == want_ratio

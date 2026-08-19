@@ -562,7 +562,7 @@ class TestBreakpointArbitration:
         data = json.loads(
             next((tmp_path / "otr_rej" / "OTR_corr").glob("*.json")).read_text()
         )
-        assert data["Origin-to-Termius/Bias Ratio"] == "Not detected"
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
         assert isinstance(data["Origin window"], int)
         assert isinstance(data["Terminus window"], int)
         assert data["Coverage fit p-value"] is not None
@@ -1122,7 +1122,7 @@ class TestPassOneSummary:
         keys = pass1_summary(res1, staged)
         assert keys["Coverage fit p-value (pass 1)"] == 0.32
         assert keys["Breakpoint source (pass 1)"] == "GC skew"
-        assert keys["Origin-to-Termius/Bias Ratio (pass 1)"] == pytest.approx(1.2)
+        assert keys["Origin-to-Terminus/Bias Ratio (pass 1)"] == pytest.approx(1.2)
         assert keys["Windows censored as CN != 1"] == 5
         assert keys["Refit on CN=1 windows"] is True
 

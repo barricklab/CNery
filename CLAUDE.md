@@ -552,7 +552,7 @@ are rejected before `get_CNV.main` creates any output directory.
   median of `gc_corr_norm_cov`, and passed *into* `apply_otr_correction` rather than carried on the
   frame: it is one scalar per sequence, and a constant column would add 226–407 kB to an 8.3 MB
   `CNV.csv`.
-- `"Origin-to-Termius/Bias Ratio"` is plain `yori / yter`, so the file's own three numbers agree. It
+- `"Origin-to-Terminus/Bias Ratio"` is plain `yori / yter`, so the file's own three numbers agree. It
   used to be `yori / (yter + 0.001)` — a divide-by-zero guard that put the reported ratio ~0.1% below
   what the two coverage values printed beside it give (1.06627 against 1.06733 on `adp1_mgd06_lb`),
   so a reader checking the arithmetic found it wrong. `yter` is a least-squares anchor on a curve
@@ -561,11 +561,15 @@ are rejected before `get_CNV.main` creates any output directory.
   `TestOriginTerminus::test_reported_ratio_reproduces_from_its_own_two_values` pins it.
 - **That JSON must stay strict JSON.** breseq parses it with nlohmann, which has no `allow_nan`, so a
   single bare `NaN` makes the whole file unparseable and silently costs it all OTR reporting.
-  `_json_safe` maps non-finite values to `null` on the way out. Two further constraints from the same
-  reader: `"Origin-to-Termius/Bias Ratio"` is load-bearing **including the typo** (renaming it makes
-  breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
-  so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
-  three columns and the assert is fatal.
+  `_json_safe` maps non-finite values to `null` on the way out. `"Origin window"` / `"Terminus
+  window"` are not type-checked by that reader, so they must never be null. Adding keys is safe;
+  `_break_pts.csv` is not — breseq asserts exactly three columns and the assert is fatal.
+- **`"Origin-to-Terminus/Bias Ratio"` was `"Termius"` and the typo was load-bearing.** breseq looks
+  the key up by name with `j.count()`, so the spelling was kept wrong on purpose to keep that reader
+  working. It is now spelled correctly, which **breaks breseq's OTR reporting until breseq is updated
+  to match** — a deliberate, one-time break taken because the misspelling was in a published output
+  file that users read. Anything else about the key's contract is unchanged, and pass 1's companion
+  moved with it: `"Origin-to-Terminus/Bias Ratio (pass 1)"`.
 - `corr_plots/<sample><seq_id>_correction_stages.pdf` is the per-sequence **before/after** diagnostic:
   one row per fitting *change* — GC and OTR — each with its own censoring strip beneath it. It is emitted in **all four `--bias` modes**, and **self-creates its directory** rather
   than being added to `out_subdirs`, which is what lets the self-creation test assert something
