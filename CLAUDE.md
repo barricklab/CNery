@@ -152,6 +152,102 @@ does it unconditionally, and the `otr`/`none` branches discard the result by ove
 That is also why `is_deletion` / `is_redundant` are present on the frame in all four modes:
 `mask_coverage_windows` runs as part of that unconditional GC stage.
 
+### GC bias is corrected in TWO pooled passes
+
+`g1` is fitted on raw coverage in `process_multi_genome`. `g2` is fitted on
+**OTR-corrected** coverage by `second_gc_pass`, because the OTR tent varies with
+POSITION and position is correlated with GC — measured r between GC% and the
+fitted tent is 0.245 on `adp1_mgd06_lb`, 0.110 on `ltee_ara_p5_75k_exp`, 0.075 on
+CWBI's chromosome — so dividing by the tent puts a GC trend straight back into
+coverage the GC stage had just removed. Span of a LOWESS of coverage against GC,
+over the 1st–99th GC percentile:
+
+| sequence | raw | after `g1` | after OTR | after `g2` |
+| --- | --- | --- | --- | --- |
+| `p5_75k_exp` | 18.27% | 1.20% | **10.39%** | **1.03%** |
+| `adp1` | 12.85% | 1.03% | 3.61% | 0.89% |
+| `p1_shift` | 70.30% | 0.56% | 2.79% | 0.61% |
+
+- **Composition is exact and `gc_corr_fact` is the TOTAL.** Both passes are
+  functions of GC alone, so `final = raw / (g1·t·g2)` gives `G = g1·g2`, a single
+  curve. `gc_corr_fact` holds `G`, which is what `bias_offsets` feeds the HMM;
+  the components stay on the frame as `gc_corr_fact_pass1` / `_pass2`, and all
+  three are drawn in `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at
+  the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
+  to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
+  correction the first over-applied to the replication ramp.
+- **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
+  offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
+  near-invariant to how the two factors split it. This is a reporting-quality
+  change: the corrected coverage column and the GC curve become right,
+  `prob_copy_number` does not move.
+- **Pooled, and applied to EVERY sequence** including ones where no ramp was
+  found. Deliberate, with a measured cost: those acquired no GC trend from OTR,
+  so the correction has nothing to remove there and makes them slightly worse
+  (`m3_32k_2rg` 0.58% → 1.09%, `plasmid_2` 7.07% → 7.16%). Applied anyway because
+  GC bias belongs to the sequencing chemistry — one curve should describe the run
+  rather than a different correction reaching each reference depending on whether
+  its own OTR fit cleared a gate.
+- **An undetected ramp no longer means bit-identical coverage.** No *tent* is
+  applied there, and that is what `test_no_tent_is_applied_when_no_bias_is_found`
+  now pins — by dividing `g2` back out and requiring the result to land exactly on
+  the GC-corrected input. `GC_bias/` therefore holds **two** files, both pooled;
+  `tests/test_cli.py` asserts the count and that both name every reference.
+- **This is why `get_CNV.main` runs the per-sequence loop TWICE.** Pass A corrects
+  each sequence, then the pooled `g2` is fitted across all of them, then pass B
+  plots and calls copy number. The HMM must not see coverage that is about to
+  change, and the pooled fit cannot run until every sequence is OTR-corrected.
+  `tests/test_authentic.py::_run_pipeline` mirrors that split — that harness
+  silently diverging from `main()` has cost real debugging time before.
+
+### GC bias is corrected in TWO pooled passes
+
+`g1` is fitted on raw coverage in `process_multi_genome`. `g2` is fitted on
+**OTR-corrected** coverage by `second_gc_pass`, because the OTR tent varies with
+POSITION and position is correlated with GC — measured r between GC% and the
+fitted tent is 0.245 on `adp1_mgd06_lb`, 0.110 on `ltee_ara_p5_75k_exp`, 0.075 on
+CWBI's chromosome — so dividing by the tent puts a GC trend straight back into
+coverage the GC stage had just removed. Span of a LOWESS of coverage against GC,
+over the 1st–99th GC percentile:
+
+| sequence | raw | after `g1` | after OTR | after `g2` |
+| --- | --- | --- | --- | --- |
+| `p5_75k_exp` | 18.27% | 1.20% | **10.39%** | **1.03%** |
+| `adp1` | 12.85% | 1.03% | 3.61% | 0.89% |
+| `p1_shift` | 70.30% | 0.56% | 2.79% | 0.61% |
+
+- **Composition is exact and `gc_corr_fact` is the TOTAL.** Both passes are
+  functions of GC alone, so `final = raw / (g1·t·g2)` gives `G = g1·g2`, a single
+  curve. `gc_corr_fact` holds `G`, which is what `bias_offsets` feeds the HMM;
+  the components stay on the frame as `gc_corr_fact_pass1` / `_pass2`, and all
+  three are drawn in `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at
+  the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
+  to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
+  correction the first over-applied to the replication ramp.
+- **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
+  offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
+  near-invariant to how the two factors split it. This is a reporting-quality
+  change: the corrected coverage column and the GC curve become right,
+  `prob_copy_number` does not move.
+- **Pooled, and applied to EVERY sequence** including ones where no ramp was
+  found. Deliberate, with a measured cost: those acquired no GC trend from OTR,
+  so the correction has nothing to remove there and makes them slightly worse
+  (`m3_32k_2rg` 0.58% → 1.09%, `plasmid_2` 7.07% → 7.16%). Applied anyway because
+  GC bias belongs to the sequencing chemistry — one curve should describe the run
+  rather than a different correction reaching each reference depending on whether
+  its own OTR fit cleared a gate.
+- **An undetected ramp no longer means bit-identical coverage.** No *tent* is
+  applied there, and that is what `test_no_tent_is_applied_when_no_bias_is_found`
+  now pins — by dividing `g2` back out and requiring the result to land exactly on
+  the GC-corrected input. `GC_bias/` therefore holds **two** files, both pooled;
+  `tests/test_cli.py` asserts the count and that both name every reference.
+- **This is why `get_CNV.main` runs the per-sequence loop TWICE.** Pass A corrects
+  each sequence, then the pooled `g2` is fitted across all of them, then pass B
+  plots and calls copy number. The HMM must not see coverage that is about to
+  change, and the pooled fit cannot run until every sequence is OTR-corrected.
+  `tests/test_authentic.py::_run_pipeline` mirrors that split — that harness
+  silently diverging from `main()` has cost real debugging time before.
+
 ### Multi-genome flow
 
 `process_multi_genome` is the top of the pipeline. It takes the `{genome_id: path}` mapping from
@@ -266,6 +362,34 @@ are rejected before `get_CNV.main` creates any output directory.
   breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
   so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
   three columns and the assert is fatal.
+- `corr_plots/<sample><seq_id>_correction_stages.pdf` is the per-sequence **before/after** diagnostic:
+  one row per fitting *change* — GC, OTR, and the censored refit — each with its own censoring strip
+  beneath it. It is emitted in **all four `--bias` modes**, and **self-creates its directory** rather
+  than being added to `out_subdirs`, which is what lets the self-creation test assert something
+  instead of passing vacuously. Three things about it are load-bearing:
+  - **Censoring is not static, so one shared track would hide the only change there is.** `is_event`
+    cannot exist before the round-0 OTR fit, because it is detected from that fit's residual, so the
+    set grows exactly once — at the refit. The GC and OTR strips come out identical, which is the
+    useful reading: those two fits saw the same data. (`is_deletion`/`is_redundant` are computed once
+    in `mask_coverage_windows` on *uncorrected* coverage and never revisited, so "≤10% of the global
+    median" means something different near the origin than near the terminus; the strips make that
+    frozen-ness legible rather than implicit.)
+  - **The in-band metric is divided by `censored_median_coverage` first.** Without it the measure
+    reads **0.000 for every stage and both denominators** on both CWBI plasmids — `norm_raw_cov` is
+    normalised against the *pooled* median while they sit at 2.95× and 1.90× — and three empty bars
+    would read as "the pipeline did nothing". The scaling is a no-op elsewhere (0.981–1.001 on all
+    five chromosomes).
+  - **Both denominators are reported because the LEVEL differs**, not the delta. On `plasmid_1` the
+    uncensored figure reads a flat **1.000** against an honest **0.819**, since 52% of its windows
+    are repeats sitting at 0.6–0.75. The censoring strip is what explains the gap.
+- **The censoring strip needs two renderings.** Deletions are 1–15 runs of 12–55 windows and draw as
+  true spans; repeats are 79–**332** runs of **2–4 windows**, which at 9,258 windows across ~10
+  inches is ~0.001 inch each — spans there render as invisible stippling that reads as *nothing
+  censored*, so they get a binned density lane at `min(400, n)` bins. Do not fold deletions into that
+  density: a 12-window deletion in a 23-window bin reads 0.5 and understates it.
+- **`OTR_STAGE_ROWS` is a table rather than "whatever columns are present"** because `--bias otr`
+  aliases `gc_corr_norm_cov = norm_raw_cov` (`get_CNV.py`), so a GC row there would plot a
+  bit-identical copy of the raw series under a label that is false.
 - Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created
   once in `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
   functions in `core.py` assume they already exist. `write_gc_skew_results` and `plot_gc_skew` are

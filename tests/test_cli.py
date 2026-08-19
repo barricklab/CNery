@@ -70,8 +70,16 @@ class TestPositionalInputs:
         names = _csv_names(out)
         assert any("chrA" in n for n in names)
         assert any("chrB" in n for n in names)
-        # One pooled GC fit across both, not one per reference.
-        assert len(os.listdir(os.path.join(out, "GC_bias"))) == 1
+        # Both GC files are POOLED across the two references, not one per
+        # reference -- that is what this counts. Two files, not one, because the
+        # correction has two passes: the fit on raw coverage, and the refit after
+        # OTR that removes the GC trend the position-dependent tent puts back.
+        # Both are fitted once across every table in the run.
+        gc_files = sorted(os.listdir(os.path.join(out, "GC_bias")))
+        assert len(gc_files) == 2, gc_files
+        assert sum("GC_passes" in n for n in gc_files) == 1
+        # The giveaway that they are pooled: one file naming BOTH references.
+        assert all("chrA_and_chrB" in n for n in gc_files), gc_files
 
     def test_directory_is_expanded(self, tmp_path, monkeypatch):
         cov = tmp_path / "coverage"

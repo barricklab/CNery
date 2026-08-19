@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
+import os
 from pathlib import Path
 
 from .core import (
@@ -13,6 +14,9 @@ from .core import (
     resolve_coverage_inputs,
     fit_otr_bias,
     apply_otr_correction,
+    plot_correction_stages,
+    plot_gc_passes,
+    second_gc_pass,
     plot_otr_corr,
     predict_ori_ter_from_skew,
     write_gc_skew_results,
@@ -321,6 +325,9 @@ def main():
     # every sequence at once -- apply_otr_correction() runs per sequence.
     relative_cn = relative_copy_numbers(per_genome)
 
+    # {genome_id: corrected frame + its OTR result}, filled by pass A below.
+    staged = {}
+
     for genome_id, df_b2c in per_genome.items():
         print(f"Processing genome: {genome_id}")
 
@@ -351,87 +358,82 @@ def main():
                 f"low confidence; see GC_skew/ for the values and curve."
             )
 
+        # Pass A collects the bias-corrected frame for every sequence. The HMM
+        # and the plots deliberately do NOT run here: the second GC pass below is
+        # POOLED, so it cannot be fitted until every sequence has been
+        # OTR-corrected, and nothing downstream should see coverage that is about
+        # to change.
         if options.bias == "gc":
-            # df_b2c already GC-corrected by pooled LOWESS
-            df_gc = df_b2c.copy()
-            print(
-                f'{smpl} ({genome_id}): GC bias vs coverage handled '
-                f'(pooled fit).'
-            )
-            df_gc["otr_gc_corr_norm_cov"] = df_gc["gc_corr_norm_cov"]
-            df_cnv = run_HMM(
-                df_gc,
-                out_dir,
-                deletion_coverage_fraction=options.deletion_coverage_fraction,
-                bias=options.bias,
-                change_rate=options.change_rate,
-            )
-            emit_cnv_plot(df_cnv, genome_id)
-
-        elif options.bias == "otr":
-            # Use raw norm_raw_cov as baseline for OTR-only correction
-            df_otr_in = df_b2c.copy()
-            df_otr_in["gc_corr_norm_cov"] = df_otr_in["norm_raw_cov"]
-            # fit_otr_bias() then apply_otr_correction() replaces the old
-            # single-call otr_correction(df_otr_in, out_dir). df_otr_in
-            # already carries is_deletion/is_redundant from the earlier
-            # GC-stage mask_coverage_windows() call inside
-            # process_multi_genome(), so fit_otr_bias() reuses them
-            # directly rather than recomputing.
-            otr_fit_result = fit_otr_bias(df_otr_in, out_dir, skew_result=skew_result)
-            df_otr, ori_win, ter_win = apply_otr_correction(
-                otr_fit_result, out_dir,
-                relative_copy_number=relative_cn.get(genome_id, 1.0),
-            )
-            _report_otr(smpl, genome_id, otr_fit_result)
-            plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
-            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
-            df_cnv = run_HMM(
-                df_otr,
-                out_dir,
-                deletion_coverage_fraction=options.deletion_coverage_fraction,
-                bias=options.bias,
-                change_rate=options.change_rate,
-            )
-            emit_cnv_plot(df_cnv, genome_id)
+            df_corr = df_b2c.copy()
+            df_corr["otr_gc_corr_norm_cov"] = df_corr["gc_corr_norm_cov"]
+            otr_fit_result = ori_win = ter_win = None
+            print(f"{smpl} ({genome_id}): GC bias vs coverage handled (pooled fit).")
 
         elif options.bias == "none":
-            df_none = df_b2c.copy()
-            df_none["otr_gc_corr_norm_cov"] = df_none["norm_raw_cov"]
-            df_cnv = run_HMM(
-                df_none,
-                out_dir,
-                deletion_coverage_fraction=options.deletion_coverage_fraction,
-                bias=options.bias,
-                change_rate=options.change_rate,
-            )
-            emit_cnv_plot(df_cnv, genome_id)
+            df_corr = df_b2c.copy()
+            df_corr["otr_gc_corr_norm_cov"] = df_corr["norm_raw_cov"]
+            otr_fit_result = ori_win = ter_win = None
 
-        elif options.bias == "all":
-            # df_b2c already has GC correction applied
-            df_gc = df_b2c.copy()
-            print(
-                f'{smpl} ({genome_id}): GC bias vs coverage handled '
-                f'(pooled fit).'
-            )
-            # Same fit -> apply split as the "otr" branch above, replacing
-            # otr_correction(df_gc, out_dir).
-            otr_fit_result = fit_otr_bias(df_gc, out_dir, skew_result=skew_result)
-            df_otr, ori_win, ter_win = apply_otr_correction(
+        else:
+            # "otr" and "all" differ only in what the OTR fit is given as its
+            # baseline: --bias otr aliases gc_corr_norm_cov to the RAW coverage,
+            # so the GC correction is not applied at all in that mode.
+            df_in = df_b2c.copy()
+            if options.bias == "otr":
+                df_in["gc_corr_norm_cov"] = df_in["norm_raw_cov"]
+            else:
+                print(f"{smpl} ({genome_id}): GC bias vs coverage handled "
+                      f"(pooled fit).")
+            otr_fit_result = fit_otr_bias(df_in, out_dir, skew_result=skew_result)
+            df_corr, ori_win, ter_win = apply_otr_correction(
                 otr_fit_result, out_dir,
                 relative_copy_number=relative_cn.get(genome_id, 1.0),
             )
             _report_otr(smpl, genome_id, otr_fit_result)
-            plot_otr_corr(df_otr, output=out_dir, ori=ori_win, ter=ter_win)
+
+        staged[genome_id] = {"df": df_corr, "otr": otr_fit_result,
+                             "ori": ori_win, "ter": ter_win}
+
+    # ---- Pooled second GC pass ------------------------------------------------
+    #
+    # The OTR tent varies with position, and position correlates with GC, so
+    # dividing by it puts a GC trend back into coverage the GC stage had removed
+    # -- measured at 10.4% of coverage on ltee_ara_p5_75k_exp and 3.6% on
+    # adp1_mgd06_lb. Refitting GC on the OTR-corrected coverage removes it
+    # (1.0% and 0.9%), and because both passes are functions of GC alone they
+    # compose exactly into one total curve.
+    #
+    # Pooled for the same reason the first pass is: GC bias belongs to the
+    # sequencing chemistry, not to any one reference. That is what forces the
+    # two-pass structure above -- the fit needs every sequence corrected first.
+    #
+    # Only under --bias all. Under gc/none there is no OTR stage to reintroduce
+    # anything, and under otr the GC correction was explicitly opted out of, so
+    # quietly applying one here would ignore the flag.
+    if options.bias == "all" and staged:
+        frames, _gc2 = second_gc_pass({g: st["df"] for g, st in staged.items()})
+        for genome_id in staged:
+            staged[genome_id]["df"] = frames[genome_id]
+        gc_passes_path = plot_gc_passes(frames, out_dir)
+        print(f"{smpl}: second GC pass fitted across {len(frames)} "
+              f"sequence(s); total GC curve in "
+              f"{os.path.basename(gc_passes_path)}.")
+
+    # ---- Pass B: plots and copy-number calling, on the final coverage ---------
+    for genome_id, st in staged.items():
+        df_final, otr_fit_result = st["df"], st["otr"]
+        if otr_fit_result is not None:
+            plot_otr_corr(df_final, output=out_dir, ori=st["ori"], ter=st["ter"])
             print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
-            df_cnv = run_HMM(
-                df_otr,
-                out_dir,
-                deletion_coverage_fraction=options.deletion_coverage_fraction,
-                bias=options.bias,
-                change_rate=options.change_rate,
-            )
-            emit_cnv_plot(df_cnv, genome_id)
+        plot_correction_stages(df_final, out_dir, otr_fit_result, bias=options.bias)
+        df_cnv = run_HMM(
+            df_final,
+            out_dir,
+            deletion_coverage_fraction=options.deletion_coverage_fraction,
+            bias=options.bias,
+            change_rate=options.change_rate,
+        )
+        emit_cnv_plot(df_cnv, genome_id)
 
 
 if __name__ == "__main__":

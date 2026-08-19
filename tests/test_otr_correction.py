@@ -16,7 +16,11 @@ from CNery.core import (
     _otr_lr_bootstrap_p, _otr_tent_fit, _otr_cusum_range,
     _otr_residual_structure, OTR_STRUCTURE_SURROGATES, _otr_diff_sigma,
     _otr_detect_event, _otr_cells_to_windows, OTR_EVENT_ALPHA,
+    _stage_rows, _in_band_fractions, _censor_bins, plot_correction_stages,
+    _correction_chain,
 )
+from CNery.core import second_gc_pass
+
 
 def _ensure_dirs(base):
     os.makedirs(os.path.join(base, "OTR_corr"), exist_ok=True)
@@ -183,13 +187,13 @@ class TestSignificanceGate:
     """
 
     def test_flat_noise_is_rejected(self, gc_corrected_flat):
-        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
+        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
         assert detail["Coverage fit p-value"] > OTR_MAX_P
         assert detail["Breakpoint source"] == "not corrected"
 
     def test_true_ramp_is_accepted(self):
-        *_, bias, detail = otr_fit(_prep(_make_tent_df(n=240)))
+        *_, bias, detail, _r0 = otr_fit(_prep(_make_tent_df(n=240)))
         assert bias is True
         assert detail["Coverage fit p-value"] <= OTR_MAX_P
         assert detail["Coverage fit r-squared"] > 0.5
@@ -206,7 +210,7 @@ class TestSignificanceGate:
             rng = np.random.default_rng(100 + seed)
             df = _make_tent_df(n=240, ratio=1.0, sd=0.05, seed=100 + seed)
             df["gc_corr_norm_cov"] = rng.normal(1.0, 0.05, len(df))
-            *_, bias, _ = otr_fit(_prep(df), n_surrogates=200)
+            *_, bias, _, _r0 = otr_fit(_prep(df), n_surrogates=200)
             accepted += int(bias)
         assert accepted <= 2, f"{accepted}/12 pure-noise sequences accepted"
 
@@ -336,26 +340,26 @@ class TestBootstrap:
 
     def test_p_value_floors_at_one_over_b_plus_one(self):
         df = _prep(_make_tent_df(n=400, sd=0.01))
-        *_, detail = otr_fit(df, n_surrogates=200)
+        *_, detail, _r0 = otr_fit(df, n_surrogates=200)
         assert detail["Bootstrap surrogates"] == 200
         assert detail["Coverage fit p-value"] == pytest.approx(1 / 201, abs=1e-5)
 
     def test_more_surrogates_lowers_the_floor(self):
         df = _prep(_make_tent_df(n=400, sd=0.01))
-        coarse = otr_fit(df, n_surrogates=100)[-1]["Coverage fit p-value"]
-        fine = otr_fit(df, n_surrogates=500)[-1]["Coverage fit p-value"]
+        coarse = otr_fit(df, n_surrogates=100)[-2]["Coverage fit p-value"]
+        fine = otr_fit(df, n_surrogates=500)[-2]["Coverage fit p-value"]
         assert fine < coarse
 
     def test_is_deterministic_for_a_fixed_seed(self):
         df = _prep(_make_tent_df(n=240))
-        a = otr_fit(df, n_surrogates=200)[-1]
-        b = otr_fit(df, n_surrogates=200)[-1]
+        a = otr_fit(df, n_surrogates=200)[-2]
+        b = otr_fit(df, n_surrogates=200)[-2]
         assert a == b
 
     def test_seed_changes_only_the_p_value(self):
         df = _prep(_make_tent_df(n=240))
-        a = otr_fit(df, n_surrogates=200, seed=1)[-1]
-        b = otr_fit(df, n_surrogates=200, seed=2)[-1]
+        a = otr_fit(df, n_surrogates=200, seed=1)[-2]
+        b = otr_fit(df, n_surrogates=200, seed=2)[-2]
         assert a["Coverage fit r-squared"] == b["Coverage fit r-squared"]
 
     def test_too_short_to_bootstrap_declines(self):
@@ -438,7 +442,7 @@ class TestBreakpointArbitration:
         """Skew coordinates equal to the truth must survive the ratio test."""
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
-        *_, bias, detail = otr_fit(
+        *_, bias, detail, _r0 = otr_fit(
             df, n_surrogates=200, skew_result=_skew(100, 300, n)
         )
         assert bias is True
@@ -449,7 +453,7 @@ class TestBreakpointArbitration:
         """A terminus 10% of the genome away loses; that is the p1 case."""
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
-        *_, bias, detail = otr_fit(
+        *_, bias, detail, _r0 = otr_fit(
             df, n_surrogates=200, skew_result=_skew(100, 340, n)
         )
         assert bias is True
@@ -470,7 +474,7 @@ class TestBreakpointArbitration:
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.8))
         # Terminus displaced by 1% of the genome -- the regime where the two
         # estimates genuinely agree and the bootstrap should say so.
-        *_, detail = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 304, n))
+        *_, detail, _r0 = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 304, n))
         lam = detail["Coverage vs skew likelihood ratio"]
         p_boot = detail["Coverage vs skew likelihood-ratio p-value"]
         assert chi2.sf(lam, 2) < 0.01
@@ -486,7 +490,7 @@ class TestBreakpointArbitration:
         """
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03))
-        *_, o_idx, t_idx, bias, detail = otr_fit(
+        *_, o_idx, t_idx, bias, detail, _r0 = otr_fit(
             df, n_surrogates=200, skew_result=_skew(300, 100, n)
         )
         assert detail["Breakpoint source"] != "GC skew"
@@ -728,13 +732,13 @@ class TestResidualStructure:
 
     def test_not_reported_when_no_tent_was_applied(self, gc_corrected_flat):
         """A tent that was never applied has no residual worth publishing."""
-        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
+        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
         assert detail["Residual structure score"] is None
         assert detail["Residual decorrelation length (bp)"] is None
 
     def test_reported_when_a_tent_was_applied(self):
-        *_, bias, detail = otr_fit(_prep(_make_tent_df(n=240)))
+        *_, bias, detail, _r0 = otr_fit(_prep(_make_tent_df(n=240)))
         assert bias is True
         assert detail["Residual structure score"] is not None
         assert detail["Residual decorrelation length (bp)"] > 0
@@ -832,8 +836,8 @@ class TestEventCensoring:
         bit-identical, and only the estimates may differ.
         """
         df = _prep(self._tent())
-        allowed = otr_fit(df, n_surrogates=200)[-1]
-        forbidden = otr_fit(df, n_surrogates=200, event_add_cap=0.0)[-1]
+        allowed = otr_fit(df, n_surrogates=200)[-2]
+        forbidden = otr_fit(df, n_surrogates=200, event_add_cap=0.0)[-2]
         for key in ("Coverage fit p-value", "Coverage fit r-squared",
                     "GC skew fit p-value", "Breakpoint source",
                     "Coverage vs skew likelihood-ratio p-value"):
@@ -851,7 +855,7 @@ class TestEventCensoring:
         cov[300:800] *= 1.8                          # 42% of the genome
         df = df.copy()
         df["gc_corr_norm_cov"] = cov
-        *_, detail = otr_fit(_prep(df), n_surrogates=200, event_add_cap=0.05)
+        *_, detail, _r0 = otr_fit(_prep(df), n_surrogates=200, event_add_cap=0.05)
         if detail["Event p-value"] is not None and detail["Event p-value"] <= OTR_EVENT_ALPHA:
             assert detail["Event exceeded censoring cap"] is True
 
@@ -862,8 +866,202 @@ class TestEventCensoring:
         assert lo == 300 and hi == 450
 
     def test_event_keys_are_null_when_nothing_was_applied(self, gc_corrected_flat):
-        *_, bias, detail = otr_fit(_prep(gc_corrected_flat))
+        *_, bias, detail, _r0 = otr_fit(_prep(gc_corrected_flat))
         assert bias is False
         assert detail["Event p-value"] is None
         assert detail["Event start (bp)"] is None
         assert detail["Event exceeded censoring cap"] is False
+
+
+class TestCorrectionStagesPlot:
+    """The per-sequence before/after diagnostic.
+
+    Pixels are not asserted on. What is asserted on are the decisions the figure
+    makes -- which rows a --bias mode draws, how the in-band fractions are
+    computed, and how censoring is binned -- because those are the parts that can
+    be silently wrong while still producing a plausible-looking PDF.
+    """
+
+    def _frame(self, n=240):
+        df = _prep(_make_tent_df(n=n))
+        df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"] * 0.98
+        df["otr_gc_corr_fact"] = 1.0
+        return df
+
+    def test_plot_is_written_and_makes_its_own_directory(self, tmp_path):
+        """Nothing pre-creates corr_plots/, which is the point.
+
+        tests/test_integration.py::_ensure_dirs deliberately does not create it
+        either, so this assertion is not vacuous -- if the writer stopped
+        self-creating, that file's tests would start failing too.
+        """
+        out = str(tmp_path / "run")
+        os.makedirs(out)
+        path = plot_correction_stages(self._frame(), out, None, bias="gc")
+        assert os.path.exists(path)
+        assert path.endswith("_correction_stages.pdf")
+        assert os.path.isdir(os.path.join(out, "corr_plots"))
+
+    def test_leaves_no_figure_open(self, tmp_path):
+        """Regression guard for the plot_copy leak, on the new figure."""
+        import matplotlib.pyplot as plt
+        out = str(tmp_path / "run")
+        os.makedirs(out)
+        plt.close("all")
+        plot_correction_stages(self._frame(), out, None, bias="gc")
+        assert plt.get_fignums() == []
+
+    @pytest.mark.parametrize("bias,rows", [("all", 2), ("gc", 1), ("otr", 1), ("none", 0)])
+    def test_bias_mode_selects_its_rows(self, bias, rows):
+        assert len(_stage_rows(bias)) == rows
+
+    def test_otr_mode_never_draws_the_aliased_gc_column(self):
+        """get_CNV.main() sets gc_corr_norm_cov = norm_raw_cov under --bias otr.
+
+        Drawing a "GC corrected" row there would plot a bit-identical copy of the
+        raw series under a label that is false. The figure has to know about the
+        aliasing; it cannot infer it from which columns happen to be present.
+        """
+        assert all(row[0] != "gc_corr_norm_cov" and row[1] != "gc_corr_norm_cov"
+                   for row in _stage_rows("otr"))
+        assert any("gc_corr_norm_cov" in row for row in _stage_rows("all"))
+
+    def test_both_denominators_are_reported(self):
+        n = 100
+        df = pd.DataFrame({
+            "v": np.r_[np.full(90, 1.0), np.full(10, 0.4)],
+            "is_deletion": np.r_[np.zeros(90, bool), np.ones(10, bool)],
+            "is_redundant": np.zeros(n, bool),
+            "gc_corr_norm_cov": 1.0,
+        })
+        censored = df["is_deletion"].to_numpy()
+        assert _in_band_fractions(df["v"].to_numpy(), 1.0, censored) == pytest.approx((0.90, 1.00))
+
+    def test_metric_is_invariant_to_replicon_copy_number(self):
+        """A 2.95x plasmid must not read 0.000 at every stage.
+
+        norm_raw_cov is normalised against the POOLED median, so a multi-copy
+        replicon never enters the 0.8-1.2 band at all. Without scaling by the
+        sequence's own censored median the figure would draw three empty bars on
+        CWBI's plasmids and read as "the pipeline did nothing".
+        """
+        n = 100
+        base = np.r_[np.full(90, 1.0), np.full(10, 0.4)]
+        censored = np.r_[np.zeros(90, bool), np.ones(10, bool)]
+        one = _in_band_fractions(base, 1.0, censored)
+        scaled = _in_band_fractions(base * 2.95, 2.95, censored)
+        assert one == pytest.approx(scaled)
+
+    def test_censor_bins_are_exact_on_a_short_sequence(self):
+        mask = np.zeros(50, dtype=bool)
+        mask[10:20] = True
+        x, dens = _censor_bins(mask, n_bins=400)
+        assert dens.size == 50           # one bin per window, no special case
+        assert dens.sum() == pytest.approx(10.0)
+
+    def test_censor_bins_average_over_a_long_sequence(self):
+        mask = np.zeros(1000, dtype=bool)
+        mask[100:200] = True
+        _x, dens = _censor_bins(mask, n_bins=100)
+        assert dens.size == 100
+        assert dens.mean() == pytest.approx(0.10)
+
+    def test_the_drawn_progression_is_the_real_one(self):
+        """Each step's "after" must be the next step's "before", and the last
+        must be exactly what the pipeline wrote.
+
+        This is not automatic. `otr_gc_corr_norm_cov` is produced by dividing by
+        the FINAL, post-refit tent, so naming that column as the OTR step's
+        output skips straight past the round-0 fit and leaves the refit row
+        decomposing something already shown rather than continuing the chain.
+        _correction_chain() reconstructs the round-0 intermediate so the figure
+        can honestly claim to show a progression.
+        """
+        df = self._frame()
+        y0 = np.full(len(df), 1.10)
+        y1 = np.full(len(df), 1.05)
+        res = {"y_fit_round0": y0, "y_fit": y1, "detail": {}}
+        steps = _correction_chain(df, res, "all")
+        assert len(steps) == 3
+        for a, b in zip(steps, steps[1:]):
+            assert np.allclose(a[2], b[1]), "chain must close"
+        assert np.allclose(steps[0][1], df["norm_raw_cov"].to_numpy(float))
+        assert np.allclose(steps[-1][2], df["otr_gc_corr_norm_cov"].to_numpy(float))
+
+    def test_no_refit_row_when_the_refit_changed_nothing(self):
+        """A row claiming a change that did not happen is worse than no row."""
+        df = self._frame()
+        same = np.full(len(df), 1.10)
+        res = {"y_fit_round0": same, "y_fit": same.copy(), "detail": {}}
+        assert len(_correction_chain(df, res, "all")) == 2
+
+
+class TestSecondGCPass:
+    """The pooled GC refit after OTR, composed into one total curve.
+
+    It exists because the OTR tent varies with POSITION and position correlates
+    with GC, so dividing by it puts a GC trend back into coverage the GC stage
+    had removed -- measured at 10.4% of coverage on ltee_ara_p5_75k_exp. Pooled,
+    like the first pass, because GC bias is a property of the chemistry rather
+    than of any one reference.
+    """
+
+    def _frame(self, gid, n=400, gc_slope=0.0, seed=1):
+        rng = np.random.default_rng(seed)
+        gc = np.linspace(0.35, 0.60, n)
+        cov = 1.0 + gc_slope * (gc - 0.475) + rng.normal(0, 0.01, n)
+        return pd.DataFrame({
+            "genome_id": gid,
+            "win_st": np.arange(n) * 100,
+            "win_end": np.arange(n) * 100 + 100,
+            "gc_percent": gc,
+            "norm_raw_cov": cov,
+            "gc_corr_norm_cov": cov,
+            "otr_gc_corr_norm_cov": cov,
+            "gc_corr_fact": np.full(n, 1.20),
+            "is_deletion": np.zeros(n, bool),
+            "is_redundant": np.zeros(n, bool),
+            "exclude_from_fit": np.zeros(n, bool),
+        })
+
+    def test_total_curve_is_the_product_of_the_two_passes(self):
+        """Both passes are functions of GC alone, so composition is exact.
+
+        This is what lets a single `gc_corr_fact` carry the whole GC correction
+        into run_HMM's emission offset while the two components stay auditable.
+        """
+        out, _ = second_gc_pass({"a": self._frame("a", gc_slope=0.6)})
+        d = out["a"]
+        assert np.allclose(d["gc_corr_fact"],
+                           d["gc_corr_fact_pass1"] * d["gc_corr_fact_pass2"])
+
+    def test_it_removes_a_gc_trend_the_first_pass_left(self):
+        d = second_gc_pass({"a": self._frame("a", gc_slope=0.6)})[0]["a"]
+        gc = d["gc_percent"].to_numpy()
+        v = d["otr_gc_corr_norm_cov"].to_numpy()
+        before = self._frame("a", gc_slope=0.6)["otr_gc_corr_norm_cov"].to_numpy()
+        lo_h, hi_h = gc < 0.45, gc > 0.55
+        assert abs(v[hi_h].mean() - v[lo_h].mean()) < abs(
+            before[hi_h].mean() - before[lo_h].mean())
+
+    def test_it_is_pooled_not_per_sequence(self):
+        """One curve across every reference, like the first pass.
+
+        Two sequences with opposite GC trends must receive the SAME correction
+        factor at the same GC -- if it were fitted per sequence they would get
+        different ones and cancel their own trends independently.
+        """
+        frames = {"a": self._frame("a", gc_slope=0.6, seed=1),
+                  "b": self._frame("b", gc_slope=-0.6, seed=2)}
+        out, _ = second_gc_pass(frames)
+        fa = out["a"].set_index("gc_percent")["gc_corr_fact_pass2"]
+        fb = out["b"].set_index("gc_percent")["gc_corr_fact_pass2"]
+        common = fa.index.intersection(fb.index)
+        assert len(common) > 50
+        assert np.allclose(fa.loc[common].to_numpy(), fb.loc[common].to_numpy())
+
+    def test_every_sequence_comes_back_with_its_own_rows(self):
+        frames = {"a": self._frame("a", n=300), "b": self._frame("b", n=120)}
+        out, _ = second_gc_pass(frames)
+        assert len(out["a"]) == 300 and len(out["b"]) == 120
+        assert set(out) == {"a", "b"}

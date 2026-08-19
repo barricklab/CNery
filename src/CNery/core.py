@@ -693,6 +693,149 @@ def fit_gc_bias(
     return {"gc_sorted": gc_sorted, "fit_sorted": fit_sorted, "floor": floor}
 
 
+def second_gc_pass(per_genome):
+    """Pooled GC refit AFTER OTR correction, composed into ONE total GC curve.
+
+    Why a second pass exists at all: `gc_corr_norm_cov` is flat against GC by
+    construction, but the OTR tent varies with POSITION, and position is
+    correlated with GC -- measured r between GC% and the fitted tent is 0.245 on
+    adp1_mgd06_lb, 0.110 on ltee_ara_p5_75k_exp, 0.075 on CWBI's chromosome. So
+    dividing by the tent puts a GC trend back into coverage the GC stage had just
+    removed. Measured span of a LOWESS of coverage against GC, over the 1st-99th
+    GC percentile:
+
+        sequence      raw     after GC   after OTR   after this pass
+        p5_75k_exp   18.27%     1.20%      10.39%         1.03%
+        adp1         12.85%     1.03%       3.61%         0.89%
+        p1_shift     70.30%     0.56%       2.79%         0.61%
+
+    Pooled, like the first pass and for the same reason: GC bias is a property of
+    the sequencing chemistry rather than of any one reference, so it is fitted
+    once across every table in the run. That is why this cannot live inside the
+    per-sequence loop -- every sequence has to be OTR-corrected before the fit
+    can see the pooled residual.
+
+    COMPOSITION IS EXACT. Both passes are functions of GC alone, so
+
+        final = raw / (g1(gc) * t(x) * g2(gc))    =>    G(gc) = g1(gc) * g2(gc)
+
+    and the total GC correction is a single curve. `gc_corr_fact` becomes G, so
+    run_HMM's emission offset (`bias_offsets`, which reads that column) carries
+    the composed divisor. The two components stay on the frame as
+    `gc_corr_fact_pass1` / `gc_corr_fact_pass2` so the correction is auditable
+    and the reported curves can be drawn separately.
+
+    Measured: this changes NO copy-number call on any of the eight authentic
+    sequences, despite the offset moving up to 10.2% on p5_75k_exp -- the HMM
+    consumes the product and is near-invariant to how the two factors split it.
+    It is a reporting-quality change: the corrected coverage column and the GC
+    curve become right, `prob_copy_number` does not move.
+
+    SCOPE. Fitted across every sequence and applied to every sequence, including
+    ones where no ramp was detected and so no tent was divided out. That is a
+    deliberate choice with a measured cost: those sequences acquired no GC trend
+    from OTR, so this correction has nothing there to remove and makes them
+    slightly worse -- ltee_ara_m3_32k_2rg goes 0.58% -> 1.09% and CWBI's
+    plasmid_2 7.07% -> 7.16%. It is applied anyway because GC bias belongs to the
+    sequencing chemistry, so one curve should describe the whole run rather than
+    a different correction landing on each reference depending on whether its own
+    OTR fit happened to clear a significance gate.
+
+    A consequence worth knowing: coverage on a sequence with no detected ramp is
+    no longer bit-identical to its GC-corrected input. No TENT is applied there --
+    that invariant holds, and is what
+    TestOriginTerminus::test_coverage_passes_through_when_no_bias_is_found now
+    pins -- but this pass still touches it.
+
+    Returns ({genome_id: df}, fit2).
+    """
+    ids = list(per_genome)
+    if not ids:
+        return dict(per_genome), None
+    pooled = pd.concat([per_genome[g] for g in ids], ignore_index=True)
+
+    scratch = pooled.copy()
+    scratch["norm_raw_cov"] = pooled["otr_gc_corr_norm_cov"]
+    fit2 = fit_gc_bias(scratch)
+    scratch = apply_gc_correction(scratch, fit2)
+
+    pooled["gc_corr_fact_pass1"] = pooled["gc_corr_fact"].to_numpy(dtype=float)
+    pooled["gc_corr_fact_pass2"] = scratch["gc_corr_fact"].to_numpy(dtype=float)
+    pooled["gc_corr_fact"] = (pooled["gc_corr_fact_pass1"].to_numpy(dtype=float)
+                              * pooled["gc_corr_fact_pass2"].to_numpy(dtype=float))
+    pooled["otr_gc_corr_norm_cov"] = scratch["gc_corr_norm_cov"].to_numpy(dtype=float)
+
+    out = dict(per_genome)
+    for genome_id in ids:
+        sub = pooled[pooled["genome_id"] == genome_id].copy()
+        sub.reset_index(drop=True, inplace=True)
+        out[genome_id] = sub
+    return out, fit2
+
+
+def plot_gc_passes(per_genome, output):
+    """The two GC passes and their product, as one figure.
+
+    g1 is the pooled fit on raw coverage; g2 the pooled fit on OTR-corrected
+    coverage; G = g1 * g2 is the total GC correction actually applied. Drawn
+    together because the interesting fact is that they OPPOSE each other at the
+    extremes -- on ltee_ara_p5_75k_exp g1 climbs to 1.159 at high GC while g2
+    falls to 0.926, so G reaches only 1.073. The second pass is mostly removing
+    correction the first pass over-applied to the replication ramp.
+
+    Pooled across sequences, so one file per run, like gc_cor_plots(). Makes its
+    own directory as that function does. Returns the path.
+    """
+    pooled = pd.concat(per_genome.values(), ignore_index=True)
+    label = "_and_".join(sorted(str(g) for g in per_genome))
+    samplename = output.strip().split("/")[-1] + label
+    savedir = os.path.join(output, "GC_bias")
+    os.makedirs(savedir, exist_ok=True)
+
+    gc = pooled["gc_percent"].to_numpy(dtype=float)
+    keep = np.ones(len(pooled), dtype=bool)
+    for col in ("is_deletion", "is_redundant"):
+        if col in pooled:
+            keep &= ~pooled[col].to_numpy(dtype=bool)
+    if not keep.any():
+        keep = np.ones(len(pooled), dtype=bool)
+
+    order = np.argsort(gc[keep])
+    x = gc[keep][order]
+    g1 = pooled["gc_corr_fact_pass1"].to_numpy(dtype=float)[keep][order]
+    g2 = pooled["gc_corr_fact_pass2"].to_numpy(dtype=float)[keep][order]
+    tot = pooled["gc_corr_fact"].to_numpy(dtype=float)[keep][order]
+    g1, g2, tot = (c / np.median(c) for c in (g1, g2, tot))
+
+    lo, hi = np.percentile(x, [1, 99])
+    m = (x >= lo) & (x <= hi)
+
+    def span(c):
+        return 100.0 * float(c[m].max() - c[m].min())
+
+    plt.figure(figsize=(10, 8))
+    plt.axhline(1.0, color="0.7", lw=0.8)
+    plt.plot(x, g1, color="tab:blue", lw=1.8,
+             label=f"g1: fitted on raw coverage (span {span(g1):.1f}%)")
+    plt.plot(x, g2, color="tab:orange", lw=1.8,
+             label=f"g2: fitted after OTR (span {span(g2):.1f}%)")
+    plt.plot(x, tot, color="black", lw=2.4,
+             label=f"G = g1 x g2, total applied (span {span(tot):.1f}%)")
+    plt.axvspan(x.min(), lo, color="0.9", zorder=0)
+    plt.axvspan(hi, x.max(), color="0.9", zorder=0)
+    plt.xlabel("GC fraction of the window's fragment-sized neighbourhood")
+    plt.ylabel("correction divisor, normalised to its median")
+    plt.title(f"{samplename}_GC bias: both passes and their product\n"
+              f"grey bands are outside the 1st-99th GC percentile",
+              fontsize=10)
+    plt.legend(loc="best", fontsize=9)
+
+    path = os.path.join(savedir, "%s_GC_passes.pdf" % samplename.replace(" ", "_"))
+    plt.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close()
+    return path
+
+
 def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
     """
     Apply stage of GC-bias correction: interpolate the fitted LOWESS curve
@@ -1959,7 +2102,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         # Not enough clean data to fit anything meaningful.
         y_flat = np.repeat(np.mean(y), n)
         print("OTR bias not detected (insufficient clean windows)")
-        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail()
+        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail(), y_flat
 
     # ---- The statistic's exhaustive grid, computed FIRST ------------------
     #
@@ -2052,7 +2195,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     if best is None:
         y_flat = np.repeat(np.mean(y), n)
         print("OTR bias not detected (no seed converged)")
-        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail()
+        return y, y_flat, o_idx_seed, t_idx_seed, False, _otr_detail(), y_flat
 
     _, x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt = best
 
@@ -2140,7 +2283,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         return y, y_fit, o_idx, t_idx, False, _otr_detail(
             s_free=s_free, p_free=p_free, s_skew=s_skew, p_skew=p_skew,
             surrogates=surrogates, skew_result=skew_result, source="not corrected",
-        )
+        ), y_fit
 
     if use_free:
         source = "coverage fit"
@@ -2180,6 +2323,10 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     # chromosome inside its CN-34 one, and censoring takes CWBI's applied ratio
     # from 1.169 to 1.075 -- roughly 40% of the ramp being divided out of that
     # chromosome was copy number, not replication.
+    # Kept so plot_correction_stages() can draw the refit as a before/after. When
+    # no event fires these are the final values and the two tents coincide.
+    round0 = (x_ori_opt, x_ter_opt, y_ori_opt, y_ter_opt)
+
     event, event_windows, event_capped = None, None, False
     if grid_ok:
         applied_phase = _otr_normalize_phases(
@@ -2261,6 +2408,8 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
     y_fit = np.clip(y_fit, otr_floor, None)
     y_corr = y / y_fit
 
+    y_fit_round0 = np.clip(otr_predict(x, *round0, genome_len), otr_floor, None)
+
     event_bp = None
     if event and event.get("cells") is not None and event["p"] <= event_alpha:
         e_lo, e_hi = _otr_cells_to_windows(*event["cells"], m, n)
@@ -2273,7 +2422,7 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         skew_result=skew_result, source=source,
         structure=structure, decorr_bp=decorr_bp,
         event=event, event_bp=event_bp, event_capped=event_capped,
-    )
+    ), y_fit_round0
 
 
 def find_nearest(array, value):
@@ -2328,7 +2477,7 @@ def fit_otr_bias(df, output, skew_result=None, **otr_kwargs):
                 df["gc_corr_norm_cov"], size=win, mode="reflect"
             )
 
-    y_corr, y_fit, o_idx, t_idx, bias, detail = otr_fit(
+    y_corr, y_fit, o_idx, t_idx, bias, detail, y_fit_round0 = otr_fit(
         df, skew_result=skew_result, **otr_kwargs
     )
 
@@ -2339,6 +2488,11 @@ def fit_otr_bias(df, output, skew_result=None, **otr_kwargs):
         "t_idx": t_idx,
         "bias": bias,
         "detail": detail,
+        # The tent as it stood BEFORE the censored refit. Identical to "y_fit"
+        # when no event fired. Kept for plot_correction_stages(), which draws the
+        # refit as a before/after; it is an array, so it cannot live in `detail`,
+        # which is merged verbatim into the results JSON.
+        "y_fit_round0": np.asarray(y_fit_round0, dtype=float),
         "df_with_medfil": df,
     }
 
@@ -2747,6 +2901,336 @@ def write_gc_skew_results(result, output, genome_id):
         # tolerates but is not valid RFC JSON. Every value here is finite, so
         # this stays strict -- and fails loudly if that ever stops being true.
         json.dump(result, fh, indent=4, allow_nan=False)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Per-sequence correction diagnostic: a before/after for every fitting step, and
+# what each of those fits was allowed to see.
+#
+# The existing plot_otr_corr() overlays all three coverage stages on one axis,
+# which buries the "before": raw is drawn first and the GC and OTR clouds cover
+# it. One row per CHANGE, with its own censoring strip, keeps each comparison
+# visible and makes the censoring legible where it actually applies.
+# ---------------------------------------------------------------------------
+
+#: Rows drawn per --bias mode, as (before, after, label, factor). The `otr` mode
+#: is why this is a table rather than "whatever columns are present":
+#: get_CNV.main() aliases gc_corr_norm_cov = norm_raw_cov there, so a GC row
+#: would plot a bit-identical copy of the raw series under a label that is a lie.
+OTR_STAGE_ROWS = {
+    "all": (("norm_raw_cov", "gc_corr_norm_cov", "GC correction", "gc_corr_fact"),
+            ("gc_corr_norm_cov", "otr_gc_corr_norm_cov", "OTR correction", "otr_gc_corr_fact")),
+    "gc": (("norm_raw_cov", "gc_corr_norm_cov", "GC correction", "gc_corr_fact"),),
+    "otr": (("norm_raw_cov", "otr_gc_corr_norm_cov", "OTR correction", "otr_gc_corr_fact"),),
+    "none": (),
+}
+
+#: Bins for the repeat-density lane. Repeats come in hundreds of 2-4 window
+#: fragments (measured: 79-332 runs per sequence, median 2-4 windows), so drawing
+#: them as spans on a 9,258-window genome gives ~0.001 inch each -- invisible
+#: stippling that reads as "nothing censored". Deletions are the opposite, a
+#: handful of 12-55 window blocks, and get true spans on their own lane: folding
+#: them into this density would put a 12-window deletion in a 23-window bin at
+#: 0.5 and understate it.
+OTR_CENSOR_BINS = 400
+
+
+def _stage_rows(bias):
+    """The before/after rows to draw for this --bias mode."""
+    return OTR_STAGE_ROWS.get(bias, OTR_STAGE_ROWS["all"])
+
+
+def _in_band_fractions(values, scale, censored):
+    """(all windows, uncensored only) fraction within 20% of single copy.
+
+    Scaled by the sequence's own censored median first. Without that the measure
+    reads 0.000 for every stage on a multi-copy replicon -- norm_raw_cov is
+    normalised against the POOLED median, so CWBI's plasmids sit at 2.95x and
+    1.90x and never enter the band at all, which would draw as "the pipeline did
+    nothing" on the one sequence where it plainly did something. The scaling is a
+    no-op where it should be: measured 0.981-1.001 on all five chromosomes.
+
+    Both denominators are reported because the LEVEL differs even where the
+    change does not. On CWBI's plasmid_1 the uncensored figure reads a flat 1.000
+    against an honest 0.819, since 52% of its windows are repeats sitting at
+    0.6-0.75 -- quoting only the uncensored number would claim perfection on a
+    sequence half of which is off-band.
+    """
+    v = np.asarray(values, dtype=float)
+    if scale and np.isfinite(scale) and scale > 0:
+        v = v / scale
+    in_band = (v > 0.8) & (v < 1.2)
+    keep = ~np.asarray(censored, dtype=bool)
+    return (float(in_band.mean()),
+            float(in_band[keep].mean()) if keep.any() else float("nan"))
+
+
+def _apply_tent(df, y_fit, base):
+    """Coverage after dividing by `y_fit`, using apply_otr_correction()'s rule.
+
+    Deletion windows keep their uncorrected value -- apply_otr_correction()
+    leaves them alone so a real deletion is not divided back up toward 1 -- so
+    reproducing that here is what makes an intermediate stage comparable to the
+    column the pipeline actually wrote.
+    """
+    out = np.asarray(base, dtype=float).copy()
+    keep = ~df["is_deletion"].to_numpy(dtype=bool) if "is_deletion" in df else np.ones(out.size, bool)
+    y = np.asarray(y_fit, dtype=float)
+    out[keep] = np.asarray(base, dtype=float)[keep] / y[keep]
+    return out
+
+
+def _correction_chain(df, otr_result, bias):
+    """The corrections in the order they actually happen, as a CHAIN.
+
+    Each step's "after" is the next step's "before", which is the only way the
+    figure can claim to show a progression. That is not automatic: the pipeline
+    writes `otr_gc_corr_norm_cov` by dividing by the FINAL, post-refit tent, so
+    naming that column as the OTR step's output would skip straight past the
+    round-0 fit and leave the refit row decomposing something already shown.
+    The round-0 tent is reconstructed here instead (fit_otr_bias keeps it), and
+    the refit becomes a genuine third step from one corrected series to another.
+
+    Returns [(label, before, after, tents)], where `tents` is (round0, final) on
+    the refit step and None elsewhere.
+    """
+    steps = []
+    for before_col, after_col, label, _factor in _stage_rows(bias):
+        if before_col not in df or after_col not in df:
+            continue
+        steps.append([label, df[before_col].to_numpy(dtype=float),
+                      df[after_col].to_numpy(dtype=float), None])
+
+    if not steps or otr_result is None:
+        return steps
+
+    y0 = np.asarray(otr_result.get("y_fit_round0"), dtype=float)
+    y1 = np.asarray(otr_result.get("y_fit"), dtype=float)
+    if y0.shape != y1.shape or np.allclose(y0, y1):
+        return steps                      # no refit happened; the chain is already right
+
+    # Split the OTR step in two at the round-0 tent.
+    otr_step = steps[-1]
+    mid = _apply_tent(df, y0, otr_step[1])
+    final = otr_step[2]
+    otr_step[0] = otr_step[0] + " (as first fitted)"
+    otr_step[2] = mid
+    steps.append(["Censored refit", mid, final, (y0, y1)])
+    return steps
+
+
+def _censor_bins(mask, n_bins=OTR_CENSOR_BINS):
+    """Fraction of windows censored per positional bin.
+
+    Degenerates to one bin per window on a short sequence, so the plasmids get
+    exact spans with no special case.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    n = mask.size
+    if n == 0:
+        return np.zeros(0), np.zeros(0)
+    bins = int(min(n_bins, n))
+    edges = (np.arange(n) * bins) // n
+    total = np.bincount(edges, minlength=bins).astype(float)
+    hit = np.bincount(edges, weights=mask.astype(float), minlength=bins)
+    total[total == 0] = 1.0
+    return np.arange(bins) * (n / bins), hit / total
+
+
+def _spans(mask):
+    """Contiguous True runs as (start, stop) index pairs."""
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return []
+    d = np.diff(np.r_[0, m.view(np.int8), 0])
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+
+def plot_correction_stages(df, output, otr_result=None, bias="all"):
+    """Before/after for each fitting step, and what each fit was allowed to see.
+
+    Makes its own directory, as plot_gc_skew() does, and returns the path.
+
+    `otr_result` is fit_otr_bias()'s dict. It is the only route to the round-0
+    tent and the detected event interval -- neither is on the frame -- and it is
+    None under --bias gc/none, where no OTR stage runs at all.
+
+    `bias` is required rather than inferred: see OTR_STAGE_ROWS.
+    """
+    genome_id = str(df["genome_id"].iloc[0])
+    samplename = output.strip().split("/")[-1] + genome_id
+    savedir = os.path.join(output, "corr_plots")
+    os.makedirs(savedir, exist_ok=True)
+
+    n = len(df)
+    mb = df["win_st"].to_numpy(dtype=float) / 1e6
+    scale = censored_median_coverage(df)
+    deletion = df["is_deletion"].to_numpy(dtype=bool) if "is_deletion" in df else np.zeros(n, bool)
+    redundant = df["is_redundant"].to_numpy(dtype=bool) if "is_redundant" in df else np.zeros(n, bool)
+    base_censor = deletion | redundant
+
+    detail = (otr_result or {}).get("detail") or {}
+    ev_start, ev_end = detail.get("Event start (bp)"), detail.get("Event end (bp)")
+    event = np.zeros(n, dtype=bool)
+    if ev_start is not None and ev_end is not None:
+        win_st = df["win_st"].to_numpy()
+        event = (win_st >= ev_start) & (win_st <= ev_end)
+
+    steps = _correction_chain(df, otr_result, bias)
+    n_rows = len(steps)
+
+    # Origin and terminus of the applied fit, in Mb, for the rows that have one.
+    ori_mb = ter_mb = None
+    if otr_result is not None and otr_result.get("bias"):
+        o_i, t_i = int(otr_result["o_idx"]) % n, int(otr_result["t_idx"]) % n
+        ori_mb, ter_mb = float(mb[o_i]), float(mb[t_i])
+
+    # Each correction row gets a tall coverage panel and a thin censoring strip
+    # directly beneath it, so "what changed" and "what this fit could see" share
+    # an x-axis. The censoring set is NOT constant across rows: is_event does not
+    # exist until the round-0 OTR fit has produced a residual to detect it in, so
+    # the refit row is the only one whose strip carries it. Drawing one shared
+    # track would hide the only change there is.
+    heights = []
+    for _ in range(max(n_rows, 1)):
+        heights += [3.0, 0.55]
+    fig = plt.figure(figsize=(11, 1.4 + 2.6 * max(n_rows, 1)))
+    gs = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.16)
+
+    def censor_strip(ax, with_event, label):
+        x, dens = _censor_bins(redundant)
+        ax.bar(x * (mb[-1] - mb[0]) / max(n - 1, 1) + mb[0],
+               dens, width=(mb[-1] - mb[0]) / max(len(dens), 1),
+               color="tab:purple", alpha=0.75, linewidth=0,
+               label=f"repeat windows, fraction per bin ({100 * redundant.mean():.1f}% overall)")
+        for a, b in _spans(deletion):
+            ax.axvspan(mb[a], mb[min(b, n - 1)], color="tab:red", alpha=0.85, linewidth=0)
+        if with_event:
+            for a, b in _spans(event):
+                ax.axvspan(mb[a], mb[min(b, n - 1)], color="tab:orange",
+                           alpha=0.5, linewidth=0)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([0, 1])
+        ax.set_ylabel("censored", fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.text(0.005, 0.90, label, transform=ax.transAxes, fontsize=7,
+                va="top", color="0.25")
+
+    def banner(ax, text):
+        """Row label inside the axes -- set_title() collides with the strip above."""
+        ax.text(0.006, 0.965, text, transform=ax.transAxes, fontsize=8.5,
+                va="top", ha="left", zorder=5,
+                bbox=dict(boxstyle="square,pad=0.25", fc="white", ec="0.8", lw=0.5))
+
+    def band(ax, series):
+        """Grey 0.8-1.2 band, and a y-range driven by the data.
+
+        The floor stays at 0 because apply_gc_correction() freezes deletion
+        windows there and that is real information, but the ceiling comes from a
+        high percentile so a single amplification does not leave most of the
+        panel empty. Clipped points are counted rather than silently dropped.
+        """
+        ax.axhspan(0.8, 1.2, color="0.85", alpha=0.6, linewidth=0, zorder=0)
+        finite = np.concatenate([s[np.isfinite(s)] for s in series]) if series else np.array([1.0])
+        top = max(1.6, float(np.percentile(finite, 99.0)) * 1.10) if finite.size else 1.6
+        clipped = int((finite > top).sum())
+        ax.set_ylim(0, top)
+        if clipped:
+            # Below the banner, which spans the top-left and can run long.
+            ax.text(0.994, 0.86, f"{clipped} window(s) above {top:.1f}",
+                    transform=ax.transAxes, fontsize=7, va="top", ha="right",
+                    color="0.35")
+
+    axes = []
+    for i in range(max(n_rows, 1)):
+        ax = fig.add_subplot(gs[2 * i, 0], sharex=axes[0] if axes else None)
+        axc = fig.add_subplot(gs[2 * i + 1, 0], sharex=ax)
+        axes.append(ax)
+
+        if i < len(steps):
+            label, before_v, after_v, tents = steps[i]
+            b = before_v / (scale or 1.0)
+            a = after_v / (scale or 1.0)
+            band(ax, [b[~base_censor], a[~base_censor]])
+            # "after" first so "before" lands on top: where a step changed
+            # nothing the row then reads grey, which is the honest picture. Where
+            # it changed something the two clouds separate and both are visible
+            # whatever the order.
+            # Only windows that INFORMED the fit are drawn at full weight. No
+            # censored window enters any coverage fit -- is_redundant and
+            # is_deletion both join `exclude_from_fit`, which fit_gc_bias() and
+            # otr_fit() read, _otr_decimate() gives those cells zero weight, and
+            # run_HMM() drops them from the observation sequence -- so showing
+            # them as equals invites the reader to judge a fit against data it
+            # never saw. They are not dropped either: apply_otr_correction()
+            # freezes only deletions, so repeat windows carry a real corrected
+            # value into CNV.csv and into the copy-number calls. Drawn faintly,
+            # they stay visible and stay clearly not-part-of-the-comparison.
+            fit_seen = ~base_censor
+            ax.scatter(mb[~fit_seen], a[~fit_seen], s=2.5, alpha=0.12,
+                       linewidths=0, rasterized=True, color="tab:orange",
+                       label="censored (not used in any fit)")
+            ax.scatter(mb[fit_seen], a[fit_seen], s=2.5, alpha=0.30, linewidths=0,
+                       rasterized=True, color="tab:blue", label="after")
+            ax.scatter(mb[fit_seen], b[fit_seen], s=2.5, alpha=0.30, linewidths=0,
+                       rasterized=True, color="0.45", label="before")
+            extra = ""
+            if tents is not None:
+                y0, y1 = tents[0] / (scale or 1.0), tents[1] / (scale or 1.0)
+                ax.plot(mb, y0, color="tab:red", lw=1.4,
+                        label="ori-ter fit, before censoring")
+                ax.plot(mb, y1, color="tab:green", lw=1.4,
+                        label="ori-ter fit, after censoring")
+                extra = (f"   event {ev_start:,}-{ev_end:,} bp "
+                         f"(p={detail.get('Event p-value')}); "
+                         f"fit moved by {float(np.max(np.abs(tents[1] - tents[0]))):.4f}")
+            if ori_mb is not None and ("OTR" in label or "refit" in label):
+                ax.axvline(ori_mb, color="tab:red", ls=":", lw=1.1,
+                           label=f"origin {ori_mb:.3f} Mb")
+                ax.axvline(ter_mb, color="tab:blue", ls=":", lw=1.1,
+                           label=f"terminus {ter_mb:.3f} Mb")
+            b_all, b_un = _in_band_fractions(before_v, scale, base_censor)
+            a_all, a_un = _in_band_fractions(after_v, scale, base_censor)
+            banner(ax, f"{i + 1}. {label}   within 20% of single copy: "
+                       f"{b_all:.1%} \u2192 {a_all:.1%} all windows   |   "
+                       f"{b_un:.1%} \u2192 {a_un:.1%} uncensored{extra}")
+            censor_strip(axc, with_event=tents is not None,
+                         label=("deletion + repeat + event" if tents is not None
+                                else "deletion + repeat"))
+
+        else:
+            # --bias none: nothing was corrected, so there is no before/after.
+            # The censoring is still worth drawing -- it is what any later run
+            # WOULD exclude -- so the strip below is populated as usual.
+            raw = df["norm_raw_cov"].to_numpy(dtype=float) / (scale or 1.0)
+            band(ax, [raw])
+            ax.scatter(mb, raw, s=2.5, alpha=0.30, linewidths=0, rasterized=True,
+                       color="0.55", label="raw coverage")
+            r_all, r_un = _in_band_fractions(df["norm_raw_cov"].to_numpy(dtype=float),
+                                             scale, base_censor)
+            banner(ax, f"no correction applied   within 20% of single copy: "
+                       f"{r_all:.1%} all windows   |   {r_un:.1%} uncensored")
+            censor_strip(axc, with_event=False, label="deletion + repeat")
+
+        ax.set_ylabel("cov / median", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.legend(loc="lower right", fontsize=7, framealpha=0.9, markerscale=3.5)
+        plt.setp(ax.get_xticklabels(), visible=False)
+        if i < max(n_rows, 1) - 1:
+            plt.setp(axc.get_xticklabels(), visible=False)
+
+    fig.axes[-1].set_xlabel("genomic position (Mb)", fontsize=9)
+    src = detail.get("Breakpoint source", "not corrected")
+    fig.suptitle(
+        f"{samplename}  --  {n:,} windows; "
+        f"{100 * base_censor.mean():.1f}% censored before fitting; "
+        f"--bias {bias}; OTR {src}",
+        fontsize=10)
+
+    path = os.path.join(savedir, "%s_correction_stages.pdf" % samplename.replace(" ", "_"))
+    fig.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
     return path
 
 

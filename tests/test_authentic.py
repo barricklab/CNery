@@ -68,7 +68,9 @@ from CNery.core import (
     read_coverage_table,
     relative_copy_numbers,
     resolve_coverage_inputs,
+    plot_gc_passes,
     run_HMM,
+    second_gc_pass,
     write_gc_skew_results,
 )
 from data._fetch import load_registry
@@ -294,13 +296,22 @@ def _run_pipeline(name, path, out):
         write_gc_skew_results(skew, str(out), seq_id)
         plot_gc_skew(df_gc, str(out), skew)
 
+        res = fit_otr_bias(df_gc, str(out), skew_result=skew)
         df_otr, ori, ter = apply_otr_correction(
-            fit_otr_bias(df_gc, str(out), skew_result=skew), str(out),
-            relative_copy_number=relative_cn[seq_id],
+            res, str(out), relative_copy_number=relative_cn[seq_id],
         )
+        frames[seq_id] = {"gc": df_gc, "otr": df_otr, "skew": skew, "res": res}
 
-        frames[seq_id] = {"gc": df_gc, "otr": df_otr,
-                          "cnv": run_HMM(df_otr, str(out)), "skew": skew}
+    # The second GC pass is POOLED, so like main() it cannot run inside the loop
+    # above -- it needs every sequence OTR-corrected first, and the HMM must not
+    # see coverage that is about to change. Mirroring that here is what keeps the
+    # authentic tier exercising the same pipeline the CLI runs; the harness
+    # silently diverging from main() has bitten this file once already.
+    corrected, _gc2 = second_gc_pass({s: f["otr"] for s, f in frames.items()})
+    plot_gc_passes(corrected, str(out))
+    for seq_id, df_final in corrected.items():
+        frames[seq_id]["otr"] = df_final
+        frames[seq_id]["cnv"] = run_HMM(df_final, str(out))
 
     return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
 
@@ -694,15 +705,32 @@ class TestOriginTerminus:
         assert otr["Origin window"] == skew["Origin (bp)"]
         assert otr["Terminus window"] == skew["Terminus (bp)"]
 
-    def test_coverage_passes_through_when_no_bias_is_found(self, seq):
-        # With no bias detected, otr_correction must leave the GC-corrected values alone.
+    def test_no_tent_is_applied_when_no_bias_is_found(self, seq):
+        """No ramp detected must mean no TENT divided out -- not no change at all.
+
+        This used to assert that otr_gc_corr_norm_cov was bit-identical to
+        gc_corr_norm_cov. That stopped being true when the pooled second GC pass
+        landed: it is fitted across the whole run and applied to every sequence,
+        including ones where no ramp was found, because GC bias belongs to the
+        sequencing chemistry and one curve should describe the run rather than a
+        different correction reaching each reference depending on whether its own
+        OTR fit cleared a gate. The measured cost is real and accepted -- on
+        ltee_ara_m3_32k_2rg the residual GC trend goes 0.58% -> 1.09%.
+
+        What must still hold is the thing the old assertion was really protecting:
+        an undetected ramp contributes NOTHING. So divide the second GC pass back
+        out and the coverage has to land exactly on its GC-corrected input.
+        """
         if seq["seq"].otr_detected:
             pytest.skip("OTR fires here; see test_correction_tightens_coverage")
         df = seq["otr"]
+        undone = df["otr_gc_corr_norm_cov"].to_numpy()
+        if "gc_corr_fact_pass2" in df:
+            keep = ~df["is_deletion"].to_numpy(dtype=bool)
+            undone = undone.copy()
+            undone[keep] = undone[keep] * df["gc_corr_fact_pass2"].to_numpy()[keep]
         np.testing.assert_allclose(
-            df["otr_gc_corr_norm_cov"].to_numpy(),
-            df["gc_corr_norm_cov"].to_numpy(),
-            rtol=1e-9,
+            undone, df["gc_corr_norm_cov"].to_numpy(), rtol=1e-9,
         )
 
     def test_correction_tightens_coverage(self, seq):
