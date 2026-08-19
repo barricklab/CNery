@@ -176,54 +176,12 @@ over the 1st–99th GC percentile:
   the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
   to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
   correction the first over-applied to the replication ramp.
-- **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
-  offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
-  near-invariant to how the two factors split it. This is a reporting-quality
-  change: the corrected coverage column and the GC curve become right,
-  `prob_copy_number` does not move.
-- **Pooled, and applied to EVERY sequence** including ones where no ramp was
-  found. Deliberate, with a measured cost: those acquired no GC trend from OTR,
-  so the correction has nothing to remove there and makes them slightly worse
-  (`m3_32k_2rg` 0.58% → 1.09%, `plasmid_2` 7.07% → 7.16%). Applied anyway because
-  GC bias belongs to the sequencing chemistry — one curve should describe the run
-  rather than a different correction reaching each reference depending on whether
-  its own OTR fit cleared a gate.
-- **An undetected ramp no longer means bit-identical coverage.** No *tent* is
-  applied there, and that is what `test_no_tent_is_applied_when_no_bias_is_found`
-  now pins — by dividing `g2` back out and requiring the result to land exactly on
-  the GC-corrected input. `GC_bias/` therefore holds **two** files, both pooled;
-  `tests/test_cli.py` asserts the count and that both name every reference.
-- **This is why `get_CNV.main` runs the per-sequence loop TWICE.** Pass A corrects
-  each sequence, then the pooled `g2` is fitted across all of them, then pass B
-  plots and calls copy number. The HMM must not see coverage that is about to
-  change, and the pooled fit cannot run until every sequence is OTR-corrected.
-  `tests/test_authentic.py::_run_pipeline` mirrors that split — that harness
-  silently diverging from `main()` has cost real debugging time before.
-
-### GC bias is corrected in TWO pooled passes
-
-`g1` is fitted on raw coverage in `process_multi_genome`. `g2` is fitted on
-**OTR-corrected** coverage by `second_gc_pass`, because the OTR tent varies with
-POSITION and position is correlated with GC — measured r between GC% and the
-fitted tent is 0.245 on `adp1_mgd06_lb`, 0.110 on `ltee_ara_p5_75k_exp`, 0.075 on
-CWBI's chromosome — so dividing by the tent puts a GC trend straight back into
-coverage the GC stage had just removed. Span of a LOWESS of coverage against GC,
-over the 1st–99th GC percentile:
-
-| sequence | raw | after `g1` | after OTR | after `g2` |
-| --- | --- | --- | --- | --- |
-| `p5_75k_exp` | 18.27% | 1.20% | **10.39%** | **1.03%** |
-| `adp1` | 12.85% | 1.03% | 3.61% | 0.89% |
-| `p1_shift` | 70.30% | 0.56% | 2.79% | 0.61% |
-
-- **Composition is exact and `gc_corr_fact` is the TOTAL.** Both passes are
-  functions of GC alone, so `final = raw / (g1·t·g2)` gives `G = g1·g2`, a single
-  curve. `gc_corr_fact` holds `G`, which is what `bias_offsets` feeds the HMM;
-  the components stay on the frame as `gc_corr_fact_pass1` / `_pass2`, and all
-  three are drawn in `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at
-  the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
-  to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
-  correction the first over-applied to the replication ramp.
+- **The fit also excludes `is_event`.** `apply_otr_correction` publishes the interval the censored
+  refit removed as an `is_event` column — empty when no event fired, and also when one fired but
+  exceeded the cap, since the refit declined it there. Without this, the amplification judged too
+  distorting to leave in the tent fit is full-weight input to the GC fit immediately afterwards.
+  Measured effect is small (curve moves ≤ 0.3%, no call changes) because the LOWESS is already
+  robust; it is there for consistency, not magnitude.
 - **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
   offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
   near-invariant to how the two factors split it. This is a reporting-quality

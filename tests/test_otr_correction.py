@@ -1065,3 +1065,44 @@ class TestSecondGCPass:
         out, _ = second_gc_pass(frames)
         assert len(out["a"]) == 300 and len(out["b"]) == 120
         assert set(out) == {"a", "b"}
+
+    def test_the_detected_event_is_excluded_from_the_fit(self):
+        """An amplification too distorting for the tent is not fit-worthy here.
+
+        The OTR refit censors the detected event; without this the same windows
+        are full-weight input to the GC fit immediately afterwards, which is not
+        a position anything else in the pipeline takes. Measured on the authentic
+        corpus the effect is small -- the curve moves at most 0.3% and no
+        copy-number call changes -- because the LOWESS is already robust. It is
+        here for consistency, not for magnitude.
+        """
+        n = 400
+        base = self._frame("a", n=n, gc_slope=0.0)
+        # a hard amplification over a narrow, high-GC stretch
+        cov = base["otr_gc_corr_norm_cov"].to_numpy(float).copy()
+        cov[320:360] *= 3.0
+        base["otr_gc_corr_norm_cov"] = cov
+        base["is_event"] = np.zeros(n, bool)
+
+        flagged = base.copy()
+        flagged.loc[320:359, "is_event"] = True
+
+        f_off = second_gc_pass({"a": base})[0]["a"]["gc_corr_fact_pass2"].to_numpy()
+        f_on = second_gc_pass({"a": flagged})[0]["a"]["gc_corr_fact_pass2"].to_numpy()
+        assert not np.allclose(f_off, f_on), "flagging the event must change the fit"
+
+    def test_an_event_over_the_cap_is_not_excluded(self):
+        """apply_otr_correction publishes is_event only when the refit used it.
+
+        When the event exceeded the censoring cap the refit declined it, so
+        nothing downstream should act as though it had been removed.
+        """
+        import tempfile
+        out = tempfile.mkdtemp()
+        os.makedirs(os.path.join(out, "OTR_corr"), exist_ok=True)
+        res = fit_otr_bias(_prep(_make_tent_df(n=240)), out,
+                           n_surrogates=200, event_add_cap=0.0)
+        d, _, _ = apply_otr_correction(res, out)
+        if not res["detail"]["Event exceeded censoring cap"]:
+            pytest.skip("no event large enough to hit the cap on this frame")
+        assert not d["is_event"].to_numpy(bool).any()

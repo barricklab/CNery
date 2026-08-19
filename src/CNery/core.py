@@ -747,6 +747,10 @@ def second_gc_pass(per_genome):
     TestOriginTerminus::test_coverage_passes_through_when_no_bias_is_found now
     pins -- but this pass still touches it.
 
+    The fit excludes `is_event` as well as `exclude_from_fit`: the copy-number
+    event the OTR refit just censored should not be full-weight input to the GC
+    fit immediately after it.
+
     Returns ({genome_id: df}, fit2).
     """
     ids = list(per_genome)
@@ -756,6 +760,16 @@ def second_gc_pass(per_genome):
 
     scratch = pooled.copy()
     scratch["norm_raw_cov"] = pooled["otr_gc_corr_norm_cov"]
+    # Exclude the copy-number event the OTR refit just censored. Without this the
+    # amplification that was too distorting to leave in the tent fit is
+    # full-weight input to the GC fit immediately afterwards, which is not a
+    # position anything else in the pipeline takes. Only the fit mask is widened;
+    # `exclude_from_fit` on the returned frames keeps its documented meaning of
+    # is_deletion | is_redundant.
+    if "is_event" in scratch:
+        scratch["exclude_from_fit"] = (
+            scratch["exclude_from_fit"].to_numpy(dtype=bool)
+            | scratch["is_event"].to_numpy(dtype=bool))
     fit2 = fit_gc_bias(scratch)
     scratch = apply_gc_correction(scratch, fit2)
 
@@ -2652,6 +2666,19 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     # using otr_fit()'s own y_corr rather than a fresh division by f1.
     df.loc[~low, "otr_gc_corr_norm_cov"] = y_corr[~low]
     df["otr_gc_corr_fact"] = f1
+
+    # The interval the censored refit excluded, published so later fits can
+    # exclude it too. Derived from the reported bounds rather than threaded out
+    # of otr_fit as a ninth return value. Empty when no event fired, and also
+    # when one fired but was too large to censor -- in that case the refit
+    # declined it, so nothing downstream should act as though it had not.
+    ev_lo, ev_hi = detail.get("Event start (bp)"), detail.get("Event end (bp)")
+    is_event = np.zeros(len(df), dtype=bool)
+    if (ev_lo is not None and ev_hi is not None
+            and not detail.get("Event exceeded censoring cap")):
+        win_st = df["win_st"].to_numpy()
+        is_event = (win_st >= ev_lo) & (win_st <= ev_hi)
+    df["is_event"] = is_event
 
     with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
         json.dump({k: _json_safe(v) for k, v in results.items()}, f, indent=4)
