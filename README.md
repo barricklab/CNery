@@ -273,11 +273,25 @@ cut -f1,2 data/reference.fasta.fai
 
 Given an output folder `CNV_out/`, `CNery` writes:
 
+CNery corrects coverage and calls copy number in **two passes**. The first runs GC
+correction, origin-to-terminus correction and the HMM as usual. The second repeats
+both fits with every window the first pass did not call single-copy excluded from
+them, then calls copy number again — only the second pass's results are written.
+
+An amplification is invisible to the crude censoring the first pass has available
+(near-zero depth, repeat overlap), so it otherwise sits in the GC and ramp fits at
+full weight and distorts them. Measured on synthetic coverage where the truth is
+known, a real 1.5x replication ramp with an amplification on top is detected 0 times
+in 60 without this and 60 times in 60 with it, at no cost in false positives. If
+excluding the non-single-copy windows would leave under half a sequence, it is
+skipped for that sequence and reported as such.
+
 - `CNV_out/CNV_plt/` — per-reference CNV prediction plots.
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
-- `CNV_out/GC_bias/` also holds `*_GC_passes.pdf` — the GC correction is fitted in two pooled passes, once on raw coverage and again after OTR correction (which reintroduces a GC trend, because the replication ramp varies with position and position correlates with GC). The plot shows both curves and their product, which is the total correction actually applied. It changes no copy-number call; it makes the corrected coverage and the reported GC curve right.
+- The GC correction is a fitted curve, not an exact quantity, so how well it is determined at each window's GC is measured (by resampling the fit) and carried into the copy-number model as extra variance. The effect grows with copy number, because a correction factor's error is multiplied by the number of copies — which is why a window at an extreme GC inside an amplification is no longer able to earn its own copy-number segment on the strength of the correction alone.
+- `CNV_out/GC_bias/` also holds `*_GC_passes.pdf` — the GC correction is fitted in two pooled passes, once on raw coverage and again after OTR correction (which reintroduces a GC trend, because the replication ramp varies with position and position correlates with GC). The second pass additionally excludes every window the first pass's copy-number calls did not put at CN=1. The plot shows both curves and their product, which is the total correction actually applied.
 - `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
-- `CNV_out/corr_plots/` — per-reference **before/after** diagnostic (`*_correction_stages.pdf`): one row for each correction step — GC and OTR — showing coverage before and after it, with the fitted curve overlaid, and directly beneath each row a strip of which windows that particular fit was allowed to see. Deletions are drawn as spans, repeats as a density track. Each row is labelled with the fraction of windows within 20% of single copy before and after, reported both over all windows and over uncensored windows only — the two can differ a lot on a repeat-heavy replicon, and the strip below shows why. Produced in every `--bias` mode.
+- `CNV_out/corr_plots/` — per-reference **before/after** diagnostic (`*_correction_stages.pdf`): one row for each correction step — GC and OTR, in each of the two passes — showing coverage before and after it, with the fitted curve overlaid, and directly beneath each row a strip of which windows that particular fit was allowed to see. Deletions are drawn as spans, repeats as a density track, and the second pass's strips additionally mark everything called CN≠1. One row does not continue from the one above it, and says so: the second OTR fit divides the first pass's ramp back out, because a ramp has to be fitted to coverage that still contains it. Each row is labelled with the fraction of windows within 20% of single copy before and after, reported both over all windows and over uncensored windows only — the two can differ a lot on a repeat-heavy replicon, and the strip below shows why. Produced in every `--bias` mode.
 
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
 

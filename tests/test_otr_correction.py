@@ -18,7 +18,16 @@ from CNery.core import (
     _stage_rows, _in_band_fractions, _censor_bins, plot_correction_stages,
     _correction_chain,
 )
-from CNery.core import second_gc_pass
+from CNery.core import (
+    CN_CENSOR_MIN_KEEP,
+    add_cn_censor,
+    otr_ratio,
+    pass1_summary,
+    plot_copy,
+    plottable,
+    refit_gc_bias_pooled,
+    stage_pass1,
+)
 
 
 def _ensure_dirs(base):
@@ -753,9 +762,23 @@ class TestCorrectionStagesPlot:
     """
 
     def _frame(self, n=240):
+        """A frame staged as it reaches the figure: both passes complete.
+
+        The figure draws one row per fitting CHANGE, and after the two-pass
+        restructure there are four of them, so the frame has to carry the pass-1
+        snapshot columns stage_pass1() writes as well as the final ones.
+        """
         df = _prep(_make_tent_df(n=n))
-        df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"] * 0.98
+        n = len(df)
+        df["gc_corr_norm_cov_pass1"] = df["gc_corr_norm_cov"]
+        df["gc_corr_fact_pass1"] = df["gc_corr_fact"]
+        df["otr_gc_corr_norm_cov_pass1"] = df["gc_corr_norm_cov"] * 0.98
+        df["otr_gc_corr_fact_pass1"] = 1.0
+        df["gc2_resid_cov"] = df["otr_gc_corr_norm_cov_pass1"] * 0.99
+        df["gc_corr_fact_pass2"] = 1.0
+        df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"] * 0.97
         df["otr_gc_corr_fact"] = 1.0
+        df["is_cn_variant"] = np.zeros(n, bool)
         return df
 
     def test_plot_is_written_and_makes_its_own_directory(self, tmp_path):
@@ -781,7 +804,7 @@ class TestCorrectionStagesPlot:
         plot_correction_stages(self._frame(), out, None, bias="gc")
         assert plt.get_fignums() == []
 
-    @pytest.mark.parametrize("bias,rows", [("all", 2), ("gc", 1), ("otr", 1), ("none", 0)])
+    @pytest.mark.parametrize("bias,rows", [("all", 4), ("gc", 2), ("otr", 2), ("none", 0)])
     def test_bias_mode_selects_its_rows(self, bias, rows):
         assert len(_stage_rows(bias)) == rows
 
@@ -837,18 +860,43 @@ class TestCorrectionStagesPlot:
         assert dens.mean() == pytest.approx(0.10)
 
     def test_the_drawn_progression_is_the_real_one(self):
-        """Each step's "after" must be the next step's "before"."""
+        """A row flagged as chaining really does chain, and one row does not.
+
+        Backfitting is not a linear chain: the second OTR fit divides the pass-1
+        tent back out, so its "before" is not the previous row's "after". The
+        figure annotates that break, and it sits between the two PASS-2 rows --
+        not at the pass boundary, which is why the flag is derived from the column
+        names rather than the pass number.
+        """
         df = self._frame()
         steps = _correction_chain(df, None, "all")
-        assert len(steps) == 2
+        assert len(steps) == 4
         for a, b in zip(steps, steps[1:]):
-            assert np.allclose(a[2], b[1]), "chain must close"
+            if b[4]:
+                assert np.allclose(a[2], b[1]), "a chaining row must chain"
         assert np.allclose(steps[0][1], df["norm_raw_cov"].to_numpy(float))
         assert np.allclose(steps[-1][2], df["otr_gc_corr_norm_cov"].to_numpy(float))
+        # Exactly one break, and it is the last row -- the second OTR fit.
+        assert [step[4] for step in steps] == [True, True, True, False]
+
+    def test_a_declined_cn_censor_draws_identical_strips(self, tmp_path):
+        """CN_CENSOR_MIN_KEEP can decline the censor for a sequence. The figure
+        must not then claim a restriction that is not in force -- the pass-2 fits
+        saw exactly what the pass-1 fits saw."""
+        out = str(tmp_path / "run")
+        os.makedirs(out)
+        df = self._frame()
+        assert not df["is_cn_variant"].any()
+        assert os.path.exists(plot_correction_stages(df, out, None, bias="all"))
+
+    def test_pass_two_rows_carry_the_cn_censor(self):
+        """The whole point of the second pass is a wider censor, so the strips
+        that describe it must differ from the first pass's."""
+        assert [row[4] for row in _stage_rows("all")] == [1, 1, 2, 2]
 
 
 class TestSecondGCPass:
-    """The pooled GC refit after OTR, composed into one total curve.
+    """The pooled GC refit between the passes, composed into one total curve.
 
     It exists because the OTR tent varies with POSITION and position correlates
     with GC, so dividing by it puts a GC trend back into coverage the GC stage
@@ -870,6 +918,7 @@ class TestSecondGCPass:
             "gc_corr_norm_cov": cov,
             "otr_gc_corr_norm_cov": cov,
             "gc_corr_fact": np.full(n, 1.20),
+            "otr_gc_corr_fact": np.ones(n),
             "is_deletion": np.zeros(n, bool),
             "is_redundant": np.zeros(n, bool),
             "exclude_from_fit": np.zeros(n, bool),
@@ -881,19 +930,40 @@ class TestSecondGCPass:
         This is what lets a single `gc_corr_fact` carry the whole GC correction
         into run_HMM's emission offset while the two components stay auditable.
         """
-        out, _ = second_gc_pass({"a": self._frame("a", gc_slope=0.6)})
+        out, _ = refit_gc_bias_pooled({"a": self._frame("a", gc_slope=0.6)})
         d = out["a"]
         assert np.allclose(d["gc_corr_fact"],
                            d["gc_corr_fact_pass1"] * d["gc_corr_fact_pass2"])
 
     def test_it_removes_a_gc_trend_the_first_pass_left(self):
-        d = second_gc_pass({"a": self._frame("a", gc_slope=0.6)})[0]["a"]
+        """Its own before/after: otr_gc_corr_norm_cov in, gc2_resid_cov out.
+
+        NOT gc_corr_norm_cov, which this pass also rewrites but to raw/G -- a
+        series that still carries the tent and so is not expected to be flat
+        against GC. That column is the next OTR fit's INPUT, not this fit's
+        output.
+        """
+        d = refit_gc_bias_pooled({"a": self._frame("a", gc_slope=0.6)})[0]["a"]
         gc = d["gc_percent"].to_numpy()
-        v = d["otr_gc_corr_norm_cov"].to_numpy()
+        v = d["gc2_resid_cov"].to_numpy()
         before = self._frame("a", gc_slope=0.6)["otr_gc_corr_norm_cov"].to_numpy()
         lo_h, hi_h = gc < 0.45, gc > 0.55
         assert abs(v[hi_h].mean() - v[lo_h].mean()) < abs(
             before[hi_h].mean() - before[lo_h].mean())
+
+    def test_the_next_otr_fit_reads_raw_over_the_total_curve(self):
+        """gc_corr_norm_cov must come out as raw/G, not as the fit's residual.
+
+        The second OTR fit is handed this column, and it has to see the ramp it
+        is meant to fit. raw/(g1*t*g2) has the pass-1 tent already divided out --
+        fitting that would be fitting a residual, and the tent would come back
+        near-flat.
+        """
+        d = refit_gc_bias_pooled({"a": self._frame("a", gc_slope=0.6)})[0]["a"]
+        raw = d["norm_raw_cov"].to_numpy(float)
+        total = (d["gc_corr_fact_pass1"].to_numpy(float)
+                 * d["gc_corr_fact_pass2"].to_numpy(float))
+        assert np.allclose(d["gc_corr_norm_cov"].to_numpy(float), raw / total)
 
     def test_it_is_pooled_not_per_sequence(self):
         """One curve across every reference, like the first pass.
@@ -904,7 +974,7 @@ class TestSecondGCPass:
         """
         frames = {"a": self._frame("a", gc_slope=0.6, seed=1),
                   "b": self._frame("b", gc_slope=-0.6, seed=2)}
-        out, _ = second_gc_pass(frames)
+        out, _ = refit_gc_bias_pooled(frames)
         fa = out["a"].set_index("gc_percent")["gc_corr_fact_pass2"]
         fb = out["b"].set_index("gc_percent")["gc_corr_fact_pass2"]
         common = fa.index.intersection(fb.index)
@@ -913,6 +983,238 @@ class TestSecondGCPass:
 
     def test_every_sequence_comes_back_with_its_own_rows(self):
         frames = {"a": self._frame("a", n=300), "b": self._frame("b", n=120)}
-        out, _ = second_gc_pass(frames)
+        out, _ = refit_gc_bias_pooled(frames)
         assert len(out["a"]) == 300 and len(out["b"]) == 120
         assert set(out) == {"a", "b"}
+
+
+class TestCopyNumberCensor:
+    """The censor the first pass's HMM builds for the second.
+
+    mask_coverage_windows() censors on two crude proxies computed once on
+    UNCORRECTED coverage -- near-zero depth and repeat overlap -- and an
+    amplification is caught by neither, so it enters the GC LOWESS and the OTR
+    tent at full weight. The HMM knows where the copy-number variation is;
+    nothing else in the pipeline does.
+    """
+
+    def _called(self, n=200, variant=(0, 0), state=3):
+        """n windows called CN=1, with [start, stop) called `state` instead."""
+        cn = np.ones(n, dtype=int)
+        cn[variant[0]:variant[1]] = state
+        return pd.DataFrame({
+            "genome_id": "a",
+            "prob_copy_number": cn,
+            "is_deletion": np.zeros(n, bool),
+            "is_redundant": np.zeros(n, bool),
+            "exclude_from_fit": np.zeros(n, bool),
+        })
+
+    def test_it_flags_exactly_what_the_hmm_did_not_call_single_copy(self):
+        df, applied = add_cn_censor(self._called(variant=(40, 60)))
+        assert applied
+        assert df["is_cn_variant"].sum() == 20
+        assert df["is_cn_variant"].to_numpy()[40:60].all()
+
+    def test_deletions_count_as_variant_too(self):
+        """CN 0 is not CN 1, and a called deletion is better evidence than the
+        near-zero-depth proxy is_deletion already carries."""
+        out, applied = add_cn_censor(self._called(variant=(10, 20), state=0))
+        assert applied and out["is_cn_variant"].to_numpy()[10:20].all()
+
+    def test_it_folds_into_the_flag_every_fit_stage_reads(self):
+        """fit_gc_bias() reads exclude_from_fit by default, so the censor has to
+        reach it or the pooled GC refit would silently ignore it."""
+        df, _ = add_cn_censor(self._called(variant=(40, 60)))
+        assert df["exclude_from_fit"].to_numpy()[40:60].all()
+        assert not df["exclude_from_fit"].to_numpy()[:40].any()
+
+    def test_it_declines_when_it_would_censor_too_much(self):
+        """A genuinely duplicated replicon is every window CN=2. Censoring it
+        entirely is not a fit, it is an empty fit -- so the guard declines and the
+        second pass censors exactly as the first did."""
+        df, applied = add_cn_censor(self._called(variant=(0, 200)))
+        assert not applied
+        assert not df["is_cn_variant"].any()
+        assert not df["exclude_from_fit"].any()
+
+    def test_the_guard_is_on_what_SURVIVES_not_on_what_is_added(self):
+        """Deletions and repeats already censored have to count against the floor
+        too: the fit sees the intersection, not the CN censor alone."""
+        df = self._called(variant=(0, 40))
+        df.iloc[40:140, df.columns.get_loc("is_redundant")] = True
+        df["exclude_from_fit"] = df["is_redundant"]
+        _out, applied = add_cn_censor(df)
+        assert not applied, "140 of 200 already gone, so 40 more must trip it"
+
+    def test_the_floor_is_a_named_constant(self):
+        assert 0.0 < CN_CENSOR_MIN_KEEP < 1.0
+
+    def test_absent_calls_are_not_an_error(self):
+        """add_cn_censor runs before the first HMM in no pipeline, but the column
+        contract lets any stage be handed a frame that lacks a column."""
+        df = self._called().drop(columns=["prob_copy_number"])
+        out, applied = add_cn_censor(df)
+        assert not applied and not out["is_cn_variant"].any()
+
+
+class TestPassOneStaging:
+    """stage_pass1(): snapshot the first pass, then build the censor."""
+
+    def _called(self, n=120):
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({
+            "genome_id": "a",
+            "norm_raw_cov": rng.normal(1.0, 0.02, n),
+            "gc_corr_norm_cov": rng.normal(1.0, 0.02, n),
+            "gc_corr_fact": np.full(n, 1.1),
+            "otr_gc_corr_norm_cov": rng.normal(1.0, 0.02, n),
+            "otr_gc_corr_fact": np.full(n, 1.05),
+            "prob_copy_number": np.ones(n, dtype=int),
+            "is_deletion": np.zeros(n, bool),
+            "is_redundant": np.zeros(n, bool),
+            "exclude_from_fit": np.zeros(n, bool),
+        })
+        df.loc[10:19, "prob_copy_number"] = 2
+        return df
+
+    def test_every_pass_one_column_is_preserved(self):
+        """The second pass overwrites the canonical names, and the four-row
+        correction-stages figure draws the first pass from these."""
+        src = self._called()
+        out, _ = stage_pass1(src)
+        for column in ("gc_corr_fact", "gc_corr_norm_cov", "otr_gc_corr_fact",
+                       "otr_gc_corr_norm_cov", "prob_copy_number"):
+            np.testing.assert_array_equal(out[f"{column}_pass1"].to_numpy(),
+                                          src[column].to_numpy())
+
+    def test_a_missing_otr_column_is_not_an_error(self):
+        """--bias gc/none never call apply_otr_correction(), so otr_gc_corr_fact
+        is not on the frame at all."""
+        src = self._called().drop(columns=["otr_gc_corr_fact"])
+        out, _ = stage_pass1(src)
+        assert "otr_gc_corr_fact_pass1" not in out
+        assert "gc_corr_fact_pass1" in out
+
+
+class TestPassOneSummary:
+    """What the second pass's results JSON records about the first."""
+
+    def test_no_tent_reports_no_ratio(self):
+        assert otr_ratio({"bias": False, "y_fit": np.ones(10),
+                          "o_idx": 0, "t_idx": 1}) is None
+        assert otr_ratio(None) is None
+
+    def test_the_ratio_is_the_two_anchors(self):
+        y = np.array([1.4, 1.0, 0.7])
+        assert otr_ratio({"bias": True, "y_fit": y, "o_idx": 0,
+                          "t_idx": 2}) == pytest.approx(2.0)
+
+    def test_the_summary_carries_the_first_verdict(self):
+        res1 = {"bias": True, "y_fit": np.array([1.2, 1.0]), "o_idx": 0, "t_idx": 1,
+                "detail": {"Coverage fit p-value": 0.32,
+                           "Coverage fit r-squared": 0.05,
+                           "Breakpoint source": "GC skew"}}
+        staged = pd.DataFrame({"is_cn_variant": np.r_[np.ones(5, bool),
+                                                      np.zeros(95, bool)]})
+        keys = pass1_summary(res1, staged)
+        assert keys["Coverage fit p-value (pass 1)"] == 0.32
+        assert keys["Breakpoint source (pass 1)"] == "GC skew"
+        assert keys["Origin-to-Termius/Bias Ratio (pass 1)"] == pytest.approx(1.2)
+        assert keys["Windows censored as CN != 1"] == 5
+        assert keys["Refit on CN=1 windows"] is True
+
+    def test_a_declined_censor_is_reported_as_such(self):
+        staged = pd.DataFrame({"is_cn_variant": np.zeros(100, bool)})
+        keys = pass1_summary(None, staged)
+        assert keys["Refit on CN=1 windows"] is False
+        assert keys["Windows censored as CN != 1"] == 0
+
+
+class TestSecondPassOtrFit:
+    """otr_fit() consumes the CN censor through the same convention as its two
+    siblings -- the caller decides which pass it is in by what it puts on the
+    frame."""
+
+    def test_cn_variant_windows_do_not_inform_the_fit(self):
+        """A tall block pasted into flat coverage moves the fit; flagged
+        is_cn_variant, it must not."""
+        base = _prep(_make_tent_df(n=240, ratio=1.0))
+        spiked = base.copy()
+        spiked.loc[60:79, "gc_corr_norm_cov"] *= 3.0
+        spiked["gc_cor_med_fil"] = spiked["gc_corr_norm_cov"]
+
+        censored = spiked.copy()
+        censored["is_cn_variant"] = np.r_[np.zeros(60, bool), np.ones(20, bool),
+                                          np.zeros(len(base) - 80, bool)]
+
+        _, _, _, _, _, d_spiked = otr_fit(spiked)
+        _, _, _, _, _, d_censored = otr_fit(censored)
+        assert d_spiked["Coverage fit r-squared"] != d_censored["Coverage fit r-squared"]
+
+
+class TestRepeatWindowsAreNotDrawn:
+    """No plot draws a redundant/repeat window.
+
+    Their depth measures how many reference copies collapsed onto the locus, not
+    how many the sample carries -- CWBI's chromosome has 17 kb at 2.13 Mb reading
+    18x the single-copy level on exactly ZERO unique coverage. Nothing in the
+    pipeline reads them: not fit_gc_bias, not otr_fit, not run_HMM's observation
+    sequence or emission fit. Drawing them at 18x reads as an amplification and
+    sets the y-axis so nothing else is legible.
+    """
+
+    def _frame(self, n=100, repeat=(40, 50), deletion=(80, 85)):
+        df = pd.DataFrame({
+            "genome_id": "a",
+            "is_redundant": np.zeros(n, bool),
+            "is_deletion": np.zeros(n, bool),
+        })
+        df.iloc[repeat[0]:repeat[1], df.columns.get_loc("is_redundant")] = True
+        df.iloc[deletion[0]:deletion[1], df.columns.get_loc("is_deletion")] = True
+        return df
+
+    def test_repeat_windows_are_excluded(self):
+        keep = plottable(self._frame())
+        assert not keep[40:50].any()
+        assert keep[:40].all() and keep[50:].all()
+
+    def test_deletions_are_NOT_excluded(self):
+        """They are censored from fitting too, but they are real measurements of
+        a real absence and the CN=0 calls are unreadable without them."""
+        assert plottable(self._frame())[80:85].all()
+
+    def test_a_frame_without_the_column_draws_everything(self):
+        """The synthetic fixtures carry no is_redundant column at all, and the
+        column contract lets any stage be handed a frame that lacks one."""
+        df = self._frame().drop(columns=["is_redundant"])
+        assert plottable(df).all()
+
+    def test_the_copy_number_plot_scales_to_what_it_draws(self, tmp_path):
+        """A repeat pile-up must not set the y-axis. Scaling to every window is
+        what compressed every real call into the bottom twentieth of the axis."""
+        import matplotlib.pyplot as plt
+
+        n = 200
+        rng = np.random.default_rng(0)
+        cov = rng.normal(100.0, 5.0, n)
+        cov[100:110] = 1800.0                       # the repeat pile-up
+        df = pd.DataFrame({
+            "genome_id": "a",
+            "win_st": np.arange(n) * 100,
+            "win_end": np.arange(n) * 100 + 100,
+            "read_count_cov": cov,
+            "otr_gc_corr_rdcnt_cov": cov,
+            "otr_gc_corr_norm_cov": cov / 100.0,
+            "prob_copy_number": np.ones(n, dtype=int),
+            "is_redundant": np.r_[np.zeros(100, bool), np.ones(10, bool),
+                                  np.zeros(90, bool)],
+            "is_deletion": np.zeros(n, bool),
+        })
+        out = str(tmp_path / "run")
+        os.makedirs(os.path.join(out, "CNV_plt"))
+        plt.close("all")
+        plot_copy(df, 0, 0, out)
+        assert plt.get_fignums() == []
+        assert os.path.exists(
+            os.path.join(out, "CNV_plt", "runa_copy_numbers.pdf"))

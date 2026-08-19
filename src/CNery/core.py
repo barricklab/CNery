@@ -9,6 +9,7 @@ import seaborn as sns
 from scipy import stats
 from scipy import ndimage
 import matplotlib as mplt
+import matplotlib.patches as mpatches
 from scipy.stats import geom, nbinom
 from scipy.optimize import minimize
 import statsmodels.api as sm
@@ -506,6 +507,29 @@ def preprocess(df, win=100, step=100, frag=400):
     return df_gc
 
 
+def plottable(df):
+    """Windows a plot may draw: everything except redundant/repeat coverage.
+
+    A window with redundant coverage carries no information about this locus's
+    copy number. CWBI's chromosome has 17 kb at 2.13 Mb with `pct_redundant`
+    1.000 where UNIQUE depth is exactly 0 and redundant depth is 18x the
+    single-copy level -- the reference holds ~18 near-identical copies and every
+    read is placed at all of them. Drawing that at 18x invites the reader to see
+    an amplification, sets the y-axis so nothing else is legible, and represents
+    a quantity the pipeline never used: no fit sees these windows, and the HMM
+    neither observes them nor fits its emission model to them.
+
+    Deletions are NOT excluded. They are censored from fitting too, but they are
+    real measurements of a real absence and the CN=0 calls are unreadable
+    without them.
+
+    Returns a boolean array, all-True when the column is absent.
+    """
+    if "is_redundant" in df:
+        return ~df["is_redundant"].to_numpy(dtype=bool)
+    return np.ones(len(df), dtype=bool)
+
+
 def gc_cor_plots(df, output):
     genome_ids = sorted(df["genome_id"].unique())
     if len(genome_ids) > 1:
@@ -518,6 +542,10 @@ def gc_cor_plots(df, output):
     os.makedirs(saveplt, exist_ok=True)
 
     plt.figure(figsize=(10, 8))
+
+    # The LOWESS below was fitted without repeat windows, so drawing them beside
+    # it would show the curve missing points it was never asked to pass through.
+    df = df.loc[plottable(df)]
 
     uniq = (
         df[['gc_percent', 'gc_corr_fact']]
@@ -633,12 +661,186 @@ def mask_coverage_windows(
     return df
 
 
+def otr_ratio(otr_fit_result):
+    """The applied origin-to-terminus ratio, or None when no tent was applied.
+
+    Same yori/yter apply_otr_correction() reports, from the same two anchors, so
+    the pass-1 figure in the results JSON cannot drift from what pass 1 actually
+    wrote.
+    """
+    if not otr_fit_result or not otr_fit_result.get("bias"):
+        return None
+    y_fit = otr_fit_result["y_fit"]
+    y_ter = float(y_fit[otr_fit_result["t_idx"]])
+    return float(y_fit[otr_fit_result["o_idx"]] / y_ter) if y_ter > 0 else None
+
+
+def pass1_summary(otr_fit_result, df_staged):
+    """The first pass's verdict, for the second pass's results JSON.
+
+    A verdict that CHANGED under the CN censor is the thing a reader needs to be
+    able to see from the file alone -- and on the corpus the evidence moves a lot
+    even where the verdict does not (adp1's coverage fit goes p = 0.32 -> 0.001
+    once its CN-3 amplification is out of the fit).
+
+    Shared by get_CNV.main() and tests/test_authentic.py::_run_pipeline so the
+    harness cannot report something main() does not.
+    """
+    detail = (otr_fit_result or {}).get("detail") or {}
+    censored = (int(df_staged["is_cn_variant"].sum())
+                if "is_cn_variant" in df_staged else 0)
+    return {
+        "Coverage fit r-squared (pass 1)": detail.get("Coverage fit r-squared"),
+        "Coverage fit p-value (pass 1)": detail.get("Coverage fit p-value"),
+        "Breakpoint source (pass 1)": detail.get("Breakpoint source"),
+        "Origin-to-Termius/Bias Ratio (pass 1)": otr_ratio(otr_fit_result),
+        "Windows censored as CN != 1": censored,
+        "Refit on CN=1 windows": bool(censored),
+    }
+
+
+#: Floor on the fraction of a sequence's windows that must survive the CN censor.
+#: The second pass excludes everything the first pass's HMM did not call CN = 1,
+#: and on a genuinely duplicated replicon -- every window CN = 2 -- that is the
+#: whole sequence. Falling back to the first pass's censoring there is the honest
+#: answer: it is a sequence whose copy number is not 1, not a sequence with no
+#: usable windows.
+CN_CENSOR_MIN_KEEP = 0.5
+
+
+def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP):
+    """Flag windows a previous pass's HMM did not call CN = 1, for the next pass.
+
+    Writes `is_cn_variant` and folds it into `exclude_from_fit`, which is the
+    single flag every fit stage already consults -- fit_gc_bias() reads it by
+    default and otr_fit() ORs `is_cn_variant` in alongside its two siblings. So
+    both refits pick the censor up without either of them knowing which pass it
+    is in.
+
+    This is what the two-pass structure exists for. `mask_coverage_windows`
+    censors on two crude proxies computed once on UNCORRECTED coverage -- near-zero
+    depth and repeat overlap -- and an amplification is caught by neither, so it
+    enters the GC LOWESS and the OTR tent at full weight. Measured, that matters:
+    cwbi_ssym_ht04's chromosome fits its origin inside its own CN-34
+    amplification, and adp1_mgd06_lb inside its CN-3 one.
+
+    Returns (df, applied). `applied` is False when the censor would leave under
+    `min_keep` of the windows, in which case nothing is added and the second pass
+    censors exactly as the first did.
+    """
+    df = df.copy()
+    n = len(df)
+    if cn_col not in df.columns or n == 0:
+        df["is_cn_variant"] = np.zeros(n, dtype=bool)
+        return df, False
+
+    cn = df[cn_col].to_numpy(dtype=float)
+    is_variant = np.isfinite(cn) & (np.rint(cn) != 1)
+
+    base = np.zeros(n, dtype=bool)
+    for column in ("is_deletion", "is_redundant"):
+        if column in df.columns:
+            base |= df[column].to_numpy(dtype=bool)
+
+    keep = (~(base | is_variant)).mean()
+    if keep < min_keep:
+        df["is_cn_variant"] = np.zeros(n, dtype=bool)
+        return df, False
+
+    df["is_cn_variant"] = is_variant
+    if "exclude_from_fit" in df.columns:
+        df["exclude_from_fit"] = df["exclude_from_fit"].to_numpy(dtype=bool) | is_variant
+    else:
+        df["exclude_from_fit"] = base | is_variant
+    return df, True
+
+
+def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP):
+    """Snapshot the first pass's results and build the censor for the second.
+
+    Every column the first pass produced is copied to a `*_pass1` name before the
+    second pass overwrites the canonical ones, so the correction-stages figure can
+    draw both passes and a reader can tell what the CN censor bought. Then
+    add_cn_censor() turns the first pass's calls into `is_cn_variant`.
+
+    Lives in core.py rather than in get_CNV.main() because
+    tests/test_authentic.py::_run_pipeline has to mirror main() exactly, and that
+    harness silently diverging from it has cost real debugging time twice.
+
+    Returns (df, cn_censor_applied).
+    """
+    df = df.copy()
+    for column in ("gc_corr_fact", "gc_corr_norm_cov",
+                   "otr_gc_corr_fact", "otr_gc_corr_norm_cov",
+                   "prob_copy_number"):
+        # otr_gc_corr_fact is absent under --bias gc/none, where
+        # apply_otr_correction() never ran.
+        if column in df.columns:
+            df[f"{column}_pass1"] = df[column].to_numpy()
+    return add_cn_censor(df, min_keep=min_keep)
+
+
+#: Bootstrap replicates for the GC curve's pointwise uncertainty. This is a
+#: standard deviation, not a p-value, so it needs far fewer replicates than the
+#: detection gates' 1000 -- the sd of an sd from 100 draws is ~7% of itself,
+#: which is well inside what the emission variance cares about.
+GC_TAU_SURROGATES = 100
+#: GC grid the bootstrap curves are evaluated on. LOWESS is smooth by
+#: construction, so 200 points resolve it and keep the cost independent of how
+#: many windows the sequence has.
+GC_TAU_GRID = 200
+
+
+def _gc_curve_tau(gc, cov, fit_mask, grid, n_surrogates=GC_TAU_SURROGATES, seed=0):
+    """Pointwise relative sd of the fitted GC curve, by resampling windows.
+
+    WHY THIS AND NOT A PERCENTILE. The obvious proxy -- "few windows out here" --
+    is wrong for this smoother: LOWESS uses a NEAREST-NEIGHBOUR bandwidth
+    (frac=0.3), so every fitted point averages the same ~0.3n windows. At GC 0.62
+    on ltee_ara_m3_32k_2rg there are still ~12,700 in the neighbourhood. What
+    actually degrades at the tails is that the neighbourhood becomes ONE-SIDED,
+    so the local linear fit extrapolates within its own window -- the standard
+    boundary effect, which inflates the fitted value's variance while leaving the
+    point estimate perfectly smooth. No count-based or percentile-based rule sees
+    that; resampling does, and it puts no constant in the code for anyone to tune.
+
+    Returns sd of log(curve) on `grid`, i.e. a RELATIVE sd, which is the form the
+    emission model needs: the offset enters multiplicatively.
+    """
+    rng = np.random.default_rng(seed)
+    gc_f, cov_f = gc[fit_mask], cov[fit_mask]
+    n = gc_f.size
+    if n < 50:
+        return np.zeros_like(grid)
+
+    loess = sm.nonparametric.lowess
+    # delta accelerates the replicates -- exact fits at points more than delta
+    # apart, linear interpolation between. The POINT ESTIMATE keeps delta=0.0
+    # above; this approximation is only ever used for the spread.
+    span = float(gc_f.max() - gc_f.min())
+    delta = 0.001 * span if span > 0 else 0.0
+
+    curves = np.empty((n_surrogates, grid.size), dtype=float)
+    for b in range(n_surrogates):
+        idx = rng.integers(0, n, n)
+        out = loess(cov_f[idx], gc_f[idx], frac=0.3, it=1, delta=delta,
+                    is_sorted=False, missing="none", return_sorted=True)
+        curves[b] = np.interp(grid, out[:, 0], out[:, 1])
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logs = np.log(np.where(curves > 0, curves, np.nan))
+    tau = np.nanstd(logs, axis=0)
+    return np.where(np.isfinite(tau), tau, 0.0)
+
+
 def fit_gc_bias(
     df,
     censor_col="exclude_from_fit",
     n_robust_iter=3,
     resid_mad=5.0,
     fit_floor_frac=0.05,
+    tau_surrogates=GC_TAU_SURROGATES,
+    tau_seed=0,
 ):
     """
     Fit stage of GC-bias correction: iterative robust LOWESS of
@@ -648,8 +850,11 @@ def fit_gc_bias(
 
     Returns
     -------
-    dict : {"gc_sorted", "fit_sorted", "floor"} -- pass to
-    apply_gc_correction().
+    dict : {"gc_sorted", "fit_sorted", "floor", "gc_grid", "gc_tau"} -- pass to
+    apply_gc_correction(). `gc_tau` is the pointwise RELATIVE standard deviation
+    of the fitted curve on `gc_grid`, from resampling the fit windows; it is what
+    lets run_HMM discount windows whose correction factor is poorly determined.
+    Set `tau_surrogates=0` to skip it.
     """
     cov = df["norm_raw_cov"].to_numpy(dtype=float)
     gc = df["gc_percent"].to_numpy(dtype=float)
@@ -690,62 +895,59 @@ def fit_gc_bias(
     fit_ref = np.median(fit_sorted)
     floor = fit_floor_frac * fit_ref if np.isfinite(fit_ref) and fit_ref > 0 else 1e-6
 
-    return {"gc_sorted": gc_sorted, "fit_sorted": fit_sorted, "floor": floor}
+    # How well is this curve determined at each GC? The correction is applied as
+    # a DIVISOR, and its error is multiplied by copy number, so a window whose
+    # offset is uncertain deserves less weight inside an amplification than one
+    # whose offset is nailed down. run_HMM turns this into emission variance; see
+    # offset_tau() and log_emission_with_offsets().
+    grid = np.linspace(float(np.min(gc_sorted)), float(np.max(gc_sorted)),
+                       GC_TAU_GRID)
+    tau = _gc_curve_tau(gc, cov, fit_mask, grid, n_surrogates=tau_surrogates,
+                        seed=tau_seed)
+
+    return {"gc_sorted": gc_sorted, "fit_sorted": fit_sorted, "floor": floor,
+            "gc_grid": grid, "gc_tau": tau}
 
 
-def second_gc_pass(per_genome):
-    """Pooled GC refit AFTER OTR correction, composed into ONE total GC curve.
+def refit_gc_bias_pooled(per_genome):
+    """Pooled GC refit for the SECOND pass, composed into ONE total GC curve.
 
     Why a second pass exists at all: `gc_corr_norm_cov` is flat against GC by
     construction, but the OTR tent varies with POSITION, and position is
     correlated with GC -- measured r between GC% and the fitted tent is 0.245 on
     adp1_mgd06_lb, 0.110 on ltee_ara_p5_75k_exp, 0.075 on CWBI's chromosome. So
     dividing by the tent puts a GC trend back into coverage the GC stage had just
-    removed. Measured span of a LOWESS of coverage against GC, over the 1st-99th
-    GC percentile:
+    removed.
 
-        sequence      raw     after GC   after OTR   after this pass
-        p5_75k_exp   18.27%     1.20%      10.39%         1.03%
-        adp1         12.85%     1.03%       3.61%         0.89%
-        p1_shift     70.30%     0.56%       2.79%         0.61%
+    It also sees a censor the first pass could not: `add_cn_censor` has by now
+    folded the first pass's copy-number calls into `exclude_from_fit`, so every
+    window the HMM did not call CN = 1 is out of this fit. The first pass had only
+    near-zero depth and repeat overlap to go on, neither of which catches an
+    amplification.
 
     Pooled, like the first pass and for the same reason: GC bias is a property of
     the sequencing chemistry rather than of any one reference, so it is fitted
     once across every table in the run. That is why this cannot live inside the
-    per-sequence loop -- every sequence has to be OTR-corrected before the fit
-    can see the pooled residual.
+    per-sequence loop -- every sequence has to be OTR-corrected and called before
+    the fit can see the pooled residual.
 
     COMPOSITION IS EXACT. Both passes are functions of GC alone, so
 
-        final = raw / (g1(gc) * t(x) * g2(gc))    =>    G(gc) = g1(gc) * g2(gc)
+        raw / (g1(gc) * t(x) * g2(gc))    =>    G(gc) = g1(gc) * g2(gc)
 
-    and the total GC correction is a single curve. `gc_corr_fact` becomes G, so
-    run_HMM's emission offset (`bias_offsets`, which reads that column) carries
-    the composed divisor. The two components stay on the frame as
-    `gc_corr_fact_pass1` / `gc_corr_fact_pass2` so the correction is auditable
-    and the reported curves can be drawn separately.
-
-    Measured: this changes NO copy-number call on any of the eight authentic
-    sequences, despite the offset moving up to 10.2% on p5_75k_exp -- the HMM
-    consumes the product and is near-invariant to how the two factors split it.
-    It is a reporting-quality change: the corrected coverage column and the GC
-    curve become right, `prob_copy_number` does not move.
+    and the total GC correction is a single curve. `gc_corr_fact` becomes G and
+    `gc_corr_norm_cov` becomes raw / G, so the column and its factor agree -- they
+    did not before, when this pass updated the factor and left the column at
+    raw/g1. That agreement is load-bearing now: raw/G is what the second OTR fit
+    is handed as its input. The components stay on the frame as
+    `gc_corr_fact_pass1` / `gc_corr_fact_pass2` so the correction is auditable and
+    the reported curves can be drawn separately.
 
     SCOPE. Fitted across every sequence and applied to every sequence, including
-    ones where no ramp was detected and so no tent was divided out. That is a
-    deliberate choice with a measured cost: those sequences acquired no GC trend
-    from OTR, so this correction has nothing there to remove and makes them
-    slightly worse -- ltee_ara_m3_32k_2rg goes 0.58% -> 1.09% and CWBI's
-    plasmid_2 7.07% -> 7.16%. It is applied anyway because GC bias belongs to the
-    sequencing chemistry, so one curve should describe the whole run rather than
-    a different correction landing on each reference depending on whether its own
-    OTR fit happened to clear a significance gate.
-
-    A consequence worth knowing: coverage on a sequence with no detected ramp is
-    no longer bit-identical to its GC-corrected input. No TENT is applied there --
-    that invariant holds, and is what
-    TestOriginTerminus::test_coverage_passes_through_when_no_bias_is_found now
-    pins -- but this pass still touches it.
+    ones where no ramp was detected and so no tent was divided out. Deliberate:
+    GC bias belongs to the sequencing chemistry, so one curve should describe the
+    whole run rather than a different correction landing on each reference
+    depending on whether its own OTR fit happened to clear a significance gate.
 
     Returns ({genome_id: df}, fit2).
     """
@@ -754,16 +956,48 @@ def second_gc_pass(per_genome):
         return dict(per_genome), None
     pooled = pd.concat([per_genome[g] for g in ids], ignore_index=True)
 
+    # Fitted on the OTR-corrected coverage -- the residual with the current tent
+    # removed, which is what makes this a backfitting step rather than a second
+    # guess at the same thing.
     scratch = pooled.copy()
     scratch["norm_raw_cov"] = pooled["otr_gc_corr_norm_cov"]
     fit2 = fit_gc_bias(scratch)
     scratch = apply_gc_correction(scratch, fit2)
 
-    pooled["gc_corr_fact_pass1"] = pooled["gc_corr_fact"].to_numpy(dtype=float)
-    pooled["gc_corr_fact_pass2"] = scratch["gc_corr_fact"].to_numpy(dtype=float)
-    pooled["gc_corr_fact"] = (pooled["gc_corr_fact_pass1"].to_numpy(dtype=float)
-                              * pooled["gc_corr_fact_pass2"].to_numpy(dtype=float))
-    pooled["otr_gc_corr_norm_cov"] = scratch["gc_corr_norm_cov"].to_numpy(dtype=float)
+    g1 = pooled["gc_corr_fact"].to_numpy(dtype=float)
+    g2 = scratch["gc_corr_fact"].to_numpy(dtype=float)
+    pooled["gc_corr_fact_pass1"] = g1
+    pooled["gc_corr_fact_pass2"] = g2
+    pooled["gc_corr_fact"] = g1 * g2
+
+    # G = g1 * g2, so log G = log g1 + log g2 and the RELATIVE variances add.
+    # The two are fitted on different data (raw vs OTR-corrected, and the second
+    # on CN=1 windows only), so treating them as independent is the right
+    # first-order statement.
+    if "gc_corr_tau" in pooled and "gc_corr_tau" in scratch:
+        t1 = pooled["gc_corr_tau"].to_numpy(dtype=float)
+        t2 = scratch["gc_corr_tau"].to_numpy(dtype=float)
+        pooled["gc_corr_tau_pass1"] = t1
+        pooled["gc_corr_tau_pass2"] = t2
+        pooled["gc_corr_tau"] = np.sqrt(t1 ** 2 + t2 ** 2)
+
+    # raw / G, freezing deletions at exactly 0 the way apply_gc_correction does,
+    # so a real deletion is not divided back up toward 1.
+    raw = pooled["norm_raw_cov"].to_numpy(dtype=float)
+    total = np.where(np.isfinite(g1 * g2) & (g1 * g2 > 0), g1 * g2, 1.0)
+    corrected = np.zeros_like(raw)
+    if "is_deletion" in pooled.columns:
+        live = ~pooled["is_deletion"].to_numpy(dtype=bool)
+    else:
+        live = np.ones(len(pooled), dtype=bool)
+    corrected[live] = raw[live] / total[live]
+    pooled["gc_corr_norm_cov"] = corrected
+
+    # The residual this pass's own fit produced, raw/(g1*t*g2). Kept because it is
+    # what the GC-pass-2 row of the correction-stages figure draws as its "after":
+    # that row shows the fit's own before/after, which is not the same series as
+    # the composed raw/G the next stage consumes.
+    pooled["gc2_resid_cov"] = scratch["gc_corr_norm_cov"].to_numpy(dtype=float)
 
     out = dict(per_genome)
     for genome_id in ids:
@@ -871,6 +1105,11 @@ def apply_gc_correction(df, gc_fit, deletion_col="is_deletion"):
 
     df["gc_corr_norm_cov"] = gc_corr
     df["gc_corr_fact"] = gc_out
+    # How well the divisor itself is determined at this window's GC. run_HMM
+    # turns it into emission variance; absent means "treat the curve as exact",
+    # which is what every caller predating this did.
+    if gc_fit.get("gc_tau") is not None and gc_fit.get("gc_grid") is not None:
+        df["gc_corr_tau"] = np.interp(gc, gc_fit["gc_grid"], gc_fit["gc_tau"])
     return df
 
 
@@ -930,18 +1169,38 @@ def plot_otr_corr(df, output, ori, ter):
     saveplt = str(output+"/OTR_corr/")
   
     plt.figure(figsize=(10, 8))
-    plt.scatter(df["win_st"],df["norm_raw_cov"], color="gray", label="Raw reads",s=8, alpha = 0.2)
-    plt.scatter(df["win_st"],df["gc_corr_norm_cov"], color="black", label="GC corrected", marker = '*', s=15, alpha = 0.5)
-    plt.scatter(df["win_st"],df["otr_gc_corr_norm_cov"], color = 'orange', label="Ori/Ter bias corrected", s = 20, alpha = 0.85, 
-                marker = mplt.markers.MarkerStyle(marker = 'o', fillstyle = 'full'))
-    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color = "black", label = "OTR-bias-fit-line")
-    plt.plot(df["win_st"],df["gc_cor_med_fil"], color="blue", label="Med-fil")
+
+    # Repeat windows are not drawn. On CWBI's chromosome they reach 18x the
+    # single-copy level on zero unique coverage, which set the y-axis so the 1.17
+    # ramp this figure exists to show was invisible.
+    keep = plottable(df)
+    drawn = df.loc[keep]
+    n_hidden = int((~keep).sum())
+
+    plt.scatter(drawn["win_st"], drawn["norm_raw_cov"], color="gray",
+                label="Raw reads", s=8, alpha=0.2)
+    plt.scatter(drawn["win_st"], drawn["gc_corr_norm_cov"], color="black",
+                label="GC corrected", marker="*", s=15, alpha=0.5)
+    plt.scatter(drawn["win_st"], drawn["otr_gc_corr_norm_cov"], color="orange",
+                label="Ori/Ter bias corrected", s=20, alpha=0.85,
+                marker=mplt.markers.MarkerStyle(marker="o", fillstyle="full"))
+    # The fitted tent is a model evaluated everywhere, so it stays whole. The
+    # median filter is a statistic OF the data, so it breaks where the data is
+    # not drawn rather than bridging the gap with a value taken from repeats.
+    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color="black",
+             label="OTR-bias-fit-line")
+    med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float).copy()
+    med_fil[~keep] = np.nan
+    plt.plot(df["win_st"], med_fil, color="blue", label="Med-fil")
     
     plt.axvline(x=ter, color='r', linestyle=':', label=f'Terminus: {ter}')
     plt.axvline(x=ori, color='r', linestyle=':', label=f'Origin: {ori}')
     plt.xlabel("Window (Genomic position)")
     plt.ylabel("Normalized read coverage")
-    plt.title(f'{samplename}_Ori/Ter bias correction')
+    title = f'{samplename}_Ori/Ter bias correction'
+    if n_hidden:
+        title += f"\n{n_hidden} repeat window(s) not shown"
+    plt.title(title)
     plt.legend(loc = 'upper right')
 
     plt_full_path = os.path.join(saveplt,'%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
@@ -1874,12 +2133,15 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
 
     # Windows to exclude from both the seed search and the least-squares
     # fit: genuine deletions and redundant/repeat-coverage windows, if
-    # mask_coverage_windows() has already flagged them.
+    # mask_coverage_windows() has already flagged them, plus anything the
+    # previous pass's HMM did not call CN = 1 (`is_cn_variant`, absent on the
+    # first pass). All three follow the same column-presence convention, and
+    # this function does not care which pass it is in -- the caller decides by
+    # what it puts on the frame.
     exclude = np.zeros(n, dtype=bool)
-    if "is_deletion" in df.columns:
-        exclude |= df["is_deletion"].to_numpy(dtype=bool)
-    if "is_redundant" in df.columns:
-        exclude |= df["is_redundant"].to_numpy(dtype=bool)
+    for column in ("is_deletion", "is_redundant", "is_cn_variant"):
+        if column in df.columns:
+            exclude |= df[column].to_numpy(dtype=bool)
 
     # Dilated by one window on each side, circularly, for the seed search
     # only: a window merely adjacent to a deletion/repeat boundary can
@@ -2282,7 +2544,7 @@ def _json_safe(value):
 
 
 def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
-                         relative_copy_number=1.0):
+                         relative_copy_number=1.0, extra_results=None):
     """
     Apply stage: evaluate the fitted OTR curve at every window, write
     plots/results JSON, and return (df, ori_win, ter_win) -- SAME
@@ -2357,6 +2619,13 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
         "Correction type": correction_type,
     }
     results.update(detail)
+
+    # Whatever the caller wants recorded beside the evidence -- in practice the
+    # first pass's verdict, so a verdict that CHANGED under the CN censor is
+    # visible from the file alone. Added last so it cannot be shadowed, and safe
+    # for breseq's nlohmann reader, which tolerates unknown keys.
+    if extra_results:
+        results.update(extra_results)
 
     df["otr_gc_corr_norm_cov"] = df["gc_corr_norm_cov"].copy()
 
@@ -2635,11 +2904,41 @@ def write_gc_skew_results(result, output, genome_id):
 #: is why this is a table rather than "whatever columns are present":
 #: get_CNV.main() aliases gc_corr_norm_cov = norm_raw_cov there, so a GC row
 #: would plot a bit-identical copy of the raw series under a label that is a lie.
+# (before column, after column, label, factor column, pass number).
+#
+# A table rather than "whatever columns are present" because --bias otr aliases
+# gc_corr_norm_cov = norm_raw_cov (get_CNV.py), so a GC row there would plot a
+# bit-identical copy of the raw series under a label that is false.
+#
+# The pass number picks the censoring strip: pass 2's fits additionally exclude
+# every window the pass-1 HMM did not call CN = 1.
+#
+# Rows 1-3 chain: each "after" column IS the next row's "before" column. Row 4
+# does not, and that is the one thing about this table worth staring at. Pass 2's
+# GC row draws its own before/after -- raw/(g1*t) -> raw/(g1*t*g2), the residual
+# that fit saw and flattened. Pass 2's OTR row starts from raw/G instead, with the
+# pass-1 tent divided back OUT, because a tent must be fitted to a series that
+# still contains the ramp; fitting the residual would return a flat tent. So the
+# break is real, it is between the two pass-2 rows rather than at the pass
+# boundary, and the figure marks it by comparing column names -- never by
+# comparing pass numbers, which get this wrong.
 OTR_STAGE_ROWS = {
-    "all": (("norm_raw_cov", "gc_corr_norm_cov", "GC correction", "gc_corr_fact"),
-            ("gc_corr_norm_cov", "otr_gc_corr_norm_cov", "OTR correction", "otr_gc_corr_fact")),
-    "gc": (("norm_raw_cov", "gc_corr_norm_cov", "GC correction", "gc_corr_fact"),),
-    "otr": (("norm_raw_cov", "otr_gc_corr_norm_cov", "OTR correction", "otr_gc_corr_fact"),),
+    "all": (("norm_raw_cov", "gc_corr_norm_cov_pass1",
+             "GC correction (pass 1)", "gc_corr_fact_pass1", 1),
+            ("gc_corr_norm_cov_pass1", "otr_gc_corr_norm_cov_pass1",
+             "OTR correction (pass 1)", "otr_gc_corr_fact_pass1", 1),
+            ("otr_gc_corr_norm_cov_pass1", "gc2_resid_cov",
+             "GC correction (pass 2)", "gc_corr_fact_pass2", 2),
+            ("gc_corr_norm_cov", "otr_gc_corr_norm_cov",
+             "OTR correction (pass 2)", "otr_gc_corr_fact", 2)),
+    "gc": (("norm_raw_cov", "gc_corr_norm_cov_pass1",
+            "GC correction (pass 1)", "gc_corr_fact_pass1", 1),
+           ("otr_gc_corr_norm_cov_pass1", "gc2_resid_cov",
+            "GC correction (pass 2)", "gc_corr_fact_pass2", 2)),
+    "otr": (("norm_raw_cov", "otr_gc_corr_norm_cov_pass1",
+             "OTR correction (pass 1)", "otr_gc_corr_fact_pass1", 1),
+            ("norm_raw_cov", "otr_gc_corr_norm_cov",
+             "OTR correction (pass 2)", "otr_gc_corr_fact", 2)),
     "none": (),
 }
 
@@ -2699,19 +2998,22 @@ def _apply_tent(df, y_fit, base):
 
 
 def _correction_chain(df, otr_result, bias):
-    """The corrections in the order they actually happen, as a CHAIN.
+    """The corrections in the order they actually happen.
 
-    Each step's "after" is the next step's "before", which is what lets the
-    figure claim to show a progression rather than a set of snapshots.
-
-    Returns [(label, before, after)].
+    Returns [(label, before, after, pass_no, chains_from_previous)]. The last
+    element is computed from the COLUMN NAMES -- this row's "before" being the
+    previous row's "after" -- so a row that does not continue the chain is marked
+    as such wherever it happens to fall. See OTR_STAGE_ROWS for why one row does
+    not.
     """
-    steps = []
-    for before_col, after_col, label, _factor in _stage_rows(bias):
+    steps, prev_after = [], None
+    for before_col, after_col, label, _factor, pass_no in _stage_rows(bias):
         if before_col not in df or after_col not in df:
             continue
         steps.append([label, df[before_col].to_numpy(dtype=float),
-                      df[after_col].to_numpy(dtype=float)])
+                      df[after_col].to_numpy(dtype=float), pass_no,
+                      prev_after is None or before_col == prev_after])
+        prev_after = after_col
     return steps
 
 
@@ -2762,7 +3064,13 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
     scale = censored_median_coverage(df)
     deletion = df["is_deletion"].to_numpy(dtype=bool) if "is_deletion" in df else np.zeros(n, bool)
     redundant = df["is_redundant"].to_numpy(dtype=bool) if "is_redundant" in df else np.zeros(n, bool)
-    base_censor = deletion | redundant
+    cn_variant = (df["is_cn_variant"].to_numpy(dtype=bool)
+                  if "is_cn_variant" in df else np.zeros(n, bool))
+    # What each pass's fits could see. Pass 2 additionally excludes every window
+    # the pass-1 HMM did not call CN = 1 -- the whole reason the second pass
+    # exists, so the strips are where it has to be legible.
+    censor_by_pass = {1: deletion | redundant, 2: deletion | redundant | cn_variant}
+    base_censor = censor_by_pass[1]
 
     detail = (otr_result or {}).get("detail") or {}
 
@@ -2777,30 +3085,73 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
 
     # Each correction row gets a tall coverage panel and a thin censoring strip
     # directly beneath it, so "what changed" and "what this fit could see" share
-    # an x-axis. The strips are identical across rows today -- every coverage fit
-    # excludes the same is_deletion | is_redundant set -- and are drawn per row
-    # anyway so that a step which ever sees a different set shows it where it
-    # applies rather than in one detached track.
+    # an x-axis. The strips genuinely differ between the passes, which is the
+    # point: pass 1 has only near-zero depth and repeat overlap to go on, and
+    # pass 2 adds everything the pass-1 HMM called CN != 1.
     heights = []
     for _ in range(max(n_rows, 1)):
         heights += [3.0, 0.55]
     fig = plt.figure(figsize=(11, 1.4 + 2.6 * max(n_rows, 1)))
     gs = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.16)
 
-    def censor_strip(ax, label):
+    def censor_strip(ax, pass_no):
+        """The reasons this fit could not use a window, drawn where they apply.
+
+        Three different things share this axis, so it carries a colour key: two
+        of them are bare axvspans with nothing else to name them, and without it
+        a reader has no way to tell a deletion from a copy-number event.
+        """
+        censored = censor_by_pass[pass_no]
         x, dens = _censor_bins(redundant)
         ax.bar(x * (mb[-1] - mb[0]) / max(n - 1, 1) + mb[0],
                dens, width=(mb[-1] - mb[0]) / max(len(dens), 1),
-               color="tab:purple", alpha=0.75, linewidth=0,
-               label=f"repeat windows, fraction per bin ({100 * redundant.mean():.1f}% overall)")
+               color="tab:purple", alpha=0.75, linewidth=0)
+
+        # CN != 1 stretches are drawn first and widest: they are the new
+        # information on this figure, and an amplification is a handful of long
+        # blocks, so spans read correctly where the repeat density lane would not.
+        # `& ~deletion` so a called deletion is not drawn twice -- it is already
+        # CN 0, and red is the more specific statement.
+        cn_only = cn_variant & ~deletion
+        drew_cn = False
+        if pass_no == 2:
+            for a, b in _spans(cn_only):
+                ax.axvspan(mb[a], mb[min(b, n - 1)], color="tab:green", alpha=0.55,
+                           linewidth=0)
+                drew_cn = True
+        drew_del = False
         for a, b in _spans(deletion):
-            ax.axvspan(mb[a], mb[min(b, n - 1)], color="tab:red", alpha=0.85, linewidth=0)
+            ax.axvspan(mb[a], mb[min(b, n - 1)], color="tab:red", alpha=0.85,
+                       linewidth=0)
+            drew_del = True
+
         ax.set_ylim(0, 1)
         ax.set_yticks([0, 1])
         ax.set_ylabel("censored", fontsize=7)
         ax.tick_params(labelsize=7)
-        ax.text(0.005, 0.90, label, transform=ax.transAxes, fontsize=7,
-                va="top", color="0.25")
+
+        # Only reasons actually DRAWN are listed. A sequence whose CN censor was
+        # declined (CN_CENSOR_MIN_KEEP -- CWBI's plasmid_1, 52% repeats) saw
+        # exactly what pass 1 saw, and naming "CN != 1" there would describe a
+        # restriction the reader can see is not present.
+        handles = []
+        if drew_del:
+            handles.append(mpatches.Patch(
+                color="tab:red", alpha=0.85,
+                label=f"deletion ({int(deletion.sum())} win)"))
+        handles.append(mpatches.Patch(
+            color="tab:purple", alpha=0.75,
+            label=f"repeat, fraction per bin ({100 * redundant.mean():.1f}%)"))
+        if drew_cn:
+            handles.append(mpatches.Patch(
+                color="tab:green", alpha=0.55,
+                label=f"CN != 1 ({int(cn_only.sum())} win)"))
+        ax.legend(handles=handles, loc="upper right", fontsize=6,
+                  ncol=len(handles), framealpha=0.85, handlelength=1.2,
+                  handleheight=0.7, borderpad=0.25, columnspacing=0.9)
+        ax.text(0.005, 0.90,
+                f"censored from this fit: {100 * censored.mean():.1f}% of windows",
+                transform=ax.transAxes, fontsize=7, va="top", color="0.25")
 
     def banner(ax, text):
         """Row label inside the axes -- set_title() collides with the strip above."""
@@ -2834,52 +3185,68 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
         axes.append(ax)
 
         if i < len(steps):
-            label, before_v, after_v = steps[i]
+            label, before_v, after_v, pass_no, chains = steps[i]
+            row_censor = censor_by_pass[pass_no]
             b = before_v / (scale or 1.0)
             a = after_v / (scale or 1.0)
-            band(ax, [b[~base_censor], a[~base_censor]])
-            # "after" first so "before" lands on top: where a step changed
-            # nothing the row then reads grey, which is the honest picture. Where
-            # it changed something the two clouds separate and both are visible
-            # whatever the order.
-            # Only windows that INFORMED the fit are drawn at full weight. No
-            # censored window enters any coverage fit -- is_redundant and
-            # is_deletion both join `exclude_from_fit`, which fit_gc_bias() and
-            # otr_fit() read, _otr_decimate() gives those cells zero weight, and
-            # run_HMM() drops them from the observation sequence -- so showing
-            # them as equals invites the reader to judge a fit against data it
-            # never saw. They are not dropped either: apply_otr_correction()
-            # freezes only deletions, so repeat windows carry a real corrected
-            # value into CNV.csv and into the copy-number calls. Drawn faintly,
-            # they stay visible and stay clearly not-part-of-the-comparison.
-            fit_seen = ~base_censor
-            ax.scatter(mb[~fit_seen], a[~fit_seen], s=2.5, alpha=0.12,
-                       linewidths=0, rasterized=True, color="tab:orange",
-                       label="censored (not used in any fit)")
+            band(ax, [b[~row_censor], a[~row_censor]])
+            # REPEAT WINDOWS ARE NOT DRAWN AT ALL. Their depth measures how many
+            # reference copies collapsed onto the locus rather than anything
+            # about this sample -- CWBI's chromosome reaches 18x on exactly zero
+            # unique coverage -- and no stage of the pipeline ever reads them.
+            # The repeat-density lane in the strip below is where they are
+            # accounted for, and it is the only place they belong.
+            #
+            # Deletions and CN-variant windows ARE drawn, faintly. They are
+            # censored from this fit too, but they are real measurements of real
+            # events, so hiding them would hide the amplifications the second
+            # pass exists to exclude. Faint keeps them clearly outside the
+            # before/after comparison.
+            #
+            # "after" is drawn before "before" so "before" lands on top: where a
+            # step changed nothing the row reads grey, which is the honest
+            # picture; where it changed something the two clouds separate and
+            # both are visible whatever the order.
+            fit_seen = ~row_censor
+            shown_censored = (~fit_seen) & (~redundant)
+            if shown_censored.any():
+                ax.scatter(mb[shown_censored], a[shown_censored], s=2.5, alpha=0.18,
+                           linewidths=0, rasterized=True, color="tab:orange",
+                           label="deletion / CN != 1 (not used in this fit)")
             ax.scatter(mb[fit_seen], a[fit_seen], s=2.5, alpha=0.30, linewidths=0,
                        rasterized=True, color="tab:blue", label="after")
             ax.scatter(mb[fit_seen], b[fit_seen], s=2.5, alpha=0.30, linewidths=0,
                        rasterized=True, color="0.45", label="before")
-            b_all, b_un = _in_band_fractions(before_v, scale, base_censor)
-            a_all, a_un = _in_band_fractions(after_v, scale, base_censor)
+            b_all, b_un = _in_band_fractions(before_v, scale, row_censor)
+            a_all, a_un = _in_band_fractions(after_v, scale, row_censor)
             banner(ax, f"{i + 1}. {label}   within 20% of single copy: "
                        f"{b_all:.1%} \u2192 {a_all:.1%} all windows   |   "
                        f"{b_un:.1%} \u2192 {a_un:.1%} uncensored")
-            censor_strip(axc, label="deletion + repeat")
+            # This row does not continue the one above: the pass-1 tent has been
+            # divided back out, because a tent has to be fitted to a series that
+            # still contains the ramp. Said on the figure rather than left for the
+            # reader to notice the discrepancy and distrust the whole thing.
+            if i and not chains:
+                ax.text(0.5, 1.015, "\u2500\u2500 pass-1 tent divided back out; "
+                                    "refitted on CN=1 windows \u2500\u2500",
+                        transform=ax.transAxes, fontsize=7.5, ha="center",
+                        va="bottom", color="0.35")
+            censor_strip(axc, pass_no=pass_no)
 
         else:
             # --bias none: nothing was corrected, so there is no before/after.
             # The censoring is still worth drawing -- it is what any later run
             # WOULD exclude -- so the strip below is populated as usual.
+            shown = ~redundant
             raw = df["norm_raw_cov"].to_numpy(dtype=float) / (scale or 1.0)
-            band(ax, [raw])
-            ax.scatter(mb, raw, s=2.5, alpha=0.30, linewidths=0, rasterized=True,
-                       color="0.55", label="raw coverage")
+            band(ax, [raw[shown]])
+            ax.scatter(mb[shown], raw[shown], s=2.5, alpha=0.30, linewidths=0,
+                       rasterized=True, color="0.55", label="raw coverage")
             r_all, r_un = _in_band_fractions(df["norm_raw_cov"].to_numpy(dtype=float),
                                              scale, base_censor)
             banner(ax, f"no correction applied   within 20% of single copy: "
                        f"{r_all:.1%} all windows   |   {r_un:.1%} uncensored")
-            censor_strip(axc, label="deletion + repeat")
+            censor_strip(axc, pass_no=1)
 
         ax.set_ylabel("cov / median", fontsize=8)
         ax.tick_params(labelsize=8)
@@ -2892,7 +3259,8 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
     src = detail.get("Breakpoint source", "not corrected")
     fig.suptitle(
         f"{samplename}  --  {n:,} windows; "
-        f"{100 * base_censor.mean():.1f}% censored before fitting; "
+        f"{100 * base_censor.mean():.1f}% censored before fitting "
+        f"({int(redundant.sum()):,} repeat window(s) not drawn); "
         f"--bias {bias}; OTR {src}",
         fontsize=10)
 
@@ -3009,13 +3377,29 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     ax1.set_zorder(2)  # Higher than ax2
     ax2.set_zorder(1)  # Lower than ax1
 
-    
-    ax2.scatter(df_plt["win_st"],df_plt["read_count_cov"], color="gray", label="Raw reads",s=10, alpha = 0.2)
-    ax2.scatter(df_plt["win_st"],df_plt["otr_gc_corr_rdcnt_cov"], color="orange", label="Corrected reads",s=5, alpha = 0.5,
-                marker = mplt.markers.MarkerStyle(marker = 'o', fillstyle = 'none'))
-    ax1.scatter(df_plt["win_st"],df_plt["prob_copy_number"], color="red", label="Predicted Copy Number", marker="_", s = 30)
+    # Repeat windows are not drawn -- not their coverage, and not their copy
+    # number. Their depth measures how many reference copies collapsed onto the
+    # locus, not how many the sample carries: CWBI's chromosome shows 18x at
+    # 2.13 Mb on exactly zero unique coverage. And the call there is INHERITED
+    # from the surrounding segment rather than voted for, since run_HMM drops
+    # these windows from its observation sequence, so a red tick would claim a
+    # measurement that was never made. The gaps this leaves in the copy-number
+    # track are the honest picture: that is where CNery has no evidence.
+    keep = plottable(df_plt)
+    drawn = df_plt.loc[keep]
+    n_hidden = int((~keep).sum())
+    if drawn.empty:
+        drawn, n_hidden = df_plt, 0
 
-    delta = int(df_plt['read_count_cov'].median()*0.5)
+    ax2.scatter(drawn["win_st"], drawn["read_count_cov"], color="gray",
+                label="Raw reads", s=10, alpha=0.2)
+    ax2.scatter(drawn["win_st"], drawn["otr_gc_corr_rdcnt_cov"], color="orange",
+                label="Corrected reads", s=5, alpha=0.5,
+                marker=mplt.markers.MarkerStyle(marker="o", fillstyle="none"))
+    ax1.scatter(drawn["win_st"], drawn["prob_copy_number"], color="red",
+                label="Predicted Copy Number", marker="_", s=30)
+
+    delta = int(drawn["read_count_cov"].median() * 0.5)
     
     ax1.yaxis.set_major_locator(ticker.MultipleLocator(2))
     ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
@@ -3026,8 +3410,10 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     ax2.yaxis.set_minor_locator(ticker.MultipleLocator(1))
 
     
-    ax2.set_ylim(int(df_plt['read_count_cov'].min() - delta), int(df_plt['read_count_cov'].max() + delta))
-    ax1.set_ylim(int(df_plt['otr_gc_corr_norm_cov'].min() - 1), int(df_plt['otr_gc_corr_norm_cov'].max() + 1))
+    # Scaled to what is DRAWN. Scaling to every window is what let one repeat
+    # pile-up at 18x compress every real call into the bottom twentieth of the axis.
+    ax2.set_ylim(int(drawn['read_count_cov'].min() - delta), int(drawn['read_count_cov'].max() + delta))
+    ax1.set_ylim(int(drawn['otr_gc_corr_norm_cov'].min() - 1), int(drawn['otr_gc_corr_norm_cov'].max() + 1))
 
     
     ax1.set_xlabel("Window (Genomic position)")
@@ -3287,7 +3673,7 @@ def robust_state_count(counts, offsets, mu, min_states=5, max_states=100, suppor
 
 
 def log_emission_with_offsets(counts, offsets, mu, size, n_states,
-                              deletion_coverage_fraction):
+                              deletion_coverage_fraction, offset_tau=None):
     """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
 
     State index == copy number. Row k is NegBinom(mu = k * mu * offset_i,
@@ -3317,8 +3703,30 @@ def log_emission_with_offsets(counts, offsets, mu, size, n_states,
     # censored fit declines and run_HMM falls back to moments, where mu is 0.
     zero_mean = np.maximum(float(deletion_coverage_fraction) * mu * offsets, 1e-9)
     out[:, 0] = counts * np.log(zero_mean / (1.0 + zero_mean)) - np.log1p(zero_mean)
+    # `offset_tau` is the relative sd of the bias offset. Treating the offset as
+    # exact understates the variance, and understates it MORE at high copy number:
+    # writing o = o_hat * (1 + eps) with Var(eps) = tau^2, the law of total
+    # variance gives
+    #
+    #     Var(y | k) = m + m^2 * (1/(k*size) + tau^2)      m = k * mu * o_hat
+    #
+    # so the uncertainty adds in the reciprocal-size scale and the extra term
+    # m^2 * tau^2 grows as k^2 -- negligible at CN 1, largest exactly where the
+    # correction is multiplied up. The k^2 scaling falls out; it is not imposed.
+    #
+    # Note the size must be formed PER STATE: k*size/(1 + k*size*tau^2), not
+    # k*(size/(1 + size*tau^2)), or the k^2 property is lost.
+    tau2 = None
+    if offset_tau is not None:
+        tau2 = np.asarray(offset_tau, dtype=float) ** 2
+        if not np.any(tau2 > 0):
+            tau2 = None
+
     for state in range(1, n_states + 1):
-        out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state * size)
+        state_size = state * size
+        if tau2 is not None:
+            state_size = state_size / (1.0 + state_size * tau2)
+        out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state_size)
 
     out[~np.isfinite(out)] = -np.inf
     return out
@@ -3561,6 +3969,25 @@ BIAS_OFFSET_COLUMNS = {
 }
 
 
+def offset_tau(df, bias="all"):
+    """Relative uncertainty of the bias offset, per window.
+
+    Only the GC arm contributes: `gc_corr_tau` is measured by resampling the
+    LOWESS fit (see _gc_curve_tau). The OTR tent has its own uncertainty which is
+    NOT modelled here -- it is a two-parameter fit whose error is structured
+    along the genome rather than pointwise, so a per-window sd would misrepresent
+    it. Returns zeros when the column is absent or the mode applies no GC
+    correction, which reproduces the exact-offset behaviour.
+    """
+    zero = np.zeros(len(df), dtype=float)
+    if "gc_corr_fact" not in BIAS_OFFSET_COLUMNS.get(bias, ()):
+        return zero
+    if "gc_corr_tau" not in df.columns:
+        return zero
+    tau = df["gc_corr_tau"].to_numpy(dtype=float)
+    return np.where(np.isfinite(tau) & (tau > 0), tau, 0.0)
+
+
 def bias_offsets(df, bias="all"):
     """Multiplicative GC/OTR bias factor per window, for the emission mean.
 
@@ -3585,9 +4012,15 @@ def bias_offsets(df, bias="all"):
 def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
             n_states=5, changeprob=None,
             max_copy_number=100, min_called_windows=100, bias="all",
-            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True):
+            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True):
     """
     Viterbi copy-number calling.
+
+    `write=False` runs the identical numeric path but emits no files and prints
+    nothing. That is what the FIRST of the two fitting passes uses: its calls
+    exist only to build the CN censor for the second pass, and writing them
+    would put provisional numbers in CNV_csv/ that the second pass then
+    overwrites -- or worse, leaves behind if the run dies in between.
 
     `change_rate` is the prior probability PER BASE that copy number changes, so
     the per-window probability is 1 - exp(-change_rate * step) and re-tiling the
@@ -3709,6 +4142,7 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         counts, offsets, mu=mu, size=size,
         n_states=n_states,
         deletion_coverage_fraction=deletion_coverage_fraction,
+        offset_tau=offset_tau(new_exp, bias=bias)[called],
     )
     step_bp, window_bp = window_geometry(new_exp)
 
@@ -3740,11 +4174,12 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         emission_weight=emission_weight,
     )
 
-    brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
-    cn_brk = copy_numbers.loc[:, ["Startpos", "Endpos", "State"]].copy()
-    cn_brk.loc[:, "Segment_Size"] = cn_brk["Endpos"] - cn_brk["Startpos"]
-    cn_brk = cn_brk.drop(columns="Endpos")
-    cn_brk.to_csv(brk_full_path, index=False)
+    if write:
+        brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
+        cn_brk = copy_numbers.loc[:, ["Startpos", "Endpos", "State"]].copy()
+        cn_brk.loc[:, "Segment_Size"] = cn_brk["Endpos"] - cn_brk["Startpos"]
+        cn_brk = cn_brk.drop(columns="Endpos")
+        cn_brk.to_csv(brk_full_path, index=False)
 
     # Assign by window index rather than by appending to a flat list:
     # once censored windows are absent from the observation sequence a
@@ -3764,11 +4199,11 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     # hole.
     new_exp.loc[:, "prob_copy_number"] = CN_HMM.ffill().bfill().astype(int)
 
-    csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
-
     new_exp = new_exp.reset_index(drop=True)
-    new_exp.to_csv(csv_full_path, index=False)
 
-    print(f"{samplename}: Copy number prediction complete. .csv files saved.")
+    if write:
+        csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
+        new_exp.to_csv(csv_full_path, index=False)
+        print(f"{samplename}: Copy number prediction complete. .csv files saved.")
 
     return new_exp

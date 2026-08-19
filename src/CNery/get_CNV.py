@@ -16,7 +16,10 @@ from .core import (
     apply_otr_correction,
     plot_correction_stages,
     plot_gc_passes,
-    second_gc_pass,
+    otr_ratio,
+    pass1_summary,
+    refit_gc_bias_pooled,
+    stage_pass1,
     plot_otr_corr,
     predict_ori_ter_from_skew,
     write_gc_skew_results,
@@ -295,7 +298,10 @@ def main():
         plot_copy(df_cnv, start, end, output=out_dir)
         print(f"{smpl} ({genome_id}): CNV prediction plots saved.")
 
-    def _report_otr(smpl, genome_id, otr_fit_result):
+    def _fmt_ratio(value):
+        return "none" if value is None else f"{value:.4f}"
+
+    def _report_otr(smpl, genome_id, otr_fit_result, pass_no):
         """Say whether OTR fired, on whose coordinates, and on what evidence.
 
         Named separately from the fit because "corrected OTR bias" is no longer
@@ -307,25 +313,80 @@ def main():
         p = detail.get("Coverage fit p-value")
         if not otr_fit_result["bias"]:
             print(
-                f"{smpl} ({genome_id}): no origin/terminus bias corrected "
-                f"(coverage fit p={p}); see OTR_corr/ for the evidence."
+                f"{smpl} ({genome_id}): pass {pass_no}: no origin/terminus bias "
+                f"corrected (coverage fit p={p}); see OTR_corr/ for the evidence."
             )
             return
         source = detail.get("Breakpoint source", "coverage fit")
         p_lr = detail.get("Coverage vs skew likelihood-ratio p-value")
         extra = "" if p_lr is None else f", likelihood ratio p={p_lr}"
         print(
-            f"{smpl} ({genome_id}): corrected origin/terminus of replication "
-            f"(OTR) bias using the {source}{extra}."
+            f"{smpl} ({genome_id}): pass {pass_no}: corrected origin/terminus of "
+            f"replication (OTR) bias using the {source}{extra}."
         )
 
-    # Bias-correction and CNV calling per genome
-    # One number per sequence: its coverage relative to the longest sequence in this
-    # run, which reads exactly 1.0. Computed here because it is the only place holding
-    # every sequence at once -- apply_otr_correction() runs per sequence.
+    # ---- Two fitting passes, the first of them provisional -------------------
+    #
+    # Pass 1 is the pipeline as it always was, plus an HMM whose calls nobody
+    # sees. Pass 2 runs the same fits again with everything that HMM did not call
+    # CN = 1 censored out of them.
+    #
+    # The point is that mask_coverage_windows() censors on two crude proxies
+    # computed once on UNCORRECTED coverage -- near-zero depth and repeat overlap
+    # -- and an amplification is caught by neither, so it goes into the GC LOWESS
+    # and the OTR tent at full weight. Measured: adp1_mgd06_lb fits its origin
+    # inside its own CN-3 amplification and cwbi_ssym_ht04's chromosome inside
+    # its CN-34 one. The HMM knows where those are; nothing else in the pipeline
+    # does.
+    #
+    # One number per sequence: its coverage relative to the longest sequence in
+    # this run, which reads exactly 1.0. Computed here because it is the only
+    # place holding every sequence at once -- apply_otr_correction() runs per
+    # sequence. Recomputed after the pooled GC refit below, which changes the
+    # column it reads.
     relative_cn = relative_copy_numbers(per_genome)
 
-    # {genome_id: corrected frame + its OTR result}, filled by pass A below.
+    def correct_one(df_in, genome_id, skew_result, second):
+        """One sequence through one pass's corrections. Returns (df, otr, ori, ter).
+
+        `second` only changes what is already on the frame -- a wider censor and,
+        under the GC modes, a coverage column that now means raw/G. The fits
+        themselves are the same calls with the same gates in both passes.
+        """
+        if options.bias == "gc":
+            df_out = df_in.copy()
+            df_out["otr_gc_corr_norm_cov"] = df_out["gc_corr_norm_cov"]
+            return df_out, None, None, None
+
+        if options.bias == "none":
+            df_out = df_in.copy()
+            df_out["otr_gc_corr_norm_cov"] = df_out["norm_raw_cov"]
+            return df_out, None, None, None
+
+        # "otr" and "all" differ only in what the OTR fit is given as its
+        # baseline: --bias otr aliases gc_corr_norm_cov to the RAW coverage, so
+        # the GC correction is not applied at all in that mode.
+        df_fit = df_in.copy()
+        if options.bias == "otr":
+            df_fit["gc_corr_norm_cov"] = df_fit["norm_raw_cov"]
+        # The median filter seeds the ori/ter guess, so it has to be recomputed
+        # from the coverage this pass is actually fitting rather than inherited
+        # from the last one.
+        df_fit = df_fit.drop(columns=["gc_cor_med_fil"], errors="ignore")
+
+        otr = fit_otr_bias(df_fit, out_dir, skew_result=skew_result)
+        extra = _pass1_keys(genome_id) if second else None
+        df_out, ori, ter = apply_otr_correction(
+            otr, out_dir,
+            relative_copy_number=relative_cn.get(genome_id, 1.0),
+            extra_results=extra,
+        )
+        return df_out, otr, ori, ter
+
+    def _pass1_keys(genome_id):
+        st = staged[genome_id]
+        return pass1_summary(st["otr"], st["df"])
+
     staged = {}
 
     for genome_id, df_b2c in per_genome.items():
@@ -358,73 +419,80 @@ def main():
                 f"low confidence; see GC_skew/ for the values and curve."
             )
 
-        # Pass A collects the bias-corrected frame for every sequence. The HMM
-        # and the plots deliberately do NOT run here: the second GC pass below is
-        # POOLED, so it cannot be fitted until every sequence has been
-        # OTR-corrected, and nothing downstream should see coverage that is about
-        # to change.
-        if options.bias == "gc":
-            df_corr = df_b2c.copy()
-            df_corr["otr_gc_corr_norm_cov"] = df_corr["gc_corr_norm_cov"]
-            otr_fit_result = ori_win = ter_win = None
+        df_corr, otr_fit_result, _ori, _ter = correct_one(
+            df_b2c, genome_id, skew_result, second=False
+        )
+        if otr_fit_result is not None:
+            _report_otr(smpl, genome_id, otr_fit_result, pass_no=1)
+        elif options.bias == "gc":
             print(f"{smpl} ({genome_id}): GC bias vs coverage handled (pooled fit).")
 
-        elif options.bias == "none":
-            df_corr = df_b2c.copy()
-            df_corr["otr_gc_corr_norm_cov"] = df_corr["norm_raw_cov"]
-            otr_fit_result = ori_win = ter_win = None
-
+        # Provisional calls, written nowhere. Their only job is the censor below.
+        df_called = run_HMM(
+            df_corr, out_dir,
+            deletion_coverage_fraction=options.deletion_coverage_fraction,
+            bias=options.bias, change_rate=options.change_rate, write=False,
+        )
+        df_staged, cn_applied = stage_pass1(df_called)
+        n_censored = int(df_staged["is_cn_variant"].sum())
+        if cn_applied:
+            print(f"{smpl} ({genome_id}): pass 1 complete; {n_censored} window(s) "
+                  f"called CN != 1 will be censored from the pass-2 fits.")
         else:
-            # "otr" and "all" differ only in what the OTR fit is given as its
-            # baseline: --bias otr aliases gc_corr_norm_cov to the RAW coverage,
-            # so the GC correction is not applied at all in that mode.
-            df_in = df_b2c.copy()
-            if options.bias == "otr":
-                df_in["gc_corr_norm_cov"] = df_in["norm_raw_cov"]
-            else:
-                print(f"{smpl} ({genome_id}): GC bias vs coverage handled "
-                      f"(pooled fit).")
-            otr_fit_result = fit_otr_bias(df_in, out_dir, skew_result=skew_result)
-            df_corr, ori_win, ter_win = apply_otr_correction(
-                otr_fit_result, out_dir,
-                relative_copy_number=relative_cn.get(genome_id, 1.0),
-            )
-            _report_otr(smpl, genome_id, otr_fit_result)
+            print(f"{smpl} ({genome_id}): pass 1 complete; CN censor NOT applied "
+                  f"-- it would leave under half the windows. Pass 2 censors as "
+                  f"pass 1 did.")
 
-        staged[genome_id] = {"df": df_corr, "otr": otr_fit_result,
-                             "ori": ori_win, "ter": ter_win}
+        staged[genome_id] = {
+            "df": df_staged, "otr": otr_fit_result, "skew": skew_result,
+            "ratio": otr_ratio(otr_fit_result),
+            "cn_applied": cn_applied, "cn_censored": n_censored,
+        }
 
-    # ---- Pooled second GC pass ------------------------------------------------
+    # ---- Pooled GC refit, between the passes ---------------------------------
     #
     # The OTR tent varies with position, and position correlates with GC, so
     # dividing by it puts a GC trend back into coverage the GC stage had removed
     # -- measured at 10.4% of coverage on ltee_ara_p5_75k_exp and 3.6% on
-    # adp1_mgd06_lb. Refitting GC on the OTR-corrected coverage removes it
-    # (1.0% and 0.9%), and because both passes are functions of GC alone they
-    # compose exactly into one total curve.
+    # adp1_mgd06_lb. Refitting GC on the OTR-corrected coverage removes it, and
+    # because both passes are functions of GC alone they compose exactly into one
+    # total curve G = g1 * g2.
     #
     # Pooled for the same reason the first pass is: GC bias belongs to the
     # sequencing chemistry, not to any one reference. That is what forces the
-    # two-pass structure above -- the fit needs every sequence corrected first.
+    # pass structure -- the fit needs every sequence corrected and called first.
     #
-    # Only under --bias all. Under gc/none there is no OTR stage to reintroduce
-    # anything, and under otr the GC correction was explicitly opted out of, so
-    # quietly applying one here would ignore the flag.
-    if options.bias == "all" and staged:
-        frames, _gc2 = second_gc_pass({g: st["df"] for g, st in staged.items()})
+    # Skipped under --bias otr, where the GC correction was explicitly opted out
+    # of, and under --bias none, which applies nothing at all.
+    if options.bias in ("all", "gc") and staged:
+        frames, _gc2 = refit_gc_bias_pooled({g: st["df"] for g, st in staged.items()})
         for genome_id in staged:
             staged[genome_id]["df"] = frames[genome_id]
         gc_passes_path = plot_gc_passes(frames, out_dir)
-        print(f"{smpl}: second GC pass fitted across {len(frames)} "
-              f"sequence(s); total GC curve in "
+        print(f"{smpl}: GC bias refitted across {len(frames)} sequence(s) on "
+              f"CN=1 windows; total GC curve in "
               f"{os.path.basename(gc_passes_path)}.")
+        # gc_corr_norm_cov now means raw/G rather than raw/g1, and this reads it.
+        relative_cn = relative_copy_numbers({g: st["df"] for g, st in staged.items()})
 
-    # ---- Pass B: plots and copy-number calling, on the final coverage ---------
+    # ---- Pass 2: the same fits, on CN=1 windows ------------------------------
     for genome_id, st in staged.items():
         df_final, otr_fit_result = st["df"], st["otr"]
-        if otr_fit_result is not None:
-            plot_otr_corr(df_final, output=out_dir, ori=st["ori"], ter=st["ter"])
-            print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
+
+        if options.bias != "none":
+            df_final, otr_fit_result, ori_win, ter_win = correct_one(
+                df_final, genome_id, st["skew"], second=True
+            )
+            if otr_fit_result is not None:
+                _report_otr(smpl, genome_id, otr_fit_result, pass_no=2)
+                ratio2 = otr_ratio(otr_fit_result)
+                if st["ratio"] is not None or ratio2 is not None:
+                    print(f"{smpl} ({genome_id}): origin-to-terminus ratio "
+                          f"{_fmt_ratio(st['ratio'])} (pass 1) -> "
+                          f"{_fmt_ratio(ratio2)} (pass 2).")
+                plot_otr_corr(df_final, output=out_dir, ori=ori_win, ter=ter_win)
+                print(f"{smpl} ({genome_id}): OTR bias vs coverage plots saved.")
+
         plot_correction_stages(df_final, out_dir, otr_fit_result, bias=options.bias)
         df_cnv = run_HMM(
             df_final,
@@ -433,6 +501,11 @@ def main():
             bias=options.bias,
             change_rate=options.change_rate,
         )
+        if "prob_copy_number_pass1" in df_cnv.columns:
+            moved = int((df_cnv["prob_copy_number"].to_numpy()
+                         != df_cnv["prob_copy_number_pass1"].to_numpy()).sum())
+            print(f"{smpl} ({genome_id}): {moved} window(s) changed copy-number "
+                  f"call between the two passes.")
         emit_cnv_plot(df_cnv, genome_id)
 
 

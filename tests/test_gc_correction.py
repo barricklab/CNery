@@ -1,7 +1,13 @@
 import pytest
 import numpy as np
 import pandas as pd
-from CNery.core import mask_coverage_windows, fit_gc_bias, apply_gc_correction
+from CNery.core import (
+    _gc_curve_tau,
+    apply_gc_correction,
+    fit_gc_bias,
+    mask_coverage_windows,
+    refit_gc_bias_pooled,
+)
 
 
 def gc_correction(df, zero_frac=0.1):
@@ -116,3 +122,112 @@ class TestGCSpan:
         out = preprocess(tiny, win=100, step=100, frag=400)
         assert len(out) == 1
         assert 0.0 < float(out["gc_percent"].iloc[0]) < 1.0
+
+
+class TestCurveUncertainty:
+    """How well the GC curve is determined, per GC.
+
+    Measured by resampling the fit windows, never chosen. The obvious proxy --
+    "few windows out here" -- is wrong for this smoother: LOWESS uses a
+    NEAREST-NEIGHBOUR bandwidth (frac=0.3), so every fitted point averages the
+    same ~0.3n windows and local support is constant by construction. What
+    degrades at the tails is that the neighbourhood becomes ONE-SIDED, so the
+    local linear fit extrapolates within its own window. Resampling sees that;
+    no count- or percentile-based rule does.
+    """
+
+    def _data(self, n=4000, seed=0):
+        """GC drawn from a normal, so the tails really are sparse."""
+        rng = np.random.default_rng(seed)
+        gc = rng.normal(0.5, 0.05, n)
+        cov = 1.0 + 0.8 * (gc - 0.5) + rng.normal(0, 0.05, n)
+        return gc, cov
+
+    def test_tau_is_larger_at_the_tails_than_in_the_middle(self):
+        gc, cov = self._data()
+        grid = np.linspace(gc.min(), gc.max(), 60)
+        tau = _gc_curve_tau(gc, cov, np.ones(gc.size, bool), grid,
+                            n_surrogates=40, seed=0)
+        lo, hi = np.percentile(gc, [2, 98])
+        interior = (grid > lo) & (grid < hi)
+        assert tau[~interior].mean() > 2.0 * tau[interior].mean()
+
+    def test_it_is_a_relative_sd_so_scale_free(self):
+        """The offset enters multiplicatively, so tau must not change when the
+        coverage units do."""
+        gc, cov = self._data()
+        grid = np.linspace(gc.min(), gc.max(), 40)
+        mask = np.ones(gc.size, bool)
+        a = _gc_curve_tau(gc, cov, mask, grid, n_surrogates=30, seed=1)
+        b = _gc_curve_tau(gc, cov * 1000.0, mask, grid, n_surrogates=30, seed=1)
+        np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-9)
+
+    def test_it_is_seeded(self):
+        gc, cov = self._data()
+        grid = np.linspace(gc.min(), gc.max(), 30)
+        mask = np.ones(gc.size, bool)
+        np.testing.assert_array_equal(
+            _gc_curve_tau(gc, cov, mask, grid, n_surrogates=20, seed=7),
+            _gc_curve_tau(gc, cov, mask, grid, n_surrogates=20, seed=7))
+
+    def test_degenerate_input_returns_zero_rather_than_failing(self):
+        grid = np.linspace(0.4, 0.6, 20)
+        tau = _gc_curve_tau(np.array([0.5, 0.5]), np.array([1.0, 1.0]),
+                            np.ones(2, bool), grid, n_surrogates=5)
+        np.testing.assert_array_equal(tau, np.zeros_like(grid))
+
+    def test_the_fit_publishes_it_on_a_grid(self):
+        rng = np.random.default_rng(0)
+        n = 800
+        gc = rng.normal(0.5, 0.05, n)
+        df = pd.DataFrame({
+            "genome_id": "a",
+            "gc_percent": gc,
+            "read_count_cov": rng.poisson(100, n).astype(float),
+            "norm_raw_cov": rng.normal(1.0, 0.05, n),
+        })
+        df = mask_coverage_windows(df)
+        fit = fit_gc_bias(df, tau_surrogates=20)
+        assert fit["gc_grid"].shape == fit["gc_tau"].shape
+        assert np.all(fit["gc_tau"] >= 0)
+        out = apply_gc_correction(df, fit)
+        assert "gc_corr_tau" in out
+        assert np.all(np.isfinite(out["gc_corr_tau"].to_numpy()))
+
+
+class TestPooledUncertaintyComposition:
+    """G = g1 * g2, so log G = log g1 + log g2 and the RELATIVE variances add."""
+
+    def _frame(self, gid, n=400, seed=1):
+        rng = np.random.default_rng(seed)
+        gc = np.linspace(0.35, 0.60, n)
+        cov = 1.0 + rng.normal(0, 0.01, n)
+        return pd.DataFrame({
+            "genome_id": gid,
+            "win_st": np.arange(n) * 100,
+            "win_end": np.arange(n) * 100 + 100,
+            "gc_percent": gc,
+            "norm_raw_cov": cov,
+            "gc_corr_norm_cov": cov,
+            "otr_gc_corr_norm_cov": cov,
+            "gc_corr_fact": np.full(n, 1.2),
+            "gc_corr_tau": np.full(n, 0.03),
+            "otr_gc_corr_fact": np.ones(n),
+            "is_deletion": np.zeros(n, bool),
+            "is_redundant": np.zeros(n, bool),
+            "exclude_from_fit": np.zeros(n, bool),
+        })
+
+    def test_relative_variances_add_in_quadrature(self):
+        out, _ = refit_gc_bias_pooled({"a": self._frame("a")})
+        d = out["a"]
+        np.testing.assert_allclose(
+            d["gc_corr_tau"].to_numpy(),
+            np.sqrt(d["gc_corr_tau_pass1"].to_numpy() ** 2
+                    + d["gc_corr_tau_pass2"].to_numpy() ** 2),
+            rtol=1e-12)
+
+    def test_the_total_is_at_least_each_component(self):
+        d = refit_gc_bias_pooled({"a": self._frame("a")})[0]["a"]
+        assert np.all(d["gc_corr_tau"] >= d["gc_corr_tau_pass1"] - 1e-12)
+        assert np.all(d["gc_corr_tau"] >= d["gc_corr_tau_pass2"] - 1e-12)

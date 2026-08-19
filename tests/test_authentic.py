@@ -61,6 +61,7 @@ from CNery.core import (
     apply_otr_correction,
     fit_otr_bias,
     genome_id_from_path,
+    plot_correction_stages,
     plot_gc_skew,
     predict_ori_ter_from_skew,
     preprocess,
@@ -70,7 +71,9 @@ from CNery.core import (
     resolve_coverage_inputs,
     plot_gc_passes,
     run_HMM,
-    second_gc_pass,
+    pass1_summary,
+    refit_gc_bias_pooled,
+    stage_pass1,
     write_gc_skew_results,
 )
 from data._fetch import load_registry
@@ -177,14 +180,14 @@ DATASETS = {
     "cwbi_ssym_ht04": Spec(
         (Sequence("chromosome", 3_354_690, otr_detected=True, otr_tightens=False,
                   otr_source="GC skew"),
-         # The chromosome's COVERAGE fit is a marginal 1.217 that fails the
-         # significance gate outright (p = 0.28), so the GC-skew arm supplies the
-         # breakpoints instead, at ratio 1.169. The correction is still a wash --
-         # windows within 20% of single-copy go 91.8% -> 91.3% -- which is what
-         # otr_tightens=False records. Its fitted amplitude is known to be
-         # contaminated by the CN-34 amplification at 59,501 sitting near the
-         # origin; an event-censoring refit was tried and removed as too clumsy,
-         # so that contamination is currently carried rather than corrected.
+         # The chromosome's COVERAGE fit fails its own gate in pass 1 (p = 0.41)
+         # and the GC-skew arm supplies the breakpoints, at ratio 1.169. Under the
+         # CN censor the coverage evidence sharpens a long way -- r-squared
+         # 0.0047 -> 0.079, p 0.41 -> 0.028 -- but the AMPLITUDE barely moves
+         # (1.1690 -> 1.1699), because the skew fixes the breakpoints and the OLS
+         # anchors were never what the CN-34 amplification at 59,501 was
+         # distorting. So the correction is still a wash on this sequence, which
+         # is what otr_tightens=False records.
          # Neither plasmid clears the GC-skew gate, which is the expected answer:
          # a plasmid has no bidirectional replication origin, so there is no sign
          # change for the cumulative curve to turn on. Both are rejected by the
@@ -269,52 +272,77 @@ def raw_tables(dataset_dir):
 _PIPELINES = {}
 
 
-def _run_pipeline(name, path, out):
-    """process_multi_genome once, then OTR + HMM per sequence, mirroring get_CNV.main()."""
+def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
+    """The full two-pass pipeline for one dataset, mirroring get_CNV.main().
+
+    Mirroring it is load-bearing and has bitten this file twice: once when the GC
+    skew was computed AFTER the OTR fit (silently running the coverage-only arm),
+    once when the pooled second GC pass was left out. The structure below is
+    main()'s at --bias all: correct, call copy number, censor everything not
+    called CN = 1, then run both fits again.
+    """
     for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
 
     per_genome = process_multi_genome(
         resolve_coverage_inputs([str(path)]),
         output_prefix=str(out),
-        win=WIN, step=STEP, frag=FRAG,
+        win=win, step=step, frag=frag,
     )
 
     # Mirrors get_CNV.main(): one number per sequence, computed across ALL of them
     # because apply_otr_correction() runs per sequence and cannot see the others.
     relative_cn = relative_copy_numbers(per_genome)
 
-    frames = {}
+    # ---- Pass 1: correct, then call copy number without writing anything -----
+    frames, staged = {}, {}
     for seq_id, df_gc in per_genome.items():
         # df_gc already carries is_deletion/is_redundant from the
         # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
         # so fit_otr_bias() reuses them.
         # Ahead of the OTR fit, exactly as get_CNV.main() places it. This
-        # ORDERING IS LOAD-BEARING now: it reads only ref_base, so it is
-        # available whatever the coverage does, and fit_otr_bias() takes it as
-        # the second breakpoint candidate. Computing it afterwards -- as this
-        # harness used to -- silently runs the coverage-only arm and stops
-        # mirroring main().
-        skew = predict_ori_ter_from_skew(df_gc, win=WIN, step=STEP)
+        # ORDERING IS LOAD-BEARING: it reads only ref_base, so it is available
+        # whatever the coverage does, and fit_otr_bias() takes it as the second
+        # breakpoint candidate.
+        skew = predict_ori_ter_from_skew(df_gc, win=win, step=step)
         write_gc_skew_results(skew, str(out), seq_id)
         plot_gc_skew(df_gc, str(out), skew)
 
-        res = fit_otr_bias(df_gc, str(out), skew_result=skew)
-        df_otr, ori, ter = apply_otr_correction(
-            res, str(out), relative_copy_number=relative_cn[seq_id],
+        res1 = fit_otr_bias(df_gc, str(out), skew_result=skew)
+        df_otr, _ori, _ter = apply_otr_correction(
+            res1, str(out), relative_copy_number=relative_cn[seq_id],
         )
-        frames[seq_id] = {"gc": df_gc, "otr": df_otr, "skew": skew, "res": res}
+        # Provisional calls: they exist only to build the CN censor for pass 2,
+        # and main() writes none of them.
+        df_staged, cn_applied = stage_pass1(run_HMM(df_otr, str(out), write=False))
+        staged[seq_id] = df_staged
+        frames[seq_id] = {"gc": df_gc, "skew": skew, "res1": res1,
+                          "cn_applied": cn_applied,
+                          "pass1_keys": pass1_summary(res1, df_staged)}
 
-    # The second GC pass is POOLED, so like main() it cannot run inside the loop
-    # above -- it needs every sequence OTR-corrected first, and the HMM must not
-    # see coverage that is about to change. Mirroring that here is what keeps the
-    # authentic tier exercising the same pipeline the CLI runs; the harness
-    # silently diverging from main() has bitten this file once already.
-    corrected, _gc2 = second_gc_pass({s: f["otr"] for s, f in frames.items()})
+    # ---- Pooled GC refit, between the passes ---------------------------------
+    # Pooled, so like main() it cannot run inside the loop above: it needs every
+    # sequence OTR-corrected AND called first.
+    corrected, _gc2 = refit_gc_bias_pooled(staged)
     plot_gc_passes(corrected, str(out))
-    for seq_id, df_final in corrected.items():
-        frames[seq_id]["otr"] = df_final
-        frames[seq_id]["cnv"] = run_HMM(df_final, str(out))
+    # gc_corr_norm_cov now means raw/G rather than raw/g1, and this reads it.
+    relative_cn = relative_copy_numbers(corrected)
+
+    # ---- Pass 2: the same fits, on CN=1 windows ------------------------------
+    for seq_id, df_staged in corrected.items():
+        f = frames[seq_id]
+        # The median filter seeds the ori/ter guess, so it is recomputed from the
+        # coverage this pass fits rather than inherited from the last one.
+        df_fit = df_staged.drop(columns=["gc_cor_med_fil"], errors="ignore")
+        res = fit_otr_bias(df_fit, str(out), skew_result=f["skew"])
+        df_final, _ori, _ter = apply_otr_correction(
+            res, str(out), relative_copy_number=relative_cn[seq_id],
+            extra_results=f["pass1_keys"],
+        )
+        plot_correction_stages(df_final, str(out), res, bias="all")
+        f["res"] = res
+        f["otr"] = df_final
+        f["cnv"] = run_HMM(df_final, str(out))
 
     return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
 
@@ -326,6 +354,40 @@ def pipeline(dataset_dir, tmp_path_factory):
     if name not in _PIPELINES:
         _PIPELINES[name] = _run_pipeline(name, path, tmp_path_factory.mktemp(f"out_{name}"))
     return _PIPELINES[name]
+
+
+#: The CLI's own defaults, which are NOT the windowing the goldens use.
+#: One run uses them because the emission-variance correction only bites at this
+#: resolution: measured at -w 1000 -s 500 it moves nothing on any of the eight
+#: sequences, so a suite that only ever ran the golden windowing would let the
+#: whole mechanism be deleted without a single failure.
+CLI_WIN, CLI_STEP, CLI_FRAG = 100, 100, 400
+
+#: Two datasets, and the second is not optional. m3_32k is the positive case;
+#: adp1 is the NEGATIVE control -- the rejected GC-tail clamp fixed m3_32k while
+#: splitting a spurious CN-2 island out of adp1's amplification, so a suite
+#: without adp1 here would not catch a change that merely trades one artifact for
+#: another.
+CLI_DEFAULT_DATASETS = ("ltee_ara_m3_32k_2rg", "adp1_mgd06_lb")
+
+
+@pytest.fixture(scope="session")
+def cli_default_pipelines(tmp_path_factory):
+    """{dataset: pipeline} at the CLI's default -w/-s/-f.
+
+    Session-scoped: 46,298 and 35,923 windows against the goldens' 9,258 and
+    6,810, so these are the most expensive runs in the suite and must happen once.
+    """
+    from conftest import _dataset_or_skip
+
+    out = {}
+    for name in CLI_DEFAULT_DATASETS:
+        path = _dataset_or_skip(name)
+        out[name] = _run_pipeline(
+            name, path, tmp_path_factory.mktemp(f"cli_{name}"),
+            win=CLI_WIN, step=CLI_STEP, frag=CLI_FRAG,
+        )
+    return out
 
 
 @pytest.fixture
@@ -709,31 +771,25 @@ class TestOriginTerminus:
         assert otr["Terminus window"] == skew["Terminus (bp)"]
 
     def test_no_tent_is_applied_when_no_bias_is_found(self, seq):
-        """No ramp detected must mean no TENT divided out -- not no change at all.
+        """No ramp detected must mean no TENT divided out.
 
-        This used to assert that otr_gc_corr_norm_cov was bit-identical to
-        gc_corr_norm_cov. That stopped being true when the pooled second GC pass
-        landed: it is fitted across the whole run and applied to every sequence,
-        including ones where no ramp was found, because GC bias belongs to the
-        sequencing chemistry and one curve should describe the run rather than a
-        different correction reaching each reference depending on whether its own
-        OTR fit cleared a gate. The measured cost is real and accepted -- on
-        ltee_ara_m3_32k_2rg the residual GC trend goes 0.58% -> 1.09%.
+        Bit-identical, and the two-pass restructure is what made it so again. For
+        one release this had to divide the second GC pass back out first: that
+        pass updated `gc_corr_fact` to the composed G but left `gc_corr_norm_cov`
+        at raw/g1, so the column and its own factor disagreed and the invariant
+        could only be checked modulo g2.
 
-        What must still hold is the thing the old assertion was really protecting:
-        an undetected ramp contributes NOTHING. So divide the second GC pass back
-        out and the coverage has to land exactly on its GC-corrected input.
+        Now refit_gc_bias_pooled() writes `gc_corr_norm_cov = raw/G` -- it has to,
+        since that column is what the second OTR fit is handed as input -- so the
+        GC correction is entirely accounted for before the OTR stage runs, and an
+        undetected ramp contributes exactly nothing.
         """
         if seq["seq"].otr_detected:
             pytest.skip("OTR fires here; see test_correction_tightens_coverage")
         df = seq["otr"]
-        undone = df["otr_gc_corr_norm_cov"].to_numpy()
-        if "gc_corr_fact_pass2" in df:
-            keep = ~df["is_deletion"].to_numpy(dtype=bool)
-            undone = undone.copy()
-            undone[keep] = undone[keep] * df["gc_corr_fact_pass2"].to_numpy()[keep]
         np.testing.assert_allclose(
-            undone, df["gc_corr_norm_cov"].to_numpy(), rtol=1e-9,
+            df["otr_gc_corr_norm_cov"].to_numpy(),
+            df["gc_corr_norm_cov"].to_numpy(), rtol=1e-9,
         )
 
     def test_correction_tightens_coverage(self, seq):
@@ -1024,3 +1080,95 @@ class TestCopyNumber:
         if not seq["seq"].has_deletions:
             pytest.skip("no deletions on this sequence (neither CWBI plasmid has one)")
         assert 0 in set(seq["cnv"]["prob_copy_number"].unique()), "expected called deletions"
+
+
+class TestOffsetUncertaintyAtCliDefaults:
+    """The GC correction is an ESTIMATE, and the HMM is told how good a one.
+
+    run_HMM divides nothing: it compares raw counts against `k * mu * offset`,
+    where the offset is a LOWESS fit evaluated at the window's GC. Treating that
+    fit as exact understates the emission variance, and understates it MORE at
+    high copy number -- the offset's error is multiplied by k, so the variance it
+    contributes grows as k^2.
+
+    The consequence is concrete. A 1.1 kb stretch at the 99.5th GC percentile
+    inside ltee_ara_m3_32k_2rg's 26 kb CN-3 amplification has its offset divided
+    down to 0.82, which puts its corrected level at 4.2 and earns it its own CN-4
+    segment -- on a GC excursion rather than on copy number. `gc_corr_tau`
+    (_gc_curve_tau) measures how well the curve is determined at each GC by
+    resampling the fit, and that is enough to keep the block whole.
+
+    THESE ASSERTIONS NEED THEIR OWN RUN. At the goldens' -w 1000 -s 500 the same
+    correction moves zero windows on all eight sequences, which is why no golden
+    changed when it landed.
+    """
+
+    #: The amplification, in bp: ~263 windows uniformly around 3.3x the median.
+    AMP = ("ltee_ara_m3_32k_2rg", "REL606", 599_601, 625_901)
+    #: adp1's, which contains 4 windows below the 0.25th GC percentile.
+    CONTROL = ("adp1_mgd06_lb", "ADP1-ISx", 2_410_101, 2_481_401)
+
+    def _block(self, pipelines, case):
+        name, seq_id, lo, hi = case
+        df = pipelines[name]["frames"][seq_id]["cnv"]
+        inside = ((df["win_st"] >= lo) & (df["win_st"] < hi)).to_numpy()
+        return df, inside
+
+    def test_the_amplification_is_called_as_one_state(self, cli_default_pipelines):
+        """No sliver: the whole block comes back at a single copy number."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        assert inside.sum() > 200, "the amplification should span 200+ windows"
+        called = set(df.loc[inside, "prob_copy_number"].unique().tolist())
+        assert called == {3}, f"expected one CN-3 block, got states {called}"
+
+    def test_no_window_in_it_is_called_cn_4(self, cli_default_pipelines):
+        """The specific regression: 11 windows here come back CN 4 without the
+        correction."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        assert int((df.loc[inside, "prob_copy_number"] == 4).sum()) == 0
+
+    def test_the_gc_excursion_is_still_extreme(self, cli_default_pipelines):
+        """Guards the guard. If the GC inside the block ever stopped being
+        extreme, the two tests above would start passing for the wrong reason."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        gc = df["gc_percent"].to_numpy(dtype=float)
+        assert int((gc[inside] > np.percentile(gc, 99)).sum()) >= 5
+
+    def test_the_negative_control_is_not_split(self, cli_default_pipelines):
+        """adp1's amplification must stay whole.
+
+        It carries the opposite excursion -- 4 windows BELOW the 0.25th GC
+        percentile -- and the GC-tail clamp that fixed m3_32k split a CN-2 island
+        out of it here. Discounting evidence where the curve is uncertain is
+        sign-blind and must not do that.
+        """
+        df, inside = self._block(cli_default_pipelines, self.CONTROL)
+        assert inside.sum() > 600
+        called = set(df.loc[inside, "prob_copy_number"].unique().tolist())
+        assert called == {3}, f"expected one CN-3 block, got states {called}"
+
+    def test_tau_is_concentrated_at_the_gc_tails(self, cli_default_pipelines):
+        """The correction has to be CONCENTRATED where the curve is uncertain.
+
+        A uniformly larger tau is a different thing and is measurably worse:
+        scaling this one up 4x everywhere brings the sliver back at five times the
+        size, because it also inflates the interior where the fit is sound.
+        """
+        df, _ = self._block(cli_default_pipelines, self.AMP)
+        assert "gc_corr_tau" in df, "the emission model reads this column"
+        gc = df["gc_percent"].to_numpy(dtype=float)
+        tau = df["gc_corr_tau"].to_numpy(dtype=float)
+        lo, hi = np.percentile(gc, [1, 99])
+        interior = (gc > lo) & (gc < hi)
+        tails = ~interior
+        assert tails.sum() > 50
+        assert tau[tails].mean() > 2.0 * tau[interior].mean()
+
+    def test_the_real_events_still_call(self, cli_default_pipelines):
+        """Not blanket conservatism. The genuine deletion and high-copy blocks
+        are all still there."""
+        df = cli_default_pipelines[self.AMP[0]]["frames"][self.AMP[1]]["cnv"]
+        states = set(df["prob_copy_number"].unique().tolist())
+        assert 0 in states, "the deletion must still be called"
+        assert 3 in states, "the CN-3 amplification must still be called"
+        assert max(states) >= 10, f"the high-copy block is gone; states {states}"

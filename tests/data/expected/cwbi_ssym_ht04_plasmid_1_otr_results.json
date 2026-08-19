@@ -4,10 +4,10 @@
     "Terminus window": 116501,
     "Terminus coverage (normalized)": null,
     "Origin-to-Termius/Bias Ratio": "Not detected",
-    "Relative copy number": 2.9531124573724026,
+    "Relative copy number": 2.9642193369393204,
     "Correction type": "Ori-ter coordinates fit by coverage",
-    "Coverage fit r-squared": 0.1202,
-    "Coverage fit p-value": 0.0989,
+    "Coverage fit r-squared": 0.0689,
+    "Coverage fit p-value": 0.24675,
     "GC skew fit r-squared": null,
     "GC skew fit p-value": null,
     "GC skew prediction confident": false,
@@ -16,5 +16,11 @@
     "Bootstrap surrogates": 1000,
     "Breakpoint source": "not corrected",
     "Residual structure score": null,
-    "Residual decorrelation length (bp)": null
+    "Residual decorrelation length (bp)": null,
+    "Coverage fit r-squared (pass 1)": 0.1202,
+    "Coverage fit p-value (pass 1)": 0.0989,
+    "Breakpoint source (pass 1)": "not corrected",
+    "Origin-to-Termius/Bias Ratio (pass 1)": null,
+    "Windows censored as CN != 1": 0,
+    "Refit on CN=1 windows": false
 }

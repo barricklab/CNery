@@ -6,6 +6,8 @@ import pandas as pd
 from scipy.stats import nbinom
 
 from CNery.core import (
+    offset_tau,
+    run_HMM,
     setup_transition_matrix,
     setup_emission_matrix,
     make_viterbi_mat,
@@ -486,3 +488,257 @@ def test_deletion_calls_do_not_depend_on_sequencing_depth(depth, tmp_path):
         f"deletion holding 10% of a {depth:.0f}x baseline was not called CN0; "
         f"got {sorted(set(called))}"
     )
+
+
+class TestProvisionalRun:
+    """run_HMM(write=False), the first of the two fitting passes.
+
+    Its calls exist only to build the CN censor for the second pass. Writing them
+    would put provisional numbers in CNV_csv/ that the second pass overwrites --
+    or leaves behind if the run dies in between.
+    """
+
+    def test_write_false_produces_no_files(self, otr_corrected_flat, tmp_path):
+        out = tmp_path / "run"
+        (out / "CNV_csv").mkdir(parents=True)
+        run_HMM(otr_corrected_flat, str(out), write=False)
+        assert list((out / "CNV_csv").iterdir()) == []
+
+    def test_write_false_changes_no_numbers(self, otr_corrected_flat, tmp_path):
+        """The provisional pass must run the identical numeric path.
+
+        If it did not, the censor would come from a different model than the one
+        whose calls are eventually published.
+        """
+        quiet_dir = tmp_path / "quiet"
+        loud_dir = tmp_path / "loud"
+        for d in (quiet_dir, loud_dir):
+            (d / "CNV_csv").mkdir(parents=True)
+        quiet = run_HMM(otr_corrected_flat, str(quiet_dir), write=False)
+        loud = run_HMM(otr_corrected_flat, str(loud_dir), write=True)
+        np.testing.assert_array_equal(quiet["prob_copy_number"].to_numpy(),
+                                      loud["prob_copy_number"].to_numpy())
+
+
+class TestOffsetUncertainty:
+    """The bias offset is an ESTIMATE, and the emission model is told how good one.
+
+    `bias_offsets` returns a LOWESS fit evaluated at each window's GC. Writing
+    o = o_hat * (1 + eps) with Var(eps) = tau^2, the law of total variance gives
+
+        Var(y | k) = m + m^2 * (1/(k*size) + tau^2)      m = k * mu * o_hat
+
+    so the uncertainty adds in the reciprocal-size scale and the extra term
+    m^2 * tau^2 grows as k^2 -- negligible at CN 1, largest exactly where the
+    offset is multiplied up. The k^2 behaviour is DERIVED, not imposed, and it is
+    what makes the correction bite inside amplifications and nowhere else.
+    """
+
+    MU, SIZE, N_STATES = 100.0, 15.0, 5
+
+    def _emissions(self, tau, counts=None, offsets=None):
+        counts = np.full(40, 300.0) if counts is None else counts
+        offsets = np.ones(counts.size) if offsets is None else offsets
+        return log_emission_with_offsets(
+            counts, offsets, mu=self.MU, size=self.SIZE, n_states=self.N_STATES,
+            deletion_coverage_fraction=0.02,
+            offset_tau=None if tau is None else np.full(counts.size, tau),
+        )
+
+    def _implied_var(self, tau, state):
+        """Var of the NB this state's row actually uses, from the model algebra."""
+        m = state * self.MU
+        size_k = state * self.SIZE
+        if tau:
+            size_k = size_k / (1.0 + size_k * tau ** 2)
+        return m + m * m / size_k
+
+    def test_none_and_zero_are_exactly_the_current_behaviour(self):
+        """Every existing golden was produced without this. Both the None path
+        and an all-zero tau must reproduce it bit for bit."""
+        base = self._emissions(None)
+        np.testing.assert_array_equal(base, self._emissions(0.0))
+
+    def test_a_missing_column_means_no_uncertainty(self):
+        df = pd.DataFrame({"gc_corr_fact": np.ones(10)})
+        np.testing.assert_array_equal(offset_tau(df, bias="all"), np.zeros(10))
+
+    def test_uncertainty_fattens_the_tail_and_lowers_the_peak(self):
+        """Widening moves mass OUT of the centre and INTO the tails, so a count
+        far from a state's mean gains likelihood and one near it loses some.
+
+        Checking only the tail would pass for a distribution that had simply been
+        shifted, so both directions are asserted.
+        """
+        far = np.array([750.0])              # CN 4 has mean 400 here
+        near = np.array([400.0])
+        assert (self._emissions(0.10, counts=far)[0, 4]
+                > self._emissions(None, counts=far)[0, 4])
+        assert (self._emissions(0.10, counts=near)[0, 4]
+                < self._emissions(None, counts=near)[0, 4])
+
+    def test_the_added_variance_grows_as_k_squared(self):
+        """THE invariant, and it has an exact form worth pinning.
+
+        Var adds m^2 * tau^2 with m = k*mu*o, while the existing terms are
+        m + m^2/(k*size). Dividing through,
+
+            Var_with / Var_without - 1 = k * mu * tau^2 / (1 + mu/size)
+
+        -- strictly LINEAR in k. So the excess is not merely increasing, it is
+        proportional to the copy number, which is what "the offset error is
+        multiplied by k" means quantitatively.
+
+        A refactor computing one effective size PER WINDOW --
+        k*(size/(1+size*tau^2)) rather than k*size/(1+k*size*tau^2) -- makes the
+        excess constant in k instead, and this test is what catches it.
+        """
+        tau = 0.10
+        excess = [self._implied_var(tau, k) / self._implied_var(0.0, k) - 1.0
+                  for k in range(1, self.N_STATES + 1)]
+        per_k = [e / k for e, k in zip(excess, range(1, self.N_STATES + 1))]
+        assert all(v == pytest.approx(per_k[0], rel=1e-9) for v in per_k), per_k
+
+        predicted = self.MU * tau ** 2 / (1.0 + self.MU / self.SIZE)
+        assert per_k[0] == pytest.approx(predicted, rel=1e-9)
+        assert excess[-1] > 4.0 * excess[0], "it must concentrate at high CN"
+
+    def test_the_emission_rows_follow_that_algebra(self):
+        """Ties the matrix the HMM actually consumes to the variance above, so
+        the previous test cannot pass while the implementation diverges."""
+        from scipy.stats import nbinom
+
+        tau = 0.10
+        out = self._emissions(tau, counts=np.array([300.0]))
+        for state in range(1, self.N_STATES + 1):
+            m = state * self.MU
+            size_k = state * self.SIZE
+            size_k = size_k / (1.0 + size_k * tau ** 2)
+            want = nbinom.logpmf(300.0, size_k, size_k / (size_k + m))
+            assert out[0, state] == pytest.approx(want, rel=1e-9)
+
+
+class TestOffsetTauDispatch:
+    """Which --bias modes carry offset uncertainty at all."""
+
+    def _frame(self, n=12):
+        return pd.DataFrame({
+            "gc_corr_fact": np.ones(n),
+            "otr_gc_corr_fact": np.ones(n),
+            "gc_corr_tau": np.full(n, 0.05),
+        })
+
+    @pytest.mark.parametrize("bias,expected", [
+        ("all", 0.05), ("gc", 0.05), ("otr", 0.0), ("none", 0.0),
+    ])
+    def test_only_modes_that_apply_gc_carry_it(self, bias, expected):
+        """--bias otr aliases the GC correction away and --bias none applies
+        nothing, so in both there is no GC offset whose error to propagate."""
+        assert offset_tau(self._frame(), bias=bias)[0] == pytest.approx(expected)
+
+    def test_negative_or_non_finite_values_are_dropped(self):
+        df = self._frame()
+        df.loc[0, "gc_corr_tau"] = np.nan
+        df.loc[1, "gc_corr_tau"] = -1.0
+        got = offset_tau(df, bias="all")
+        assert got[0] == 0.0 and got[1] == 0.0 and got[2] == pytest.approx(0.05)
+
+
+class TestUncertaintySuppressesAGcSliver:
+    """End to end, offline: the artifact this correction exists for.
+
+    Reproduces the geometry measured on ltee_ara_m3_32k_2rg -- a CN-3
+    amplification with a short stretch inside it where the GC curve claims a
+    suppression the coverage does not show -- and checks that the discrepancy
+    alone buys a spurious higher state without the correction, and does not with
+    it.
+
+    THE DISCREPANCY IS THE POINT. Counts here follow mu*cn with no suppression at
+    all, while `gc_corr_fact` claims 0.82. That is the measured situation: inside
+    the real amplification the raw depth is 3.45x where the genome-wide GC curve
+    implies 3 * 0.82 = 2.46x, so the corrected level reads 4.2 and earns a CN-4
+    segment. Generating counts that OBEY the dip would put the corrected level at
+    exactly 3 and prove nothing.
+
+    SCALE. This is a deliberately harder case than the real one -- an 18%
+    discrepancy over 16 windows at low dispersion -- so it needs a tau well above
+    what the bootstrap produces on real data (0.003-0.02). It is a test of the
+    MECHANISM. That the mechanism works at realistic magnitudes is what
+    tests/test_authentic.py::TestOffsetUncertaintyAtCliDefaults covers.
+
+    SEEDS, PLURAL. A single seed is luck: measured, the outcome at the decision
+    boundary flips with noise, and only 2 of 6 seeds showed the clean pattern in
+    a marginal regime. The regime below is 0/12 whole without tau and 12/12 with
+    it, and the test averages anyway rather than trusting one draw.
+    """
+
+    N, MU, SIZE = 600, 300.0, 80.0
+    AMP = (200, 460)          # the CN-3 block, in windows
+    DIP = (300, 316)          # where the GC curve claims a suppression
+    CLAIM = 0.82              # ...of this much, which the coverage does not show
+    SEEDS = range(6)
+
+    def _frame(self, seed):
+        rng = np.random.default_rng(seed)
+        cn = np.ones(self.N)
+        cn[self.AMP[0]:self.AMP[1]] = 3.0
+        offset = np.ones(self.N)
+        offset[self.DIP[0]:self.DIP[1]] = self.CLAIM
+        mean = self.MU * cn
+        counts = rng.negative_binomial(
+            self.SIZE, self.SIZE / (self.SIZE + mean)).astype(float)
+        return pd.DataFrame({
+            "genome_id": "a",
+            "win_st": np.arange(self.N) * 100,
+            "win_end": np.arange(self.N) * 100 + 100,
+            "read_count_cov": counts,
+            "norm_raw_cov": counts / self.MU,
+            "gc_corr_norm_cov": counts / self.MU / offset,
+            "otr_gc_corr_norm_cov": counts / self.MU / offset,
+            "gc_corr_fact": offset,
+            "otr_gc_corr_fact": np.ones(self.N),
+            "is_deletion": np.zeros(self.N, bool),
+        })
+
+    def _is_whole(self, seed, tau, out_dir):
+        df = self._frame(seed)
+        if tau is not None:
+            # Concentrated where the curve is uncertain, which is the whole
+            # point -- a uniformly large tau is a different thing and is
+            # measurably worse on real data.
+            df["gc_corr_tau"] = np.where(
+                df["gc_corr_fact"].to_numpy() < 0.95, tau, tau / 10.0)
+        cnv = run_HMM(df, str(out_dir), write=False)
+        inside = ((cnv["win_st"] >= self.AMP[0] * 100)
+                  & (cnv["win_st"] < self.AMP[1] * 100)).to_numpy()
+        return sorted(set(cnv.loc[inside, "prob_copy_number"].tolist())) == [3]
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        (tmp_path / "CNV_csv").mkdir(parents=True)
+        return tmp_path
+
+    def test_the_discrepancy_alone_splits_the_block(self, out_dir):
+        """Without the correction, an offset the coverage does not support is
+        enough on its own -- there is no copy-number change anywhere in the
+        block. If this ever stops splitting, the test below proves nothing.
+        """
+        whole = sum(self._is_whole(s, None, out_dir) for s in self.SEEDS)
+        assert whole == 0, f"expected every seed to split, {whole} stayed whole"
+
+    def test_uncertainty_keeps_the_block_whole(self, out_dir):
+        """Telling the model the offset is uncertain restores the single block,
+        on every seed."""
+        whole = sum(self._is_whole(s, 0.20, out_dir) for s in self.SEEDS)
+        assert whole == len(self.SEEDS), (
+            f"only {whole}/{len(self.SEEDS)} seeds kept the block whole")
+
+    def test_the_effect_is_monotone_in_tau(self, out_dir):
+        """More uncertainty must never make the split MORE likely, over the
+        range where the correction is meant to operate. (It is not monotone
+        without bound -- a uniform 4x on real data brings the artifact back --
+        which is why this stops at the working range.)
+        """
+        rates = [sum(self._is_whole(s, t, out_dir) for s in self.SEEDS)
+                 for t in (None, 0.10, 0.20)]
+        assert rates == sorted(rates), rates

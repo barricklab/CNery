@@ -115,6 +115,9 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
 | `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
 | `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
+| `is_cn_variant` | `add_cn_censor` | pass-1 HMM did not call this window CN=1 |
+| `gc_corr_tau` | `apply_gc_correction` | relative sd of the GC curve at this window's GC |
+| `*_pass1` | `stage_pass1` | the first pass's value, before pass 2 overwrites it |
 | `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts (output/plots only — **not** the HMM's observation) |
 | `prob_copy_number` | `run_HMM` | Viterbi state |
 
@@ -132,16 +135,20 @@ Adding a stage means reading the previous column name and writing the next one.
 
 ### `--bias` works by aliasing columns
 
-`get_CNV.py:212-265` implements the four modes by *renaming data into the column the next stage
-expects*, rather than by branching inside the correction functions. `fit_otr_bias` unconditionally
+`get_CNV.main`'s `correct_one()` implements the four modes by *renaming data into the column the
+next stage expects*, rather than by branching inside the correction functions. It is called once per
+pass, so a mode's aliasing is defined in exactly one place for both. `fit_otr_bias` unconditionally
 reads `gc_corr_norm_cov`. The aliasing still drives the corrected-coverage columns written to
 `CNV.csv` and the plots — but **not** the HMM, which now takes `bias` as an argument and composes its
 emission offset from the correction-factor columns directly.
 
-- `all` — no aliasing; both corrections run in sequence.
-- `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely.
-- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input.
-- `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`.
+- `all` — no aliasing; both corrections run in sequence, and both are refitted in pass 2.
+- `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely. The pooled GC
+  refit still runs in pass 2, since the CN censor sharpens a GC fit whether or not an OTR stage
+  exists.
+- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input. No GC
+  refit, because the GC correction was explicitly opted out of.
+- `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`. No second pass at all.
 
 Any new bias mode is another aliasing branch here, not a new parameter threaded through `core.py` —
 *plus* an entry in `BIAS_OFFSET_COLUMNS`, since the HMM composes its emission offset from the
@@ -152,53 +159,221 @@ does it unconditionally, and the `otr`/`none` branches discard the result by ove
 That is also why `is_deletion` / `is_redundant` are present on the frame in all four modes:
 `mask_coverage_windows` runs as part of that unconditional GC stage.
 
-### GC bias is corrected in TWO pooled passes
+### The pipeline runs TWICE, and the first HMM censors the second run
 
-`g1` is fitted on raw coverage in `process_multi_genome`. `g2` is fitted on
-**OTR-corrected** coverage by `second_gc_pass`, because the OTR tent varies with
-POSITION and position is correlated with GC — measured r between GC% and the
-fitted tent is 0.245 on `adp1_mgd06_lb`, 0.110 on `ltee_ara_p5_75k_exp`, 0.075 on
-CWBI's chromosome — so dividing by the tent puts a GC trend straight back into
-coverage the GC stage had just removed. Span of a LOWESS of coverage against GC,
-over the 1st–99th GC percentile:
+Every fit in CNery is contaminated by real copy-number variation.
+`mask_coverage_windows` censors on two crude proxies computed once on
+*uncorrected* coverage — `is_deletion` (≤10% of the global median) and
+`is_redundant` (any repeat overlap) — and an **amplification is caught by
+neither**, so it goes into the GC LOWESS and the OTR tent at full weight. The HMM
+knows where the copy-number variation is; nothing else in the pipeline does.
 
-| sequence | raw | after `g1` | after OTR | after `g2` |
-| --- | --- | --- | --- | --- |
-| `p5_75k_exp` | 18.27% | 1.20% | **10.39%** | **1.03%** |
-| `adp1` | 12.85% | 1.03% | 3.61% | 0.89% |
-| `p1_shift` | 70.30% | 0.56% | 2.79% | 0.61% |
+```
+PASS 1   censoring: is_deletion | is_redundant
+  process_multi_genome:  preprocess -> pool -> mask -> pooled GC fit g1 -> apply
+  per sequence:          GC skew -> otr_fit (gate + arbitration) -> tent T1 -> apply
+  per sequence:          run_HMM(write=False)                              -> CN1
+
+  is_cn_variant := (CN1 != 1)          <- add_cn_censor(), folded into exclude_from_fit
+
+PASS 2   censoring: is_deletion | is_redundant | is_cn_variant
+  pooled GC refit g2 on raw/(g1*T1)    ->  G = g1*g2,  gc_corr_norm_cov = raw/G
+  per sequence: full otr_fit on raw/G  ->  T2          (the gate RE-RUNS)
+  per sequence: run_HMM(write=True)    ->  the published calls, plots
+```
+
+This is alternating conditional fitting: `g2` is fitted on the residual with the
+current tent removed, `T2` on the residual with the current GC curve removed.
+
+- **The second OTR fit reads `raw/G`, never the residual `raw/(g1·T1·g2)`.** A
+  tent has to be fitted to a series that still *contains* the ramp; fitting the
+  residual would return a near-flat tent and the correction would collapse.
+  `refit_gc_bias_pooled` therefore writes `gc_corr_norm_cov = raw/G` — the column
+  and its own factor `gc_corr_fact = G` finally agree, which for one release they
+  did not. The pass's own before/after, `raw/(g1·T1)` → `raw/(g1·T1·g2)`, is kept
+  separately as `gc2_resid_cov` because the figure draws it and nothing else
+  should consume it. `test_the_next_otr_fit_reads_raw_over_the_total_curve` pins
+  the distinction.
+- **`raw/G` is deliberately NOT flat against GC**, and reading its GC span as a
+  regression is a mistake: `G` includes `g2`, which was fitted to flatten the
+  *tent-corrected* series, so `raw/G` carries exactly the GC trend that the tent's
+  own GC-projection implies (12.11% on `p5_75k_exp`). Dividing by `T2` removes it,
+  and the FINAL column is what should be judged.
+
+Span of a LOWESS of coverage against GC over the 1st–99th GC percentile, at each
+stage — note `raw/G` is an intermediate, not a result:
+
+| sequence | raw | `raw/g1` | `raw/(g1·T1)` | `raw/G` | **final** |
+| --- | --- | --- | --- | --- | --- |
+| `p5_75k_exp` | 18.27% | 1.20% | 10.27% | 12.11% | **0.93%** |
+| `p1_shift` | 70.30% | 0.56% | 2.67% | 3.34% | **0.46%** |
+| `adp1` | 12.85% | 1.03% | 1.74% | 2.44% | **0.81%** |
+| `cwbi:chromosome` | 12.23% | 1.99% | 2.25% | 2.64% | **1.74%** |
 
 - **Composition is exact and `gc_corr_fact` is the TOTAL.** Both passes are
-  functions of GC alone, so `final = raw / (g1·t·g2)` gives `G = g1·g2`, a single
-  curve. `gc_corr_fact` holds `G`, which is what `bias_offsets` feeds the HMM;
-  the components stay on the frame as `gc_corr_fact_pass1` / `_pass2`, and all
-  three are drawn in `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at
-  the extremes — on `p5_75k_exp` `g1` climbs to 1.159 at high GC while `g2` falls
-  to 0.926, so `G` reaches only 1.073. The second pass is mostly *removing*
-  correction the first over-applied to the replication ramp.
-- **It changes no copy-number call** — 0 windows on all 8 sequences, despite the
-  offset moving up to 10.2% on `p5_75k_exp`. The HMM consumes the product and is
-  near-invariant to how the two factors split it. This is a reporting-quality
-  change: the corrected coverage column and the GC curve become right,
-  `prob_copy_number` does not move.
-- **Pooled, and applied to EVERY sequence** including ones where no ramp was
-  found. Deliberate, with a measured cost: those acquired no GC trend from OTR,
-  so the correction has nothing to remove there and makes them slightly worse
-  (`m3_32k_2rg` 0.58% → 1.09%, `plasmid_2` 7.07% → 7.16%). Applied anyway because
-  GC bias belongs to the sequencing chemistry — one curve should describe the run
-  rather than a different correction reaching each reference depending on whether
-  its own OTR fit cleared a gate.
-- **An undetected ramp no longer means bit-identical coverage.** No *tent* is
-  applied there, and that is what `test_no_tent_is_applied_when_no_bias_is_found`
-  now pins — by dividing `g2` back out and requiring the result to land exactly on
-  the GC-corrected input. `GC_bias/` therefore holds **two** files, both pooled;
-  `tests/test_cli.py` asserts the count and that both name every reference.
-- **This is why `get_CNV.main` runs the per-sequence loop TWICE.** Pass A corrects
-  each sequence, then the pooled `g2` is fitted across all of them, then pass B
-  plots and calls copy number. The HMM must not see coverage that is about to
-  change, and the pooled fit cannot run until every sequence is OTR-corrected.
+  functions of GC alone, so `G = g1·g2` is a single curve. `gc_corr_fact` holds
+  `G`, which is what `bias_offsets` feeds the HMM; the components stay on the
+  frame as `gc_corr_fact_pass1` / `_pass2`, and all three are drawn in
+  `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at the extremes, so the
+  second pass is mostly *removing* correction the first over-applied to the
+  replication ramp.
+- **The GC refit is pooled and applied to EVERY sequence**, including ones where
+  no ramp was found — GC bias belongs to the sequencing chemistry, so one curve
+  should describe the run rather than a different correction reaching each
+  reference depending on whether its own OTR fit cleared a gate.
+- **An undetected ramp again means bit-identical coverage.** Because
+  `gc_corr_norm_cov` is now `raw/G`, the GC correction is fully accounted for
+  before the OTR stage runs, so "no tent detected" means the OTR stage contributed
+  exactly nothing. `test_no_tent_is_applied_when_no_bias_is_found` asserts that
+  directly again, instead of having to divide `g2` back out first.
+- **The pooled refit is what forces the pass structure.** It cannot run until
+  every sequence is OTR-corrected *and* called, and the published HMM must not see
+  coverage that is about to change.
   `tests/test_authentic.py::_run_pipeline` mirrors that split — that harness
-  silently diverging from `main()` has cost real debugging time before.
+  silently diverging from `main()` has cost real debugging time twice.
+
+#### What the censor is worth, and what it costs
+
+- **It changes no copy-number call on the corpus** — 0 windows on all 8
+  sequences. What moves is the *evidence*: censoring the amplification takes
+  `adp1` from r² 0.051 (p = 0.32) to r² 0.240 (p = 0.001) and `p5_75k_exp` from
+  r² 0.473 to 0.943. The coverage arm now stands on its own where it previously
+  needed the GC skew to carry it, and `adp1` acquires a live likelihood-ratio test
+  for the first time (p = 0.167, still deferring to the skew).
+- **Amplitudes barely move**: `adp1` 1.0673 → 1.0725, `cwbi:chromosome`
+  1.1690 → 1.1699, `p5_75k_exp` 2.0500 → 2.0791, `p1_shift` 1.3464 → 1.3400. The
+  earlier expectation that CWBI's ratio would fall toward 1.075 was wrong, and the
+  reason is worth knowing: its breakpoints come from the GC skew, so only the OLS
+  anchors could move, and the CN-34 amplification was never what those anchors
+  were fitting.
+- **`CN_CENSOR_MIN_KEEP = 0.5`.** If the censor would leave under half a
+  sequence's windows it is declined and pass 2 censors exactly as pass 1 did — a
+  genuinely duplicated replicon is every window at CN=2, and censoring it entirely
+  is an empty fit, not a clean one. The floor is checked on what SURVIVES, so
+  deletions and repeats already excluded count against it. CWBI's `plasmid_1`
+  trips it on the corpus.
+- **The gate re-runs in pass 2 and its p-values are the reported ones.** Pass 1's
+  are kept beside them under `... (pass 1)` keys, so a verdict that changed under
+  the censor is legible from the file alone.
+
+#### The GC correction is an ESTIMATE, and the HMM is told how good a one
+
+`bias_offsets` hands `run_HMM` a LOWESS fit evaluated at each window's GC.
+Treating that fit as exact understates the emission variance, and understates it
+**more at high copy number** — the offset's error is multiplied by `k`. Writing
+`o = ô(1 + ε)` with `Var(ε) = τ²`, the law of total variance gives
+
+```
+Var(y | k) = m + m² · (1/(k·size) + τ²)          m = k · mu · ô
+```
+
+so the uncertainty adds in the reciprocal-size scale and the extra term `m²τ²`
+grows as **k²**. The emission row for state `k` therefore uses
+`k·size/(1 + k·size·τ²)`.
+
+- **The k² scaling falls out; it is not imposed.** That is the whole reason this
+  is a derivation rather than a knob, and it is why the correction is negligible
+  at CN 1 and largest exactly where the offset is multiplied up.
+  `test_the_added_variance_grows_as_k_squared` pins the exact form —
+  `Var_with/Var_without − 1 = k·mu·τ²/(1 + mu/size)`, strictly linear in `k`.
+- **The effective size must be formed PER STATE**, `k·r/(1 + k·r·τ²)`, not
+  `k·(r/(1 + r·τ²))`. The second is the natural-looking refactor and it silently
+  flattens the k² property to a constant.
+- **τ is measured, never chosen.** `_gc_curve_tau` resamples the fit windows,
+  refits the LOWESS on a 200-point GC grid `GC_TAU_SURROGATES = 100` times, and
+  takes the sd of `log(curve)` — a relative sd, which is the form a
+  multiplicative offset needs. Seeded, so goldens are stable.
+- **Why no percentile or window-count rule works.** LOWESS uses a
+  nearest-neighbour bandwidth (`frac=0.3`), so every fitted point averages the
+  same ~0.3n windows — at GC 0.62 on `ltee_ara_m3_32k_2rg` there are still
+  ~12,700 in the neighbourhood. The tails are not sparse; they are **one-sided**,
+  so the local linear fit extrapolates within its own window. That is a boundary
+  effect, invisible to any count-based rule, and resampling is what sees it.
+  Measured τ is U-shaped: interior 0.0030, rising to 0.0095 at the 99.5th GC
+  percentile and 0.0225 at the extreme.
+
+**What it does, measured at the CLI defaults.** Exactly one thing:
+`ltee_ara_m3_32k_2rg` goes 31 → 29 segments, dropping an 11-window **CN-4 sliver**
+that sat inside a 263-window CN-3 amplification. Those windows are at the 99.5th
+GC percentile, where the offset is divided down to 0.82 and the corrected level
+reads 4.2 — a GC excursion wearing a copy-number costume. **Zero windows move on
+the other seven sequences**, and no golden changed, because at the goldens'
+`-w 1000 -s 500` the correction is a measured no-op. That is why
+`tests/test_authentic.py::TestOffsetUncertaintyAtCliDefaults` runs its own two
+datasets at `-w 100 -s 100 -f 400`; without it the whole mechanism could be
+deleted with the suite still green.
+
+- **`adp1_mgd06_lb` is the negative control and is not optional.** Its CN-3
+  amplification contains 4 windows *below* the 0.25th GC percentile — the
+  opposite excursion. Discounting evidence where the curve is uncertain is
+  sign-blind, so it must leave that block whole, and the test asserts it does.
+- **The fix has a working band, not unlimited headroom.** It holds from 1× to 2×
+  the measured τ, but a **uniform** 4× inflation brings the sliver back at five
+  times the size (55 windows) and loses the CN-12 call, because it also inflates
+  the interior where the fit is sound. The *shape* of τ matters, not its scale.
+  Do not "strengthen" this by scaling it.
+
+**Two alternatives were measured and rejected. Do not retry them.**
+
+- **Clamping the GC correction at the tails.** It changes the point estimate, so
+  it necessarily helps one sign of excursion and hurts the other: at 0.5% tails
+  it merges `m3_32k` (31 → 29) and *splits* `adp1` (7 → 9), a wash. Its threshold
+  is also non-monotonic — at 1% and above the sliver returns **worse** (22 windows
+  against 11 unclamped), because the clamp is a global refit that shifts `mu`,
+  the state count and `g2`.
+- **A fixed-width GC kernel.** Its point estimates agree with the rank-based one
+  to ≤2% over the 1st–99th percentile and across a 12× bandwidth range, and both
+  fix the artifact. It would cost a hand-rolled smoother, sparse-GC guards and a
+  full golden regeneration for no measured gain in what is actually applied. It
+  does report tail uncertainty better (τ 4× larger, 5–6× tail/interior contrast
+  against 3×), which is the one real argument for it.
+
+**`frac=0.3` is CV-validated, not an unexamined constant.** 5-fold
+cross-validation cannot separate it from any bandwidth in 0.05–0.50 (within
+0.03% MSE on both `m3_32k` and `adp1`); only 0.02 is clearly worse, at 49%. It is
+also a sensible density-adaptive rule in disguise — measured at **0.26–0.44 × the
+GC standard deviation** across six references, median 0.32. Its one weakness is
+the tails, where the 30% neighbourhood spans 2.4–4.0 × the GC sd.
+
+#### Why re-running the gate on censored data is safe HERE
+
+CLAUDE.md used to record that an iterative fit–censor–refit loop took the OTR
+false-positive rate from 0/8 to 4/8, because excising 1–2% of windows removes
+87–98% of the variance the bootstrap was calibrated against. That measurement was
+on a **residual-driven** censor: it excised the interval where the tent under test
+fit worst, so the selection served the hypothesis. The HMM censor does not look at
+the tent's residual at all.
+
+Measured, on synthetic coverage built on `adp1`'s real geometry and GC with the
+truth known — flat AR(1) trend at the measured 83-window scale, negative-binomial
+counts, 60 seeds per arm, coverage-fit gate at a nominal 1%:
+
+| arm | pass 1 clears | pass 2 clears |
+| --- | --- | --- |
+| flat, no amplification | 3% | **3%** |
+| flat + CN-3 amplification | 0% | **3%** |
+| 1.5× ramp + CN-3 amplification | **0%** | **100%** |
+
+Two things to read off that. The censor does **not** inflate the false-positive
+rate: it returns the gate to its own baseline (3% at a nominal 1% — the gate is
+mildly anti-conservative on this synthetic, and was already), which the
+amplification's variance had been artificially suppressing to 0%. And the last row
+is the whole point: a real 1.5× ramp with an amplification on top is detected
+**0/60 times** without the censor and **60/60 times** with it.
+
+- **The variance-collapse effect is real and is not the failure it looks like.**
+  Censoring 2.71% of `adp1`'s windows takes the weighted SST of the decimated
+  series from 433.9 to 72.2 and its tent r² from 0.016 to 0.463. The bootstrap
+  null resamples the same censored series, so it carries the same SST; what
+  changed is that the amplification is no longer a block no tent can fit,
+  dominating both numerator and denominator.
+- **Do not build a ramp-free control by dividing out the best-fit tent.** It was
+  tried and it is invalid: that tent is fitted on *contaminated* data — on `adp1`
+  it sits inside the CN-3 amplification — so what is left is (real ramp − wrong
+  tent), which still contains a ramp. Censoring then lets the fit find it, and the
+  control reads 4/8 "false positives" that are nothing of the kind. The measured
+  giveaway was a residual with τ = 1 cell over a series with τ = 223. Build the
+  null synthetically, where the truth is known.
 
 ### Multi-genome flow
 
