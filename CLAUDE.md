@@ -602,6 +602,56 @@ are rejected before `get_CNV.main` creates any output directory.
   once in `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
   functions in `core.py` assume they already exist. `write_gc_skew_results` and `plot_gc_skew` are
   the exceptions, making their own like `apply_otr_correction` does.
+- **A reference with nothing to measure is a RESULT, not an error.** Three real inputs used to take
+  a whole run down with a bare library exception naming no file: a header-only coverage table
+  (`IndexError` from `preprocess`), an all-zero one (`ValueError` from `np.interp` inside
+  `fit_gc_bias`), and — the one that will actually happen — a healthy chromosome beside a plasmid
+  that got no reads (`ZeroDivisionError` from `solve_pr`, five lines of normal-looking progress into
+  the run). Each now warns, writes the sequence its full output set, and **exits 0**, because a
+  plasmid with no reads must not cost the chromosome sharing the invocation.
+  - `no_usable_coverage_reason` classifies it, and recognises exactly two conditions: **no windows**,
+    and **no window with finite positive coverage**. It is reported in the JSON under
+    `"No usable coverage reason"`.
+  - **"Every window is a repeat" is deliberately NOT one of them.** An all-repeat replicon has real
+    coverage and gets real calls: `otr_fit` and `run_HMM` already cope by widening the mask, and the
+    only stage that could not survive it — `fit_gc_bias` — now declines to an **identity curve**
+    (flat 1.0, so `apply_gc_correction` is an exact no-op). That matters past the corrected column:
+    `run_HMM` composes its emission offsets from `gc_corr_fact`, so a fabricated curve would reach
+    the copy-number model where no bias could be measured.
+  - **Only a windowless frame gets a special branch in `main()`.** An all-zero sequence travels the
+    ordinary path end to end and reports more for it — the GC skew is a property of `ref_base` and is
+    still measured, `otr_fit` declines, `run_HMM` calls CN 0. Divert it and you throw that away.
+  - `run_HMM`'s short-circuit predicate is **the data being empty**, never `fit_result is None`:
+    `fit_censored_negative_binomial` also returns `None` on healthy-but-small frames, where the
+    moment fallback below it is live and correct.
+  - `relative_copy_numbers` ranks by `win_end.max()`, and a zero-window frame gives `NaN`. **`max()`
+    with a NaN key silently returns the first key** rather than raising, so one empty table sorting
+    first used to anchor the run on a NaN and write `"Relative copy number": null` into every
+    *healthy* sequence's JSON too. It now ranks only sequences that have windows.
+  - The empty windowed frame is built from empty **lists**, which pandas types as `object`. Left
+    that way, `pd.concat` in `process_multi_genome` promotes the *pooled* column, so one empty
+    plasmid turns a healthy chromosome's `win_st` into floats all the way out to its CSV. The dtypes
+    are cast explicitly for that reason.
+- **The OTR results JSON is written on EVERY path, and `write_otr_results` is the only writer.**
+  breseq reads it by name with nlohmann, and a missing file costs it exactly what an unparseable one
+  does. Two paths produced none at all before: `--bias gc` and `--bias none`, which return from
+  `correct_one` before any OTR stage runs — so **two of the four bias modes gave breseq nothing on a
+  completely healthy run**. They now write the declined record, with `"Correction type"` naming the
+  mode so the file says why rather than implying a fit was attempted and rejected.
+  - `declined_otr_results` builds that record with the same key set as a rejected fit, so a reader
+    never tells the cases apart by which keys are absent. `"Origin window"` / `"Terminus window"`
+    stay real ints (0 when there is no coordinate); the ratio stays the string `"Not detected"`.
+  - The dump is now `allow_nan=False`, matching `write_gc_skew_results`. `_json_safe` is a *shallow*
+    guard — top-level values only — so this is what stands between breseq and an unparseable file
+    when a future statistic arrives nested or as a width `isinstance(x, float)` misses. It is a
+    deliberate new failure mode: a run that would have written bare `NaN` was already failing, just
+    silently and in the field rather than loudly in the suite.
+- **`sample_prefix` rstrips the separator, and that fixed a real naming split.** The JSON writers
+  used `output.strip().split("/")[-1]` while `run_HMM` used `rstrip`. The default `out_dir` is
+  `"CNV_out/"` **with** a trailing slash, so by default one invocation wrote
+  `OTR_corr/chrA_otr_results.json` beside `CNV_csv/CNV_outchrA_CNV.csv` — the JSON silently losing
+  the sample prefix. The name must not depend on how the caller spelled `-o`. **This renamed both
+  JSONs under the default `-o`**, so breseq may need updating if it globs for the old spelling.
 - `predict_ori_ter_from_skew` (`core.py`) **does not censor** `is_deletion` / `is_redundant`
   windows, unlike every other fit stage. GC skew is a property of the *reference sequence*, and a
   deletion in the sample does not change the reference's base composition. Because `cum_gc_skew`

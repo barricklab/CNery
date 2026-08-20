@@ -5,6 +5,7 @@ wrapper over a fixed pair of BAM/FASTA paths. Inputs are now the whole interface
 files get picked up, what they are called, and what a bad invocation leaves behind.
 """
 
+import json
 import os
 import sys
 
@@ -411,3 +412,147 @@ class TestRegionWithSeveralSequences:
         _run(monkeypatch, [str(cov), "--region", "tinyPlasmid:900000-999000",
                            "-o", out, "-w", "100", "-s", "50"])
         assert any("tinyPlasmid" in n for n in os.listdir(os.path.join(out, "CNV_plt")))
+
+
+def _reject(value):
+    raise AssertionError(f"not strict JSON: {value}")
+
+
+def _otr_json(out, seq_id):
+    """The OTR record breseq reads for one sequence, parsed strictly.
+
+    parse_constant refuses NaN/Infinity: breseq reads this with nlohmann, which
+    is strict RFC JSON, and a single bare NaN costs it the whole file.
+    """
+    path = os.path.join(out, "OTR_corr",
+                        f"{os.path.basename(out)}{seq_id}_otr_results.json")
+    with open(path) as fh:
+        return json.loads(fh.read(), parse_constant=_reject)
+
+
+class TestDegenerateCoverage:
+    """A reference with nothing to measure is a RESULT, not a crash.
+
+    Each of these took the whole run down before, with a bare library exception
+    naming no file: a header-only table raised IndexError from preprocess, an
+    all-zero one ValueError from np.interp inside fit_gc_bias, and a healthy
+    chromosome beside a zero-coverage plasmid ZeroDivisionError from solve_pr --
+    the realistic one, since a plasmid that got no reads is an ordinary event.
+
+    What every case must produce is the OTR results JSON. breseq reads it by
+    name, and a missing file costs it exactly what an unparseable one does.
+    """
+
+    def _run_ok(self, monkeypatch, table_dir, out):
+        _run(monkeypatch, [str(table_dir), "-o", out, "-w", "100", "-s", "100"])
+
+    def test_header_only_table(self, tmp_path, monkeypatch):
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "empty.coverage.tsv", seq="")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        data = _otr_json(out, "empty")
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+        # breseq does not type-check these two, so a null is as damaging as a
+        # missing file. There is no coordinate to report, but there is an int.
+        assert isinstance(data["Origin window"], int)
+        assert isinstance(data["Terminus window"], int)
+        assert data["No usable coverage reason"] == "the coverage table has no position rows"
+
+    def test_all_zero_coverage(self, tmp_path, monkeypatch):
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "flat.coverage.tsv", cov=0)
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        data = _otr_json(out, "flat")
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+        assert data["No usable coverage reason"] == "every window has zero coverage"
+
+    def test_every_window_is_a_repeat(self, tmp_path, monkeypatch):
+        # NOT degenerate: an all-repeat replicon has real coverage and gets real
+        # calls. Only fit_gc_bias could not survive it, and it now declines to an
+        # identity curve instead of raising.
+        d = tmp_path / "in"
+        d.mkdir()
+        rows = [(i + 1, b, 0, 0, 12, 12) for i, b in enumerate(SEQ)]
+        (d / "rep.coverage.tsv").write_text(_render(COLUMNS, rows, len(SEQ), "\t"))
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        assert _otr_json(out, "rep")["No usable coverage reason"] is None
+        assert any("rep" in n for n in _csv_names(out))
+
+    def test_zero_plasmid_does_not_take_down_the_chromosome(self, tmp_path, monkeypatch):
+        """The case that will actually happen: a plasmid that got no reads."""
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "chrom.coverage.tsv")
+        _write_table(d / "plasmid.coverage.tsv", cov=0)
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        # Both sequences get a file, and the healthy one is unaffected.
+        assert _otr_json(out, "plasmid")["No usable coverage reason"] is not None
+        assert _otr_json(out, "chrom")["No usable coverage reason"] is None
+        assert any("chrom" in n and n.endswith("_CNV.csv") for n in _csv_names(out))
+        assert any("plasmid" in n and n.endswith("_CNV.csv") for n in _csv_names(out))
+
+    def test_a_dead_plasmid_does_not_null_the_chromosomes_copy_number(
+            self, tmp_path, monkeypatch):
+        # relative_copy_numbers ranks by win_end.max(); a zero-window frame gives
+        # NaN, and max() with a NaN key returns the FIRST key rather than raising
+        # -- so an empty table sorting first used to anchor the run on a NaN and
+        # write "Relative copy number": null into every healthy sequence too.
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "aaa_dead.coverage.tsv", seq="")   # sorts first
+        _write_table(d / "zzz_live.coverage.tsv")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        assert _otr_json(out, "zzz_live")["Relative copy number"] == pytest.approx(1.0)
+
+    def test_break_points_csv_keeps_its_three_columns(self, tmp_path, monkeypatch):
+        # breseq asserts exactly three columns and the assert is fatal, so an
+        # empty file is not an acceptable stand-in for no segments.
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "empty.coverage.tsv", seq="")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        path = os.path.join(out, "CNV_csv",
+                            f"{os.path.basename(out)}empty_break_pts.csv")
+        with open(path) as fh:
+            header = fh.readline().strip().split(",")
+        assert header == ["Startpos", "State", "Segment_Size"]
+
+    @pytest.mark.parametrize("bias", ["all", "gc", "otr", "none"])
+    def test_every_bias_mode_writes_the_json(self, bias, tmp_path, monkeypatch):
+        """--bias gc and --bias none used to write NO OTR record at all.
+
+        Both return from correct_one() before any OTR stage runs, so two of the
+        four modes gave breseq nothing on a completely healthy table.
+        """
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+
+        _run(monkeypatch, [str(d), "-o", out, "-w", "100", "-s", "100",
+                           "--bias", bias])
+
+        data = _otr_json(out, "chrA")
+        assert isinstance(data["Origin window"], int)
+        assert isinstance(data["Terminus window"], int)
+        assert "Origin-to-Terminus/Bias Ratio" in data

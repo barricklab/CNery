@@ -742,3 +742,50 @@ class TestUncertaintySuppressesAGcSliver:
         rates = [sum(self._is_whole(s, t, out_dir) for s in self.SEEDS)
                  for t in (None, 0.10, 0.20)]
         assert rates == sorted(rates), rates
+
+
+class TestNothingToCall:
+    """A sequence with no coverage is called CN 0, not crashed on.
+
+    run_HMM used to reach solve_pr(0.0, 0.0) and raise ZeroDivisionError. The
+    moment fallback's guard is written `if mean > 0 and var <= mean`, which steps
+    over exactly the case that needs it -- so a plasmid that got no reads took
+    down the chromosome sharing the invocation.
+    """
+
+    def _frame(self, n=50, cov=0.0):
+        return pd.DataFrame({
+            "genome_id": "dead",
+            "win_st": np.arange(n) * 100,
+            "win_end": np.arange(n) * 100 + 100,
+            "read_count_cov": np.full(n, cov),
+            "norm_raw_cov": np.full(n, cov),
+            "otr_gc_corr_norm_cov": np.full(n, cov),
+            "gc_corr_fact": np.ones(n),
+            "otr_gc_corr_fact": np.ones(n),
+        })
+
+    def test_all_zero_coverage_is_called_copy_number_zero(self, tmp_path):
+        out = run_HMM(self._frame(), str(tmp_path), write=False)
+        assert (out["prob_copy_number"] == 0).all()
+
+    def test_a_frame_with_no_windows_does_not_raise(self, tmp_path):
+        # genome_id cannot be read off row 0 of an empty frame, so the caller
+        # supplies it -- the CSVs still have to be named after something.
+        out = run_HMM(self._frame(n=0), str(tmp_path), write=False,
+                      genome_id="dead")
+        assert len(out) == 0
+
+    def test_solve_pr_declines_instead_of_dividing_by_zero(self):
+        from CNery.core import solve_pr
+        p, size = solve_pr(0.0, 0.0)
+        assert p == 0.0 and not np.isfinite(size)
+
+    def test_a_healthy_frame_still_uses_the_moment_fallback(self):
+        # The short-circuit predicate is the DATA being empty, never
+        # `fit_result is None` -- that also fires on healthy small frames, where
+        # the moment estimate below it is a live and correct path.
+        from CNery.core import solve_pr
+        p, size = solve_pr(50.0, 100.0)
+        assert size == pytest.approx(50.0)
+        assert p == pytest.approx(0.5)

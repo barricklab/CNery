@@ -46,6 +46,20 @@ STRAND_SPLIT_COLUMNS = (
 TOTAL_ONLY_COLUMNS = ("unique_cov", "redundant_cov")
 
 
+def sample_prefix(output):
+    """The `<sample>` every output filename is prefixed with, from the output dir.
+
+    rstrip, not strip: the default output directory is "CNV_out/" WITH a trailing
+    slash (get_CNV.main()), and `"CNV_out/".split("/")[-1]` is the empty string.
+    So the JSON writers used to drop the prefix entirely under the default -o
+    while run_HMM's CSVs kept it -- OTR_corr/chrA_otr_results.json beside
+    CNV_csv/CNV_outchrA_CNV.csv, from one invocation. A file breseq cannot find
+    is worth no more than one that was never written, and the name should not
+    depend on how the caller happened to spell -o.
+    """
+    return str(output).rstrip("/").split("/")[-1]
+
+
 def coverage_table_path(coverage_dir, seq_id, suffix=COVERAGE_TABLE_SUFFIX):
     """Path of the coverage table for `seq_id` inside `coverage_dir`.
 
@@ -341,7 +355,15 @@ def preprocess(df, win=100, step=100, frag=400):
     # preprocess() usable on a raw frame handed to it directly.
     df_b2c = normalize_coverage_columns(df)
 
-    start_coord = int(df_b2c.index[0])
+    # A table with a valid header and no position rows is a REFERENCE WITH NO
+    # COVERAGE, not a malformed file -- bam2cov writes one for a sequence that
+    # got no reads, and read_coverage_table() passes it because every column it
+    # checks for is present. Windowing it yields no windows, which is the honest
+    # answer; taking df.index[0] to find the first coordinate is what used to
+    # raise a bare IndexError from four frames below the input boundary.
+    # get_CNV.main() turns the empty frame into a "no usable coverage" result and
+    # still writes breseq its JSON. See no_usable_coverage_reason().
+    start_coord = int(df_b2c.index[0]) if len(df_b2c.index) else 1
     genome = df_b2c['ref_base']
     genome_len = len(genome)
     # GC% is measured over max(frag, win) bases centred on each window, because
@@ -503,6 +525,17 @@ def preprocess(df, win=100, step=100, frag=400):
     skew = np.asarray(gc_skew_s, dtype=float)
     df_gc["gc_skew"] = skew
     df_gc["cum_gc_skew"] = np.cumsum(skew - skew.mean()) if skew.size else skew
+
+    # An empty frame is built from empty LISTS, which pandas types as `object`.
+    # Downstream every one of these columns is read with .to_numpy(dtype=float)
+    # and several are pd.concat'd with populated frames, so leaving them object
+    # would turn "no coverage" into a dtype error somewhere else entirely.
+    if df_gc.empty:
+        for col in ("win_st", "win_end", "win_len", "window_num"):
+            df_gc[col] = df_gc[col].astype(int)
+        for col in ("gc_percent", "read_count_cov", "pct_redundant",
+                    "norm_raw_cov", "gc_skew", "cum_gc_skew"):
+            df_gc[col] = df_gc[col].astype(float)
 
     return df_gc
 
@@ -837,6 +870,10 @@ def _round(value, nd):
 
 def gc_cor_plots(df, output):
     genome_ids = sorted(df["genome_id"].unique())
+    # Every table in the run was empty, so the pooled frame has no rows and no
+    # genome to name the file after. There is no diagnostic to draw either.
+    if not genome_ids:
+        return
     if len(genome_ids) > 1:
         label = "_and_".join(str(g) for g in genome_ids)
     else:
@@ -857,9 +894,16 @@ def gc_cor_plots(df, output):
         .drop_duplicates(subset='gc_percent')
         .sort_values('gc_percent')
     )
-    gc_fit = np.poly1d(
-        np.polyfit(uniq['gc_percent'], uniq['gc_corr_fact'], 2)
-    )
+    # A quadratic needs three points. Below that -- a one-position reference, or
+    # a frame where plottable() dropped everything because every window is a
+    # repeat or a deletion -- np.polyfit raises LinAlgError ("SVD did not
+    # converge") rather than returning anything. Draw the scatter without the
+    # summary curve; the points are the diagnostic, the parabola is a reading aid.
+    gc_fit = None
+    if len(uniq) >= 3:
+        gc_fit = np.poly1d(
+            np.polyfit(uniq['gc_percent'], uniq['gc_corr_fact'], 2)
+        )
 
     plt.scatter(
         df['gc_percent'],
@@ -876,13 +920,14 @@ def gc_cor_plots(df, output):
         s=10,
         alpha=0.3
     )
-    plt.plot(
-        np.sort(df['gc_percent'].unique()),
-        gc_fit(np.sort(df['gc_percent'].unique())),
-        color='black',
-        linewidth=3,
-        label='LOWESS fit'
-    )
+    if gc_fit is not None:
+        plt.plot(
+            np.sort(df['gc_percent'].unique()),
+            gc_fit(np.sort(df['gc_percent'].unique())),
+            color='black',
+            linewidth=3,
+            label='LOWESS fit'
+        )
 
     plt.ylabel('Normalized read coverage')
     plt.xlabel('GC% per window')
@@ -964,6 +1009,38 @@ def mask_coverage_windows(
         default="clean",
     )
     return df
+
+
+def no_usable_coverage_reason(df):
+    """Why this sequence cannot be analysed at all, or None if it can.
+
+    A reference can reach the pipeline with nothing to measure -- a plasmid that
+    got no reads, or a coverage table with a valid header and no position rows.
+    Every fit downstream then has an empty design matrix, and what used to happen
+    was a bare IndexError from preprocess(), a ValueError from np.interp inside
+    fit_gc_bias(), or a ZeroDivisionError from solve_pr() several stages later.
+    None of those name the sequence, and all of them take the whole run down --
+    including the healthy references sharing the invocation.
+
+    So it is classified ONCE, here, and reported as a result: get_CNV.main()
+    writes the sequence its full (degenerate) output set, breseq included, says
+    so on stdout, and carries on with the rest.
+
+    WHAT IS DELIBERATELY NOT HERE: "every window is censored as redundant". An
+    all-repeat replicon has real coverage and deserves real copy-number calls,
+    and otr_fit() and run_HMM() already cope by widening the mask rather than
+    failing. The only stage that could not survive it was fit_gc_bias(), which
+    now declines to an identity curve -- so that case stays a normal analysis
+    with one fit skipped, not a degenerate sequence.
+    """
+    if len(df) == 0:
+        return "the coverage table has no position rows"
+
+    cov = df["read_count_cov"].to_numpy(dtype=float)
+    if not np.any(np.isfinite(cov) & (cov > 0)):
+        return "every window has zero coverage"
+
+    return None
 
 
 def otr_ratio(otr_fit_result):
@@ -1168,6 +1245,26 @@ def fit_gc_bias(
     loess = sm.nonparametric.lowess
     fit_mask = (~censored) & np.isfinite(cov) & np.isfinite(gc)
 
+    # Nothing to fit: every window is censored, or has no finite coverage, or
+    # there are no windows at all. Decline with an IDENTITY curve rather than
+    # raising -- the same shape otr_fit() returns when it cannot fit a tent, and
+    # for the same reason: a stage that cannot measure a bias should contribute
+    # nothing, not take the run down. LOWESS on empty arrays returns a (0, 2)
+    # array and np.interp then raises "array of sample points is empty".
+    #
+    # A flat 1.0 makes apply_gc_correction() an exact no-op (gc_corr_norm_cov ==
+    # norm_raw_cov, gc_corr_fact == 1.0), which is what "no GC correction was
+    # applied" has to mean if the emission offsets the HMM composes from
+    # gc_corr_fact are to stay honest.
+    if not fit_mask.any():
+        return {
+            "gc_sorted": np.array([0.0, 1.0]),
+            "fit_sorted": np.array([1.0, 1.0]),
+            "floor": 1e-6,
+            "gc_grid": np.linspace(0.0, 1.0, GC_TAU_GRID),
+            "gc_tau": np.zeros(GC_TAU_GRID),
+        }
+
     gc_sorted = fit_sorted = None
     for _ in range(max(1, n_robust_iter)):
         gc_f = gc[fit_mask]
@@ -1327,7 +1424,7 @@ def plot_gc_passes(per_genome, output):
     """
     pooled = pd.concat(per_genome.values(), ignore_index=True)
     label = "_and_".join(sorted(str(g) for g in per_genome))
-    samplename = output.strip().split("/")[-1] + label
+    samplename = sample_prefix(output) + label
     savedir = os.path.join(output, "GC_bias")
     os.makedirs(savedir, exist_ok=True)
 
@@ -1496,6 +1593,14 @@ def process_multi_genome(
     df_pooled = pd.concat(preprocessed.values(), ignore_index=True)
 
     global_median = df_pooled["read_count_cov"].median()
+    # Every table in the run is empty or all-zero. Dividing by it would put NaN
+    # (0/0) into norm_raw_cov and make every downstream mask nonsense; 1.0 leaves
+    # the zeros as zeros, which is what they are. Gated on non-positive, so it
+    # cannot touch a real median however many zero windows a genome carries.
+    if not np.isfinite(global_median) or global_median <= 0:
+        print("WARNING: no sequence in this run has any coverage; "
+              "normalising against 1.0 and reporting no bias.")
+        global_median = 1.0
     df_pooled["norm_raw_cov"] = df_pooled["read_count_cov"] / global_median
 
     df_pooled = _pooled_gc_stage(df_pooled)
@@ -1515,8 +1620,8 @@ def process_multi_genome(
 
 def plot_otr_corr(df, output, ori, ter):
 
-    genome_id = str(df["genome_id"][0])
-    samplename = output.strip().split('/')[-1] + genome_id
+    genome_id = str(df["genome_id"].iloc[0])
+    samplename = sample_prefix(output) + genome_id
     saveplt = str(output+"/OTR_corr/")
   
     plt.figure(figsize=(10, 8))
@@ -2875,12 +2980,88 @@ def relative_copy_numbers(per_genome):
         return {}
 
     medians = {gid: censored_median_coverage(df) for gid, df in per_genome.items()}
-    longest = max(per_genome, key=lambda gid: float(per_genome[gid]["win_end"].max()))
+
+    # Rank only sequences that HAVE windows. A zero-window frame gives
+    # win_end.max() == NaN, and max() with a NaN key silently returns the first
+    # key it was given rather than raising -- so a single empty table sorting
+    # first would anchor the whole run on a NaN median and write
+    # "Relative copy number": null into every OTHER sequence's JSON, including
+    # perfectly healthy ones.
+    ranked = [gid for gid in per_genome
+              if len(per_genome[gid]) and np.isfinite(per_genome[gid]["win_end"].max())]
+    if not ranked:
+        return {gid: float("nan") for gid in per_genome}
+
+    longest = max(ranked, key=lambda gid: float(per_genome[gid]["win_end"].max()))
     anchor = medians[longest]
 
     if not np.isfinite(anchor) or anchor <= 0:
         return {gid: float("nan") for gid in per_genome}
     return {gid: medians[gid] / anchor for gid in per_genome}
+
+
+def write_otr_results(results, output, genome_id):
+    """Write one sequence's OTR record to OTR_corr/<sample><seq_id>_otr_results.json.
+
+    THE ONE FILE BRESEQ READS. It parses this with nlohmann/json, which is strict
+    RFC JSON with no allow_nan, so a single bare NaN anywhere makes the whole file
+    unparseable: breseq falls into `catch (...)`, warns, and reports no ori-ter
+    bias at all. _json_safe() maps non-finite values to null on the way out, and
+    allow_nan=False makes a value it missed fail HERE, loudly, in the suite --
+    rather than silently costing breseq the file in the field. That is a
+    deliberate new failure mode; a run that would have written unparseable JSON
+    was already failing, just quietly and somewhere else.
+
+    Sole writer of this file, so that every path producing one -- a fitted tent,
+    a rejected fit, a bias mode that never fits, and a sequence with no coverage
+    at all -- produces the same shape.
+    """
+    savedir = os.path.join(str(output), "OTR_corr")
+    os.makedirs(savedir, exist_ok=True)
+
+    samplename = sample_prefix(output) + str(genome_id)
+    path = os.path.join(savedir, f"{samplename}_otr_results.json")
+    with open(path, "w") as fh:
+        json.dump({k: _json_safe(v) for k, v in results.items()}, fh,
+                  indent=4, allow_nan=False)
+    return path
+
+
+def declined_otr_results(df, correction_type, reason=None,
+                         relative_copy_number=float("nan")):
+    """The OTR record for a sequence no tent was fitted to.
+
+    Covers the cases apply_otr_correction() never sees: --bias gc and --bias
+    none, which return before any OTR stage runs, and a sequence with no usable
+    coverage, whose frame cannot be fitted at all. Without this those paths wrote
+    NO json, and a missing file costs breseq exactly what an unparseable one does.
+
+    The shape matches apply_otr_correction()'s rejected-fit branch, including the
+    two constraints that reader imposes: "Origin-to-Terminus/Bias Ratio" is the
+    string "Not detected", and "Origin window"/"Terminus window" are real ints
+    and never null -- breseq does not type-check them. On a frame with no windows
+    there is no coordinate to report and both are 0.
+    """
+    if len(df):
+        xori = int(df["win_st"].iloc[0])
+        xter = int(df["win_end"].iloc[len(df) - 1])
+    else:
+        xori = xter = 0
+
+    results = {
+        "Origin window": xori,
+        "Origin coverage (normalized)": np.nan,
+        "Terminus window": xter,
+        "Terminus coverage (normalized)": np.nan,
+        "Origin-to-Terminus/Bias Ratio": "Not detected",
+        "Relative copy number": relative_copy_number,
+        "Correction type": correction_type,
+    }
+    results.update(_otr_detail())
+    # Added, never substituted: CLAUDE.md records that adding keys is the only
+    # change that is safe for breseq's reader.
+    results["No usable coverage reason"] = reason
+    return results
 
 
 def _json_safe(value):
@@ -2890,8 +3071,14 @@ def _json_safe(value):
     allow_nan: a single bare NaN makes the WHOLE file unparseable, so it falls
     into `catch (...)`, warns, and reports no ori-ter bias. That has been true of
     every "Not detected" file CNery has written, since yori/yter are NaN there.
+
+    np.floating rather than float: np.float64 subclasses float and would be
+    caught anyway, but np.float32 does not, and neither does np.float16. The
+    values written here are float64 today; the point is that this is the guard
+    standing between breseq and an unparseable file, so it should not depend on
+    which numpy width a future statistic happens to come back as.
     """
-    if isinstance(value, float) and not np.isfinite(value):
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
         return None
     return value
 
@@ -2917,10 +3104,10 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     behavior.
     """
     df = otr_fit_result["df_with_medfil"].copy()
-    genome_id = str(df["genome_id"][0])
-    samplename = output.strip().split("/")[-1] + genome_id
-    saveplt = str(output + "/OTR_corr/")
-    os.makedirs(saveplt, exist_ok=True)
+    genome_id = str(df["genome_id"].iloc[0])
+    # write_otr_results() makes this itself; kept here because plot_otr_corr()
+    # writes into the same directory and does not.
+    os.makedirs(str(output + "/OTR_corr/"), exist_ok=True)
 
     y_corr = otr_fit_result["y_corr"]
     f1 = otr_fit_result["y_fit"]
@@ -2961,6 +3148,12 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     correction_type = "Ori-ter coordinates fit by coverage"
     if bias and detail.get("Breakpoint source") == "GC skew":
         correction_type = GC_SKEW_METHOD
+    # An all-zero sequence declines every fit and reaches here on the ordinary
+    # path, where the default string would claim coordinates were fitted by
+    # coverage there was none of. Say what actually happened.
+    no_coverage = no_usable_coverage_reason(df)
+    if no_coverage is not None:
+        correction_type = "No usable coverage"
 
     results = {
         "Origin window": int(xori),
@@ -2977,6 +3170,13 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     # first pass's verdict, so a verdict that CHANGED under the CN censor is
     # visible from the file alone. Added last so it cannot be shadowed, and safe
     # for breseq's nlohmann reader, which tolerates unknown keys.
+    # Present on every OTR record, so a reader never has to tell "no coverage"
+    # from "this CNery predates the key". Measured rather than passed in: an
+    # all-zero sequence reaches this function on the ordinary path -- otr_fit()
+    # declines it, run_HMM() calls it CN 0 -- so nothing upstream would otherwise
+    # have said so in the file.
+    results["No usable coverage reason"] = no_coverage
+
     if extra_results:
         results.update(extra_results)
 
@@ -2992,8 +3192,7 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     df.loc[~low, "otr_gc_corr_norm_cov"] = y_corr[~low]
     df["otr_gc_corr_fact"] = f1
 
-    with open(saveplt + str(samplename) + '_otr_results.json', 'w') as f:
-        json.dump({k: _json_safe(v) for k, v in results.items()}, f, indent=4)
+    write_otr_results(results, output, genome_id)
 
     return df, xori, xter
 
@@ -3224,13 +3423,66 @@ def predict_ori_ter_from_skew(
     }
 
 
+def plot_no_data(output, subdir, filename, title, message):
+    """A one-page PDF saying there was nothing to draw.
+
+    Emitted for a sequence with no windows, in place of each figure the ordinary
+    path would have produced. Every plotting function here starts by indexing row
+    0 of the frame, so none of them survives an empty one -- and a MISSING plot
+    is the worst of the three outcomes: it is indistinguishable from a run that
+    died partway, which is exactly the confusion this whole code path exists to
+    remove. A page that says "no usable coverage" is a result.
+    """
+    savedir = os.path.join(str(output), subdir)
+    os.makedirs(savedir, exist_ok=True)
+
+    plt.figure(figsize=(10, 8))
+    plt.axis("off")
+    plt.title(title)
+    plt.text(0.5, 0.5, message, ha="center", va="center", fontsize=12, wrap=True)
+
+    path = os.path.join(savedir, filename)
+    plt.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close()
+    return path
+
+
+def no_skew_prediction():
+    """The GC-skew record for a reference with no windows to measure skew over.
+
+    predict_ori_ter_from_skew() raises on an empty frame, deliberately -- a
+    caller reaching it with no windows has a bug. A coverage table with no
+    position rows is not that case: there is genuinely nothing to predict from,
+    and the file still has to exist, because a reader that finds one sequence's
+    GC_skew JSON missing cannot tell "no data" from "the run died here".
+
+    Every value is finite: write_gc_skew_results() dumps with allow_nan=False,
+    and plot_gc_skew() formats the separation as a percentage and the p-value
+    with :.3g, neither of which tolerates None.
+    """
+    return {
+        "Origin (bp)": 0,
+        "Terminus (bp)": 0,
+        "Origin window index": 0,
+        "Terminus window index": 0,
+        "Windows": 0,
+        "Separation (fraction of genome)": 0.0,
+        "Cumulative skew amplitude": 0.0,
+        "Replichore skew t-statistic": 0.0,
+        "Replichore skew p-value": 1.0,
+        "Bootstrap surrogates": 0,
+        "Prediction confident": False,
+        "Prediction method": GC_SKEW_METHOD,
+    }
+
+
 def write_gc_skew_results(result, output, genome_id):
     """Write one reference's skew prediction to GC_skew/<name>_gc_skew_results.json.
 
     Makes its own directory, as apply_otr_correction() does, so callers and
     tests need not pre-create it.
     """
-    samplename = output.strip().split("/")[-1] + str(genome_id)
+    samplename = sample_prefix(output) + str(genome_id)
     savedir = os.path.join(output, "GC_skew")
     os.makedirs(savedir, exist_ok=True)
 
@@ -3408,7 +3660,7 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
     `bias` is required rather than inferred: see OTR_STAGE_ROWS.
     """
     genome_id = str(df["genome_id"].iloc[0])
-    samplename = output.strip().split("/")[-1] + genome_id
+    samplename = sample_prefix(output) + genome_id
     savedir = os.path.join(output, "corr_plots")
     os.makedirs(savedir, exist_ok=True)
 
@@ -3626,7 +3878,7 @@ def plot_correction_stages(df, output, otr_result=None, bias="all"):
 def plot_gc_skew(df, output, result):
     """Cumulative GC skew across the reference, with the predicted ori/ter marked."""
     genome_id = str(df["genome_id"].iloc[0])
-    samplename = output.strip().split("/")[-1] + genome_id
+    samplename = sample_prefix(output) + genome_id
     savedir = os.path.join(output, "GC_skew")
     os.makedirs(savedir, exist_ok=True)
 
@@ -3739,8 +3991,8 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
 
 def plot_copy(df_cnv, pltstart, pltend, output):
     
-    genome_id = str(df_cnv["genome_id"][0])
-    samplename = output.strip().split('/')[-1] + genome_id
+    genome_id = str(df_cnv["genome_id"].iloc[0])
+    samplename = sample_prefix(output) + genome_id
     # samplename = sample.strip().split('.')[0]
     saveplt = str(output+"/CNV_plt/")
     
@@ -3885,6 +4137,16 @@ def plot_copy(df_cnv, pltstart, pltend, output):
 
 #Probability calculations for the Emission and Transition matrices
 def solve_pr(mean, variance):
+    # A negative binomial needs variance > mean; at or below it there is no
+    # finite `size`, and the arithmetic below divides by zero. Callers are
+    # expected to have applied the var = mean * (1 + 1e-3) guard, but that guard
+    # is written `if mean > 0`, so an all-zero frame arrives here as (0.0, 0.0)
+    # and used to raise ZeroDivisionError from inside run_HMM -- taking down a
+    # whole multi-sequence run because one plasmid got no reads. Decline instead;
+    # run_HMM short-circuits such a frame before it gets here, and this is the
+    # backstop for any other caller.
+    if not (variance > mean):
+        return 0.0, float("inf")
     r = (mean * mean)/(variance - mean)
     p = 1 - (mean/variance)
     return p, r
@@ -4458,7 +4720,8 @@ def bias_offsets(df, bias="all"):
 def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
             n_states=5, changeprob=None,
             max_copy_number=100, min_called_windows=100, bias="all",
-            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True):
+            change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
+            genome_id=None):
     """
     Viterbi copy-number calling.
 
@@ -4513,14 +4776,23 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     """
 
     saveloc = os.path.join(output, "CNV_csv")
-    genome_id = str(df["genome_id"].iloc[0])
-    samplename = output.rstrip("/").split("/")[-1] + genome_id
+    # `genome_id` is normally read off the frame, but a sequence with no
+    # coverage has no row to read it from, and its CSVs still have to be named.
+    if genome_id is None:
+        genome_id = str(df["genome_id"].iloc[0])
+    genome_id = str(genome_id)
+    samplename = sample_prefix(output) + genome_id
 
     new_exp = df.copy()
 
     new_exp.loc[:, "otr_gc_corr_norm_cov"] = np.nan_to_num(new_exp["otr_gc_corr_norm_cov"].to_numpy())
 
     med = new_exp["read_count_cov"].median()
+    # No windows at all: the median is NaN and int(NaN) raises. Zero is the
+    # honest baseline for a sequence with no coverage, and it keeps the
+    # back-converted read-count column below well-defined.
+    if not np.isfinite(med):
+        med = 0.0
 
     rc_cap = int(max(1.0, max_copy_number) * med)
 
@@ -4539,6 +4811,37 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         np.nan_to_num(new_exp["read_count_cov"].to_numpy(dtype=float))
     ).clip(min=0)
     offsets_all = bias_offsets(new_exp, bias=bias)
+
+    # NOTHING TO CALL. Either the sequence has no windows, or every window is at
+    # zero coverage. Both used to reach solve_pr(0.0, 0.0) and raise
+    # ZeroDivisionError -- the moment fallback's guard is written `if mean > 0`,
+    # so it steps over exactly the case that needs it. Every window is CN 0,
+    # which is what "no reads mapped here" means, and the files are still
+    # written: a caller that gets no CSV cannot tell this from a crash.
+    #
+    # The predicate is deliberately the DATA being empty, not `fit_result is
+    # None` -- that also fires on healthy-but-small frames, where the moment
+    # fallback below is a live and correct path.
+    if len(new_exp) == 0 or counts_all.max(initial=0.0) <= 0:
+        new_exp = new_exp.reset_index(drop=True)
+        new_exp.loc[:, "prob_copy_number"] = np.zeros(len(new_exp), dtype=int)
+        if write:
+            empty_breaks = pd.DataFrame(
+                {"Startpos": pd.Series(dtype=int),
+                 "State": pd.Series(dtype=int),
+                 "Segment_Size": pd.Series(dtype=int)}
+            )
+            # Three columns, header row, no data. breseq asserts the column
+            # count and the assert is fatal, so an empty file is not an option.
+            empty_breaks.to_csv(
+                os.path.join(saveloc, f"{samplename}_break_pts.csv"), index=False
+            )
+            new_exp.to_csv(
+                os.path.join(saveloc, f"{samplename}_CNV.csv"), index=False
+            )
+            print(f"{samplename}: no coverage to call; "
+                  "copy number 0 across the sequence. .csv files saved.")
+        return new_exp
 
     if "is_redundant" in new_exp.columns:
         not_redundant = ~new_exp["is_redundant"].to_numpy(dtype=bool)

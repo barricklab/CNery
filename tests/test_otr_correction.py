@@ -23,6 +23,8 @@ from CNery.core import (
     add_cn_censor,
     otr_ratio,
     pass1_summary,
+    declined_otr_results,
+    write_otr_results,
     _cnv_axis_limits,
     _cnv_axis_ticks,
     plot_copy,
@@ -30,6 +32,10 @@ from CNery.core import (
     refit_gc_bias_pooled,
     stage_pass1,
 )
+
+
+def _reject_constant(value):
+    raise AssertionError(f"not strict JSON: {value}")
 
 
 def _ensure_dirs(base):
@@ -1341,3 +1347,64 @@ class TestCopyNumberPlotAxes:
     def test_a_degenerate_range_still_yields_ticks(self):
         cn, reads = _cnv_axis_ticks([0, 1], 0.0, 0.0, 0.0, 0.0)
         assert len(cn) == len(reads) >= 2
+
+
+class TestTheJsonIsAlwaysWritten:
+    """Every path that can end a sequence must leave breseq a parseable record.
+
+    breseq reads OTR_corr/*_otr_results.json by name with nlohmann -- strict RFC
+    JSON, no allow_nan -- and a missing file costs it exactly what an
+    unparseable one does: it catches, warns, and reports no ori-ter bias at all.
+    """
+
+    def test_a_sequence_with_no_windows_still_gets_a_record(self, tmp_path):
+        out = str(tmp_path / "deg")
+        empty = pd.DataFrame({
+            "win_st": pd.Series(dtype=int), "win_end": pd.Series(dtype=int),
+        })
+        path = write_otr_results(
+            declined_otr_results(empty, "No usable coverage",
+                                 reason="the coverage table has no position rows"),
+            out, "chrEmpty",
+        )
+        with open(path) as fh:
+            data = json.loads(fh.read(), parse_constant=_reject_constant)
+
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+        # There is no coordinate to report, but breseq does not type-check these
+        # two, so they must still be ints rather than null.
+        assert data["Origin window"] == 0
+        assert data["Terminus window"] == 0
+        assert data["No usable coverage reason"]
+
+    def test_the_declined_record_matches_the_rejected_fit_shape(self, tmp_path,
+                                                                gc_corrected_flat):
+        # A reader should not have to tell "--bias none" or "no coverage" from
+        # "a tent was fitted and rejected" by which keys are absent.
+        out = str(tmp_path / "otr_shape")
+        _ensure_dirs(out)
+        res = fit_otr_bias(gc_corrected_flat, out, n_surrogates=200)
+        apply_otr_correction(res, out)
+        with open(next((tmp_path / "otr_shape" / "OTR_corr").glob("*.json"))) as fh:
+            rejected = json.load(fh)
+
+        declined = declined_otr_results(gc_corrected_flat, "No usable coverage")
+        assert set(declined) <= set(rejected)
+
+    def test_the_writer_refuses_a_bare_nan(self, tmp_path):
+        # allow_nan=False turns a value _json_safe missed into a loud failure
+        # here rather than a silently unparseable file in the field.
+        # A nested NaN is the case _json_safe cannot see: it maps top-level
+        # values only, so the writer's own allow_nan=False is the backstop.
+        with pytest.raises(ValueError):
+            write_otr_results({"nested": [float("nan")]},
+                              str(tmp_path / "bad"), "chrX")
+
+    def test_the_filename_does_not_depend_on_a_trailing_slash(self, tmp_path):
+        empty = pd.DataFrame({"win_st": pd.Series(dtype=int),
+                              "win_end": pd.Series(dtype=int)})
+        record = declined_otr_results(empty, "No usable coverage")
+        with_slash = write_otr_results(record, str(tmp_path / "out") + "/", "chrS")
+        without = write_otr_results(record, str(tmp_path / "out"), "chrS")
+        assert os.path.basename(with_slash) == os.path.basename(without)
+        assert os.path.basename(with_slash) == "outchrS_otr_results.json"

@@ -14,6 +14,9 @@ from .core import (
     resolve_coverage_inputs,
     fit_otr_bias,
     apply_otr_correction,
+    declined_otr_results,
+    no_usable_coverage_reason,
+    write_otr_results,
     plot_correction_stages,
     plot_gc_passes,
     DEFAULT_FRAG_SIZE,
@@ -26,6 +29,8 @@ from .core import (
     plot_otr_corr,
     predict_ori_ter_from_skew,
     write_gc_skew_results,
+    no_skew_prediction,
+    plot_no_data,
     plot_gc_skew,
     run_HMM,
     plot_copy,
@@ -384,14 +389,26 @@ def main():
         under the GC modes, a coverage column that now means raw/G. The fits
         themselves are the same calls with the same gates in both passes.
         """
-        if options.bias == "gc":
+        # --bias gc and --bias none never run an OTR stage, so neither used to
+        # write OTR_corr/*_otr_results.json AT ALL -- two of the four modes gave
+        # breseq nothing on a completely healthy run, and a missing file costs it
+        # exactly what an unparseable one does. Write the declined record instead,
+        # naming the mode so the file says why rather than implying a fit was
+        # attempted and rejected.
+        if options.bias in ("gc", "none"):
             df_out = df_in.copy()
-            df_out["otr_gc_corr_norm_cov"] = df_out["gc_corr_norm_cov"]
-            return df_out, None, None, None
-
-        if options.bias == "none":
-            df_out = df_in.copy()
-            df_out["otr_gc_corr_norm_cov"] = df_out["norm_raw_cov"]
+            df_out["otr_gc_corr_norm_cov"] = (
+                df_out["gc_corr_norm_cov"] if options.bias == "gc"
+                else df_out["norm_raw_cov"]
+            )
+            write_otr_results(
+                declined_otr_results(
+                    df_out,
+                    correction_type=f"No OTR correction (--bias {options.bias})",
+                    relative_copy_number=relative_cn.get(genome_id, 1.0),
+                ),
+                out_dir, genome_id,
+            )
             return df_out, None, None, None
 
         # "otr" and "all" differ only in what the OTR fit is given as its
@@ -428,6 +445,65 @@ def main():
         for genome_id, df_b2c in frames.items():
             if not quiet:
                 print(f"Processing genome: {genome_id}")
+
+            # A coverage table with no position rows -- a reference that got no
+            # reads at all. There is nothing to fit, nothing to call and no
+            # coordinate to report, and several stages below index row 0. Report
+            # it as a RESULT and carry on with the other sequences: breseq still
+            # gets its JSON, and a plasmid with no reads must not take down the
+            # chromosome sharing the invocation.
+            #
+            # Gated on having no WINDOWS, not on no_usable_coverage_reason().
+            # A sequence whose every window reads zero still has a reference to
+            # measure GC skew over and windows to call CN 0 on, and it now
+            # travels the ordinary path end to end -- otr_fit() declines it,
+            # run_HMM() calls it 0. Diverting it here would report less.
+            if len(df_b2c) == 0:
+                reason = no_usable_coverage_reason(df_b2c)
+                if not quiet:
+                    write_gc_skew_results(no_skew_prediction(), out_dir, genome_id)
+                    write_otr_results(
+                        declined_otr_results(
+                            df_b2c,
+                            correction_type="No usable coverage",
+                            reason=reason,
+                            relative_copy_number=relative_cn.get(
+                                genome_id, float("nan")),
+                        ),
+                        out_dir, genome_id,
+                    )
+                    # The OTR stage is what normally puts these on the frame,
+                    # and it was skipped. run_HMM reads both by name -- the
+                    # coverage column for the CSV, the factor column for the
+                    # emission offsets -- so an empty sequence's CNV.csv would
+                    # otherwise be a KeyError rather than a file.
+                    df_deg = df_b2c.copy()
+                    df_deg["otr_gc_corr_norm_cov"] = df_deg["gc_corr_norm_cov"]
+                    df_deg["otr_gc_corr_fact"] = 1.0
+                    run_HMM(
+                        df_deg, out_dir,
+                        deletion_coverage_fraction=options.deletion_coverage_fraction,
+                        bias=options.bias, change_rate=options.change_rate,
+                        write=True, genome_id=genome_id,
+                    )
+                    # Same figures the ordinary path emits, each saying why it
+                    # is blank -- so "no plot" never has to be read as "the run
+                    # died before it got here".
+                    blank = f"{smpl}{genome_id}"
+                    note = f"No usable coverage: {reason}."
+                    for subdir, suffix, title in (
+                        ("CNV_plt", "_copy_numbers.pdf", "Copy number"),
+                        ("GC_skew", "_GC_skew.pdf", "Cumulative GC skew"),
+                        ("OTR_corr", "_OTR_corr.pdf", "Origin-to-terminus bias"),
+                        ("corr_plots", "_correction_stages.pdf",
+                         "Correction stages"),
+                    ):
+                        plot_no_data(out_dir, subdir, f"{blank}{suffix}",
+                                     f"{blank}: {title}", note)
+
+                    print(f"{smpl} ({genome_id}): no usable coverage "
+                          f"({reason}); no bias detected.")
+                continue
 
             # Origin/terminus from the reference's own cumulative GC skew. This sits
             # ahead of the --bias branch on purpose: it reads only the sequence, so

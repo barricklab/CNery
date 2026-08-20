@@ -428,3 +428,50 @@ class TestFragmentSelection:
         assert detail["Fragment size candidates"] == frag_candidates(100)
         assert len(detail["Fragment size picks per split"]) == 3
         assert detail["Fragment size improvement se"] is not None
+
+
+class TestNothingToFit:
+    """fit_gc_bias declines with an identity curve rather than raising.
+
+    LOWESS on empty arrays returns a (0, 2) array and the np.interp that follows
+    raises "array of sample points is empty". Three real inputs reach it: every
+    window at zero coverage (all flagged is_deletion), every window overlapping a
+    repeat (all flagged is_redundant), and a reference with no windows at all.
+
+    The declined curve is flat 1.0 so that apply_gc_correction is an exact
+    no-op. That matters beyond the corrected column: run_HMM composes its
+    emission offsets from gc_corr_fact, so a fabricated curve would be applied to
+    the copy-number model even where no bias could be measured.
+    """
+
+    def _frame(self, n=200, cov=0.0, redundant=0.0):
+        rng = np.random.default_rng(0)
+        return pd.DataFrame({
+            "genome_id": "a",
+            "gc_percent": rng.normal(0.5, 0.05, n),
+            "read_count_cov": np.full(n, cov),
+            "norm_raw_cov": np.full(n, cov),
+            "pct_redundant": np.full(n, redundant),
+        })
+
+    def test_all_zero_coverage_gives_an_identity_curve(self):
+        df = mask_coverage_windows(self._frame())
+        fit = fit_gc_bias(df)
+        np.testing.assert_allclose(fit["fit_sorted"], 1.0)
+
+    def test_all_repeat_windows_give_an_identity_curve(self):
+        df = mask_coverage_windows(self._frame(cov=25.0, redundant=1.0))
+        assert df["exclude_from_fit"].all()
+        np.testing.assert_allclose(fit_gc_bias(df)["fit_sorted"], 1.0)
+
+    def test_an_empty_frame_gives_an_identity_curve(self):
+        df = mask_coverage_windows(self._frame(n=0))
+        np.testing.assert_allclose(fit_gc_bias(df)["fit_sorted"], 1.0)
+
+    def test_applying_it_changes_nothing(self):
+        # The point of a flat 1.0: "no GC correction was applied" has to mean
+        # the coverage is untouched and the factor the HMM reads is exactly one.
+        df = mask_coverage_windows(self._frame(cov=25.0, redundant=1.0))
+        out = apply_gc_correction(df, fit_gc_bias(df))
+        np.testing.assert_allclose(out["gc_corr_fact"], 1.0)
+        np.testing.assert_allclose(out["gc_corr_norm_cov"], out["norm_raw_cov"])

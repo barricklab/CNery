@@ -316,14 +316,21 @@ class TestArtifacts:
         with open(path) as fh:
             assert json.load(fh) == result
 
-    def test_filename_follows_the_otr_results_convention(self, tmp_path):
-        # samplename is the output prefix's last path component + genome_id, so
-        # the trailing slash CNery's default out_dir carries leaves the prefix
-        # empty and the file named for the sequence alone. Same rule as
-        # apply_otr_correction's *_otr_results.json.
+    def test_filename_does_not_depend_on_a_trailing_slash(self, tmp_path):
+        # samplename is the output prefix's last path component + genome_id, via
+        # sample_prefix(), which RSTRIPS the separator. It used to strip()
+        # instead, so CNery's default out_dir of "CNV_out/" split to the empty
+        # string and this file came out named for the sequence alone -- beside a
+        # CNV_csv/CNV_outchrS_CNV.csv from the same run, because run_HMM already
+        # rstripped. breseq reads the JSON by name, so the name must not depend
+        # on how the caller spelled -o. Same rule as *_otr_results.json.
         _, result = _predict(tmp_path, SWITCH_SEQ)
-        path = write_gc_skew_results(result, str(tmp_path / "out") + "/", "chrS")
-        assert os.path.basename(path) == "chrS_gc_skew_results.json"
+        with_slash = write_gc_skew_results(
+            result, str(tmp_path / "out") + "/", "chrS")
+        without = write_gc_skew_results(result, str(tmp_path / "out"), "chrS")
+
+        assert os.path.basename(with_slash) == "outchrS_gc_skew_results.json"
+        assert os.path.basename(with_slash) == os.path.basename(without)
 
     def test_json_is_strict_rfc_json(self, tmp_path):
         # Unlike the OTR results file, which emits a bare NaN.
