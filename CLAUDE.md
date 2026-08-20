@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `environment.yml` — the user-facing install path, as documented in `README.md`.
 - `dev-environment.yml` — the contributor path. Adds `pytest` (absent from the runtime manifests, so
-  the suite cannot run without it), pins `pandas<3`, drops the `pathlib` stdlib-backport entry, and
+  the suite cannot run without it), drops the `pathlib` stdlib-backport entry, and
   includes `breseq`. Following the same convention as the `breseq` repo, it builds into an untracked
   `env/` inside the repo (already covered by `.gitignore`):
 
@@ -31,12 +31,40 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 560; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 263, offline, ~35s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 297, real coverage tables
+conda run -p $PWD/env pytest                    # all 729; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 396, offline, ~50s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 333, real coverage tables (32 skip per-sequence)
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
+```
+
+**pandas 2 and pandas 3 are both supported, and the suite is identical on each** — 697 passed, 32
+skipped on 2.3.3 and on 3.0.5, goldens included. The `pandas<3` cap is gone; what replaced it is two
+invariants that are not obvious from the code, both recorded in `dev-environment.yml`:
+
+1. **Every function in `core.py` that takes a DataFrame and writes to it calls `.copy()` first.**
+   Under pandas 3's Copy-on-Write a write through a view does not propagate, so a stage that mutated
+   its argument in place would fail *silently* rather than raise. There are no chained assignments
+   (`df[col][mask] = x`) anywhere, and adding one would be a bug on pandas 3 only.
+2. **`preprocess` casts a zero-window frame's columns to int/float explicitly.** Empty lists give
+   `object`, which `pd.concat` then promotes across the *pooled* frame — so one empty plasmid would
+   turn a healthy chromosome's `win_st` into floats.
+   `tests/test_coverage_table_io.py::test_window_coordinates_stay_integers` pins it.
+
+There is no CI, so a contributor **on pandas 2** can check pandas-3 readiness without reinstalling,
+by turning on the two options that account for most of the 3.0 behaviour change. (On pandas 3 the
+command is pointless: Copy-on-Write is mandatory there and `mode.copy_on_write` is already a
+deprecated no-op that pandas 4 removes.) `pyproject.toml` ignores `DeprecationWarning`, which hides
+exactly the signals worth seeing here, hence the `-W` override:
+
+```bash
+conda run -p $PWD/env python -c "
+import pandas as pd, pytest, sys
+pd.options.mode.copy_on_write = True
+pd.options.future.infer_string = True
+sys.exit(pytest.main(['-m','synthetic','-q','-W','error::DeprecationWarning',
+                      '-W','error::FutureWarning']))"
 ```
 
 **Running the tool.** Console entry point is `CNery` → `CNery.get_CNV:main`. Full flag list is in

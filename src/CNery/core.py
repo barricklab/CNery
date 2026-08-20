@@ -389,7 +389,13 @@ def preprocess(df, win=100, step=100, frag=400):
     # Prefix sums of the G and C counts along the reference, so each window's
     # base composition is two array lookups instead of another pass of the
     # per-window Python string work gc_percent already pays for.
-    bases = genome.to_numpy()
+    #
+    # astype(str) so the comparison does not depend on which dtype to_numpy()
+    # hands back: `ref_base` is object under pandas 2 and the dedicated string
+    # dtype under pandas 3. Both give an object array of Python str here and both
+    # compare correctly, but reference_gc_flags() already armours the identical
+    # operation this way and the two should not differ.
+    bases = genome.to_numpy().astype(str)
     cum_g = np.concatenate(([0], np.cumsum(bases == 'G')))
     cum_c = np.concatenate(([0], np.cumsum(bases == 'C')))
 
@@ -457,7 +463,13 @@ def preprocess(df, win=100, step=100, frag=400):
         # Summarize the window coverage statistics
         window_med_cov.insert(i, float(np.nanmedian(win_cov)))
         pct_redundant_s.insert(i, pct_redundant)
-        winseq = genome[i:i + winu]
+        # .iloc, like the coverage slices above: this frame is read with
+        # index_col=0, so its index is the 1-BASED genome coordinate and label 0
+        # does not exist. A bare integer slice on a Series is still positional,
+        # so `genome[i:i + winu]` works -- but it was the one place in this loop
+        # where a 1-based index met bare [], and it should read like its
+        # neighbours rather than rely on that distinction holding.
+        winseq = genome.iloc[i:i + winu]
         seq.insert(i, ''.join(str(element) for element in winseq))
 
         # GC skew (G-C)/(G+C) over the WINDOW, not over the fragment gc_percent
@@ -1661,9 +1673,7 @@ def plot_otr_corr(df, output, ori, ter):
 
     plt_full_path = os.path.join(saveplt,'%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
     plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
-    
-    df.reset_index(drop = True)
-    
+
     plt.close()
 
 

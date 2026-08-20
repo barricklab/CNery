@@ -9,14 +9,26 @@ dependencies:
 #     because that is the version the dependency set below is known to resolve cleanly against.
   - python=3.11
 # CNery runtime dependencies. Mirrors requirements.txt, with two deliberate differences noted below.
-#  => pandas is capped below 3. Commit 473446b already removed the DataFrame._append call that
-#     pandas 3 dropped, but core.py still does positional Series lookups (core.py:453, core.py:835:
-#     `df["genome_id"][0]`) whose meaning pandas 3 changes. breseq's own dev-environment.yml applies
-#     the same cap to the CNery build it packages, for the same reason.
-  - pandas>=2.2.0,<3
+#  => pandas is NO LONGER capped below 3. The cap existed because core.py did positional Series
+#     lookups (`df["genome_id"][0]`) whose meaning pandas 3 changes; all six are now `.iloc[0]`, and
+#     the suite passes unchanged on both 2.3.3 and 3.0.5 -- goldens included. Both majors are
+#     supported deliberately, since breseq redistributes CNery and its users are on either.
+#     Two invariants keep that true, and neither is obvious from the code:
+#       1. Every function in core.py that takes a DataFrame and writes to it calls .copy() FIRST.
+#          Under pandas 3's Copy-on-Write a write through a view silently does not propagate, so a
+#          function that mutates its argument in place would fail quietly rather than loudly.
+#       2. preprocess() casts the columns of a zero-window frame to int/float explicitly. Left as
+#          the `object` that empty lists produce, pd.concat would promote the POOLED column and one
+#          empty plasmid would turn a healthy chromosome's win_st into floats.
+#     tests/test_coverage_table_io.py::test_window_coordinates_stay_integers pins the second.
+#     Note breseq's own dev-environment.yml may still cap the CNery build it packages.
+  - pandas>=2.2.0
   - numpy>=1.26.0
   - scipy>=1.12.0
-  - statsmodels>=0.14.0
+#  => statsmodels floor is 0.14.6, not 0.14.0, and that matters now the pandas cap is gone: the
+#     solver would otherwise be free to pair pandas 3 with a statsmodels that predates it entirely.
+#     statsmodels declares no upper pandas bound, so nothing else would catch the mismatch.
+  - statsmodels>=0.14.6
   - matplotlib>=3.8.0
   - seaborn>=0.13.0
   - setuptools>=68.2.0
