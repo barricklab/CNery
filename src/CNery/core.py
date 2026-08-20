@@ -1630,13 +1630,61 @@ def process_multi_genome(
     return per_genome_corrected
 
 
-def plot_otr_corr(df, output, ori, ter):
+# def plot_otr_corr(df, output, ori, ter):
 
-    genome_id = str(df["genome_id"].iloc[0])
-    samplename = sample_prefix(output) + genome_id
-    saveplt = str(output+"/OTR_corr/")
-  
-    plt.figure(figsize=(10, 8))
+#     genome_id = str(df["genome_id"].iloc[0])
+#     samplename = sample_prefix(output) + genome_id
+#     saveplt = str(output+"/OTR_corr/")
+#     os.makedirs(saveplt, exist_ok=True)
+
+#     fig, ax = plt.subplots(figsize=(12, 7))
+
+#     # Repeat windows are not drawn. On CWBI's chromosome they reach 18x the
+#     # single-copy level on zero unique coverage, which set the y-axis so the 1.17
+#     # ramp this figure exists to show was invisible.
+#     keep = plottable(df)
+#     drawn = df.loc[keep]
+#     n_hidden = int((~keep).sum())
+
+#     plt.scatter(drawn["win_st"], drawn["norm_raw_cov"], color="gray",
+#                 label="Raw reads", s=8, alpha=0.2)
+#     plt.scatter(drawn["win_st"], drawn["gc_corr_norm_cov"], color="black",
+#                 label="GC corrected", marker="*", s=15, alpha=0.5)
+#     plt.scatter(drawn["win_st"], drawn["otr_gc_corr_norm_cov"], color="orange",
+#                 label="Ori/Ter bias corrected", s=20, alpha=0.85,
+#                 marker=mplt.markers.MarkerStyle(marker="o", fillstyle="full"))
+#     # The fitted tent is a model evaluated everywhere, so it stays whole. The
+#     # median filter is a statistic OF the data, so it breaks where the data is
+#     # not drawn rather than bridging the gap with a value taken from repeats.
+#     plt.plot(df["win_st"], df["otr_gc_corr_fact"], color="black",
+#              label="OTR-bias-fit-line")
+#     med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float).copy()
+#     med_fil[~keep] = np.nan
+#     plt.plot(df["win_st"], med_fil, color="blue", label="Med-fil")
+    
+#     plt.axvline(x=ter, color='r', linestyle=':', label=f'Terminus: {ter}')
+#     plt.axvline(x=ori, color='r', linestyle=':', label=f'Origin: {ori}')
+#     plt.xlabel("Window (Genomic position)")
+#     plt.ylabel("Normalized read coverage")
+#     title = f'{samplename}_Ori/Ter bias correction'
+#     if n_hidden:
+#         title += f"\n{n_hidden} repeat window(s) not shown"
+#     plt.title(title)
+#     plt.legend(loc = 'upper right')
+
+#     plt_full_path = os.path.join(saveplt,'%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
+#     plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
+
+#     plt.close()
+
+def plot_otr_corr(df, output, ori, ter):
+    
+    genome_id = str(df["genome_id"][0])
+    samplename = output.strip().split('/')[-1] + "_" + genome_id
+    saveplt = str(output + "/OTR_corr/")
+    os.makedirs(saveplt, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
 
     # Repeat windows are not drawn. On CWBI's chromosome they reach 18x the
     # single-copy level on zero unique coverage, which set the y-axis so the 1.17
@@ -1645,36 +1693,38 @@ def plot_otr_corr(df, output, ori, ter):
     drawn = df.loc[keep]
     n_hidden = int((~keep).sum())
 
-    plt.scatter(drawn["win_st"], drawn["norm_raw_cov"], color="gray",
-                label="Raw reads", s=8, alpha=0.2)
-    plt.scatter(drawn["win_st"], drawn["gc_corr_norm_cov"], color="black",
-                label="GC corrected", marker="*", s=15, alpha=0.5)
-    plt.scatter(drawn["win_st"], drawn["otr_gc_corr_norm_cov"], color="orange",
-                label="Ori/Ter bias corrected", s=20, alpha=0.85,
-                marker=mplt.markers.MarkerStyle(marker="o", fillstyle="full"))
-    # The fitted tent is a model evaluated everywhere, so it stays whole. The
-    # median filter is a statistic OF the data, so it breaks where the data is
-    # not drawn rather than bridging the gap with a value taken from repeats.
-    plt.plot(df["win_st"], df["otr_gc_corr_fact"], color="black",
-             label="OTR-bias-fit-line")
+    ax.scatter(drawn["win_st"], drawn["norm_raw_cov"], color="#B0B0B0", s=3.5,
+            alpha=0.7, label="Raw coverage (before)", zorder=1)
+    ax.scatter(drawn["win_st"], drawn["gc_corr_norm_cov"], color="#3544A9", s=3.5,
+            alpha=0.7, label="GC-corrected coverage", zorder=2)
     med_fil = df["gc_cor_med_fil"].to_numpy(dtype=float).copy()
     med_fil[~keep] = np.nan
-    plt.plot(df["win_st"], med_fil, color="blue", label="Med-fil")
-    
-    plt.axvline(x=ter, color='r', linestyle=':', label=f'Terminus: {ter}')
-    plt.axvline(x=ori, color='r', linestyle=':', label=f'Origin: {ori}')
-    plt.xlabel("Window (Genomic position)")
-    plt.ylabel("Normalized read coverage")
+    ax.plot(df["win_st"], med_fil, color="#A95024", linewidth=2.0,
+            alpha=0.5, label="Median-filtered (fit seed)", zorder=4)
+    ax.plot(df["win_st"], df["otr_gc_corr_fact"], color="black", linewidth=1.2,
+                alpha=0.5, label="Fitted OTR trend", zorder=5)
+    ax.scatter(drawn["win_st"], drawn["otr_gc_corr_norm_cov"], color="#F1C827", s=5,
+            alpha=0.95, label="OTR-corrected coverage (after)", zorder=3)
+
+    ax.axvline(x=ori, color="#2CA02C", linestyle=":", linewidth=1.8,
+               label=f"Origin ({int(ori)})", zorder=5)
+    ax.axvline(x=ter, color="#9467BD", linestyle=":", linewidth=1.8,
+               label=f"Terminus ({int(ter)})", zorder=5)
+
+    ax.set_xlabel("Genomic position (window start)")
+    ax.set_ylabel("Normalized read coverage")
     title = f'{samplename}_Ori/Ter bias correction'
     if n_hidden:
         title += f"\n{n_hidden} repeat window(s) not shown"
-    plt.title(title)
-    plt.legend(loc = 'upper right')
+    ax.set_title(title)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
 
-    plt_full_path = os.path.join(saveplt,'%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
-    plt.savefig(plt_full_path, format = 'pdf', bbox_inches = 'tight')
+    plt_full_path = os.path.join(saveplt, '%s_OTR_corr.pdf' % samplename.replace(' ', '_'))
+    fig.savefig(plt_full_path, format='pdf', bbox_inches='tight')
 
-    plt.close()
+    df.reset_index(drop=True)
+
+    plt.close(fig)
 
 
 def otr_predict(x, x_ori, x_ter, y_ori, y_ter, genome_len):
@@ -3988,21 +4038,18 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
     if not shown.size:
         shown = np.array([0.0])
 
-    # FLOORED AT ZERO, both of them. A read count cannot be negative and neither
-    # can a copy number, so padding the bottom the way the top is padded put a
-    # "-85 reads" tick on the axis and invited the reader to believe the scale
-    # meant something there. Windows at zero coverage -- real deletions, and the
-    # CN-0 calls that describe them -- sit on the bottom edge, which is where
-    # zero belongs.
-    lo2 = 0.0
+    # Equal Delta across both axes since the zero copy was
+    # hard to see as the floor was at zero. Same scaling as the hi-limit
+    # used for the lo-limit. Needs testing against a lot of examples.
+    lo2 = float(shown.min()) - delta
     hi2 = float(shown.max()) + delta
-    return (lo2, hi2 / scale), (lo2, hi2)
+    return (lo2 / scale, hi2 / scale), (lo2, hi2)
 
 
 def plot_copy(df_cnv, pltstart, pltend, output):
     
     genome_id = str(df_cnv["genome_id"].iloc[0])
-    samplename = sample_prefix(output) + genome_id
+    samplename = sample_prefix(output) + "_" + genome_id
     # samplename = sample.strip().split('.')[0]
     saveplt = str(output+"/CNV_plt/")
     
@@ -4042,7 +4089,7 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     # what raised matplotlib's "More than 20 figures have been opened" on any run
     # touching enough sequences -- and every CNV plot came out at matplotlib's
     # default 6.4x4.8 rather than the 10x8 the code appeared to ask for.
-    fig, ax1 = plt.subplots(figsize=(10, 8))
+    fig, ax1 = plt.subplots(figsize=(12, 7))
 
     ax2 = ax1.twinx()
     ax1.patch.set_visible(False)
@@ -4064,11 +4111,23 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     if drawn.empty:
         drawn, n_hidden = df_plt, 0
 
-    ax2.scatter(drawn["win_st"], drawn["read_count_cov"], color="gray",
-                label="Raw reads", s=10, alpha=0.2)
-    ax2.scatter(drawn["win_st"], drawn["otr_gc_corr_rdcnt_cov"], color="orange",
-                label="Corrected reads", s=5, alpha=0.5,
-                marker=mplt.markers.MarkerStyle(marker="o", fillstyle="none"))
+    ax2.scatter(drawn["win_st"], drawn["read_count_cov"], color="#B0B0B0",
+                label="Raw reads", s=8, alpha=0.7)
+    ax2.plot(drawn["win_st"], drawn["otr_gc_corr_rdcnt_cov"], color="#186DA2FF",
+                label="Corrected reads", linewidth=1.5, alpha=0.95)
+
+    # Flag redundant/repeat windows on the corrected series without breaking the
+    # "corrected coverage is a line, not points" rule: overlay the SAME series,
+    # masked to NaN everywhere except is_redundant windows, so matplotlib only
+    # draws over those segments. Small markers are added on this overlay so an
+    # isolated single flagged window (too short to render as a visible line
+    # segment on its own) still shows up.
+    if "is_redundant" in df_plt.columns and df_plt["is_redundant"].any():
+        redundant_overlay = df_plt["otr_gc_corr_rdcnt_cov"].where(df_plt["is_redundant"])
+        ax2.plot(df_plt["win_st"], redundant_overlay, color="#63EFA2",
+                 linewidth=1.2, alpha=0.5, linestyle = "-.",
+                 label="Corrected (redundant/repeat window)", zorder=3)
+    
     # COPY-NUMBER CALLS AS SEGMENTS, AT THEIR TRUE EXTENT.
     #
     # They used to be one scatter marker per window ("_", s=30), whose width is
@@ -4089,9 +4148,9 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     win_b = df_plt["win_end"].to_numpy()
     edges = np.r_[0, np.flatnonzero(np.diff(cn_all) != 0) + 1, len(cn_all)]
     for a, b in zip(edges[:-1], edges[1:]):
-        ax1.hlines(cn_all[a], win_a[a], win_b[b - 1], color="red", linewidth=1.6,
+        ax1.hlines(cn_all[a], win_a[a], win_b[b - 1], color="red", linewidth=4,
                    zorder=6)
-    ax1.plot([], [], color="red", linewidth=1.6, label="Predicted Copy Number")
+    ax1.plot([], [], color="red", linewidth=4, label="Predicted Copy Number", zorder=6)
 
     delta = int(drawn["read_count_cov"].median() * 0.5)
     
