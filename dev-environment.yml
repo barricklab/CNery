@@ -32,9 +32,13 @@ dependencies:
   - matplotlib>=3.8.0
   - seaborn>=0.13.0
   - setuptools>=68.2.0
-#  => requirements.txt also lists `pathlib>=1.0.0`. That is deliberately NOT reproduced here: it is a
-#     PyPI backport of a module that has been in the standard library since Python 3.4, and
-#     installing it can shadow the real one.
+#  => `pathlib` used to be listed in requirements.txt and environment.yml and deliberately omitted
+#     here. It is now gone from all three: it is a PyPI/conda backport of a module that has been in
+#     the standard library since Python 3.4, so on any Python this package supports it installs a
+#     Python-2-era pathlib.py that nothing imports. The note here used to say it "can shadow the
+#     real one" -- measured, it cannot: stdlib sits ahead of site-packages on sys.path, so
+#     `import pathlib` gets the real module either way. It was dead weight, not a hazard, which is
+#     why removing it needs no version bump for anyone.
 # Test runner.
 #  => Not a runtime dependency, which is why it is absent from requirements.txt and environment.yml.
 #     The tests/ suite cannot run without it, so it belongs in the contributor environment.

@@ -7,10 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Environment.** Two specs, for two audiences:
 
 - `environment.yml` — the user-facing install path, as documented in `README.md`.
-- `dev-environment.yml` — the contributor path. Adds `pytest` (absent from the runtime manifests, so
-  the suite cannot run without it), drops the `pathlib` stdlib-backport entry, and
-  includes `breseq`. Following the same convention as the `breseq` repo, it builds into an untracked
-  `env/` inside the repo (already covered by `.gitignore`):
+- `dev-environment.yml` — the contributor path. Adds `pytest` and `pooch` (absent from the runtime
+  manifests, so the suite cannot run without them) and pins `python=3.11` for a fast, reproducible
+  solve. Otherwise the three dependency lists are **the same list, written three times** —
+  `requirements.txt` for the wheel (`pyproject.toml` reads it via `dynamic = ["dependencies"]`),
+  `environment.yml` for conda users, and this one for contributors. Nothing checks that they agree,
+  so a version floor changed in one has to be changed in all three by hand.
+  Following the same convention as the `breseq` repo, it builds into an untracked `env/` inside the
+  repo (already covered by `.gitignore`):
 
 ```bash
 conda env create -f dev-environment.yml --prefix=$PWD/env
