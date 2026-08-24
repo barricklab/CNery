@@ -4689,7 +4689,18 @@ def _segments_from_path(path, win_st, win_end, chr_length):
         return seq.iloc[i] if hasattr(seq, "iloc") else seq[i]
 
     rows = []
-    start_pos = 0
+    # The first segment opens at the first window's start, not at 0. Every other Startpos below
+    # comes from win_st, so seeding this with a literal 0 made row 1 the one row in the file that
+    # was not a real 1-based window start -- a private convention every consumer then had to know
+    # about. breseq did not, and wrote it into a Genome Diff as a start coordinate of 0, which its
+    # own parser rejects ("Expected positive integral value for field 9: [start]"). That only
+    # surfaced when the first segment was called CN != 1 and so survived breseq's filter, which
+    # takes either a deletion at the start of a contig or coverage thin enough that the whole
+    # genome comes back CN 0.
+    #
+    # Segment_Size is written downstream as Endpos - Startpos, so this shortens row 1 by one base
+    # and leaves every segment's last base exactly where it was.
+    start_pos = _at(win_st, 0)
     prev_state = path[0]
 
     # range(1, len(path)) -- the old loop ran to len(obs) - 1 and so could never

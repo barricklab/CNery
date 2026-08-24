@@ -21,6 +21,7 @@ from CNery.core import (
     window_geometry,
     _log_emission_lookup,
     _default_log_start,
+    _segments_from_path,
 )
 
 
@@ -115,6 +116,82 @@ def test_backtraced_path_scores_at_least_as_high_as_the_argmax_labels():
     path = _decode(obs, em, tm)
     per_window = np.argmax(make_viterbi_mat(obs, tm, em), axis=1)
     assert score(path) >= score(per_window)
+
+
+class TestFirstSegmentCoordinate:
+    """The first row of break_pts.csv must be a real window start like every other row.
+
+    It used to be a literal 0, seeded before the loop had looked at a window. That is
+    not a coordinate any window has, and it made row 1 the one row a consumer could not
+    read the same way as the rest -- breseq wrote it into a Genome Diff as start 0 and
+    then failed its own validation on the file it had just written.
+    """
+
+    @staticmethod
+    def _windows(n, size=100):
+        """1-based window starts, as build_windows produces them for a real reference."""
+        win_st = pd.Series(np.arange(n) * size + 1)
+        return win_st, win_st + size
+
+    def test_first_segment_opens_at_the_first_window(self):
+        win_st, win_end = self._windows(10)
+        path = [1] * 5 + [0] * 5
+
+        segments = _segments_from_path(path, win_st, win_end, chr_length=1001)
+
+        assert segments["Startpos"].iloc[0] == win_st.iloc[0] == 1
+
+    def test_first_segment_opens_at_the_first_window_when_its_state_is_not_1(self):
+        """The regression. A CN != 1 first segment is the one that reaches a .gd.
+
+        Copy number 1 is the baseline breseq drops, so while the genome opened in
+        state 1 the bad coordinate was filtered out before anything could trip over
+        it. A contig starting inside a deletion, or a library thin enough that the
+        whole genome comes back CN 0, is what makes row 1 survive.
+        """
+        win_st, win_end = self._windows(10)
+        path = [0] * 5 + [1] * 5
+
+        segments = _segments_from_path(path, win_st, win_end, chr_length=1001)
+
+        assert segments["State"].iloc[0] == 0
+        assert segments["Startpos"].iloc[0] == 1
+
+    def test_every_startpos_is_a_window_start(self):
+        win_st, win_end = self._windows(12)
+        path = [0] * 4 + [1] * 4 + [2] * 4
+
+        segments = _segments_from_path(path, win_st, win_end, chr_length=1201)
+
+        assert set(segments["Startpos"]).issubset(set(win_st))
+
+    def test_the_last_base_of_every_segment_is_unchanged(self):
+        """Coordinate-neutrality: only the start moved, and only by one base.
+
+        Segment_Size is written downstream as Endpos - Startpos, so a consumer
+        recovers the last base as Startpos + Segment_Size - 1 == Endpos - 1. Shifting
+        row 1 from 0 to 1 shortens it by a base at the front and must leave that
+        derived end exactly where it was.
+        """
+        win_st, win_end = self._windows(10)
+        path = [0] * 5 + [1] * 5
+
+        segments = _segments_from_path(path, win_st, win_end, chr_length=1001)
+        sizes = segments["Endpos"] - segments["Startpos"]
+        last_base = segments["Startpos"] + sizes - 1
+
+        assert list(last_base) == list(segments["Endpos"] - 1)
+        # ... and the segments still tile the sequence with no gap and no overlap.
+        assert list(segments["Startpos"])[1:] == list(last_base + 1)[:-1]
+
+    def test_a_single_state_genome_is_one_segment_starting_at_one(self):
+        win_st, win_end = self._windows(6)
+
+        segments = _segments_from_path([0] * 6, win_st, win_end, chr_length=601)
+
+        assert len(segments) == 1
+        assert segments["Startpos"].iloc[0] == 1
+        assert segments["Endpos"].iloc[0] == 601
 
 
 def test_state_change_at_the_final_window_is_emitted():
