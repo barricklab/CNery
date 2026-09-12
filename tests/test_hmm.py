@@ -1133,28 +1133,48 @@ class TestInteriorBoundaryPrior:
         assert self._extra_nats(old, new, 126, 127) > 100.0
 
     def test_a_real_stepped_array_is_barely_taxed(self):
-        """A doubling is a claim the data can support; it must stay affordable."""
+        """A doubling is a claim the data can support; it must stay affordable.
+
+        6.6 nats at the defaults -- 4.6 for the interior rate and 2 for the fold
+        penalty -- against the hundreds of nats a real 2x step over many windows
+        supplies. test_a_genuine_two_level_array_is_still_split proves the end of
+        that sentence.
+        """
         old, new = self._matrices()
-        assert self._extra_nats(old, new, 50, 100) < 5.0
+        assert self._extra_nats(old, new, 50, 100) < 8.0
 
     def test_the_kernel_is_scale_free(self):
-        """1 -> 2 and 100 -> 200 are the same event, which is what "%" means.
-
-        Compared WITHIN one row, because the row normalizer legitimately differs
-        between rows -- state 4 and state 50 do not have the same neighbours.
-        Halving and doubling from the same state are equidistant in log space, so
-        they must come out equal.
-        """
+        """1 -> 2 and 100 -> 200 are the same event, which is what "%" means."""
         _, new = self._matrices()
+        # Within a row: halving and doubling are equidistant in log space.
         for k in (4, 8, 50):
             assert new[k, k // 2] == pytest.approx(new[k, k * 2], rel=1e-12)
-
-    def test_returning_to_baseline_gets_cheaper_not_dearer(self):
-        """The mass taken off interior targets has to go somewhere, and it goes
-        to single copy -- which is how copy-number segments actually end."""
+        # And ACROSS rows, which only holds because the row is not renormalized.
         old, new = self._matrices()
-        assert self._extra_nats(old, new, 126, 1) < 0.0
-        assert self._extra_nats(old, new, 126, 0) < 0.0
+        assert (self._extra_nats(old, new, 2, 4)
+                == pytest.approx(self._extra_nats(old, new, 50, 100), rel=1e-12))
+
+    def test_leaving_an_amplified_state_costs_exactly_what_it_did(self):
+        """Baseline is untouched, and that is load-bearing rather than tidy.
+
+        Renormalizing the row to change_prob hands the mass taken off interior
+        targets to states 0 and 1, making it CHEAPER to leave an amplified state.
+        Measured, that cost breseq a real 108 kb IS186 amplification on
+        ltee_ara_m3_38k_se36 -- the segment broke at a 400 bp dip to CN 1 and the
+        AMP call went with it -- and grew spurious few-hundred-base CN 2
+        excursions on two other clones, which are cheaper to enter and leave for
+        the same reason.
+        """
+        old, new = self._matrices()
+        assert new[126, 1] == old[126, 1]
+        assert new[126, 0] == old[126, 0]
+
+    def test_the_removed_mass_goes_to_the_diagonal(self):
+        """An amplified state is simply more persistent: the only cheap way out
+        is unchanged, so what an interior boundary loses, staying put gains."""
+        old, new = self._matrices()
+        assert new[126, 126] > old[126, 126]
+        assert new.sum(axis=1)[126] == pytest.approx(1.0)
 
     def test_baseline_and_deletion_rows_are_untouched(self):
         """Scoped to amplified states, so an ordinary duplication call pays

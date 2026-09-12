@@ -4720,21 +4720,32 @@ def setup_transition_matrix(n_states, remain_prob, interior_change_prob=None,
     log2_states[amplified] = np.log2(states[amplified])
 
     for k in range(2, n_states):
-        weight = np.ones(n_states)
+        # Start from the row as it already is, so every BASELINE target keeps
+        # exactly `per_state_prob`. This is the whole design, and getting it
+        # wrong is not subtle: renormalizing the row to change_prob instead
+        # hands the mass taken off interior targets to states 0 and 1, which
+        # makes LEAVING an amplified state cheaper -- about 0.9 nats on a
+        # five-state grid. Measured, that cost breseq a real 108 kb IS186
+        # amplification on ltee_ara_m3_38k_se36: the segment broke at a 400 bp
+        # dip to CN 1 and the AMP call went with it, and two other LTEE clones
+        # grew spurious few-hundred-base CN 2 excursions, which are cheaper to
+        # enter and leave for the same reason. Interior boundaries were supposed
+        # to get dearer; nothing else was supposed to move.
+        row = transition[k].copy()
+
         # |log2(l/k)| is 0 at l == k, which would divide by zero. The diagonal is
         # not a target, so it is excluded rather than guarded.
         gap = np.abs(log2_states - log2_states[k])
         with np.errstate(divide="ignore", invalid="ignore"):
-            interior = r * np.exp(-penalty / gap)
-        interior[~np.isfinite(interior)] = 0.0
-        weight[amplified] = interior[amplified]
-        weight[k] = 0.0
+            factor = r * np.exp(-penalty / gap)
+        factor[~np.isfinite(factor)] = 0.0
 
-        total = weight.sum()
-        if total <= 0.0:
-            continue
-        row = change_prob * weight / total
-        row[k] = remain_prob
+        row[amplified] = per_state_prob * factor[amplified]
+        # The mass removed goes to the DIAGONAL, not to baseline: with the only
+        # cheap way out unchanged, an amplified state is simply more persistent,
+        # which is what "an interior boundary is rare" means.
+        row[k] = 0.0
+        row[k] = 1.0 - row.sum()
         transition[k] = row
 
     # np.savetxt("transition.csv", transition, delimiter=",")
