@@ -4423,7 +4423,22 @@ def fit_censored_negative_binomial(counts, offsets=None, min_windows=30,
     return mu, size
 
 
-def robust_state_count(counts, offsets, mu, min_states=5, max_states=100, support=3):
+#: Hard ceiling on the HMM's state grid. Not the grid itself: robust_state_count()
+#: sizes that from the data and only clips at this value, so a genome whose
+#: largest ratio is 3 still gets 5 states and is unaffected by where the ceiling
+#: sits. It exists to bound memory, which is linear in the grid width -- the
+#: emission matrix and the backpointers are (n_windows, n_states).
+#:
+#: It was 100, which is not a large copy number: a 991 bp tandem amplification
+#: measured at 135x came back called at exactly 100, because 100 was the largest
+#: number the Viterbi path could emit. A saturated call is worse than a coarse
+#: one -- it looks like a measurement. 500 costs nothing on a genome that does
+#: not need it, and ~270 MB on a 4.6 Mb genome that does.
+DEFAULT_MAX_COPY_NUMBER = 500
+
+
+def robust_state_count(counts, offsets, mu, min_states=5,
+                       max_states=DEFAULT_MAX_COPY_NUMBER, support=3):
     """How many copy-number states the model needs, ignoring lone spikes.
 
     Taking `int(max(coverage))` lets a SINGLE outlier window set the state space
@@ -4605,7 +4620,7 @@ def _log_emission_lookup(obs, emission_matrix):
     return logemi[:, np.asarray(obs, dtype=int)].T
 
 
-def _viterbi_forward(log_emission_obs, log_transition, log_start):
+def _viterbi_forward(log_emission_obs, log_transition, log_start, keep_scores=True):
     """Forward pass of Viterbi, keeping backpointers.
 
     `log_transition` is indexed [from, to] -- the orientation the recursion
@@ -4614,23 +4629,117 @@ def _viterbi_forward(log_emission_obs, log_transition, log_start):
 
     Returns (logv, ptr) where ptr[i, l] is the state at i-1 on the best path
     that ends in state `l` at window i. ptr[0] is unused.
+
+    With `keep_scores` the first return value is the full (n_obs, n_states)
+    score matrix; without it, only its final row -- which is all _backtrace()
+    reads. On a wide state grid that matrix is the largest array in the run
+    (180 MB at 500 states over a 4.6 Mb genome, against 90 MB of backpointers
+    that cannot be avoided), so the segment caller declines it.
     """
     log_emission_obs = np.asarray(log_emission_obs, dtype=float)
     n_obs, n_states = log_emission_obs.shape
 
-    logv = np.full((n_obs, n_states), -np.inf)
+    logv = np.full((n_obs, n_states), -np.inf) if keep_scores else None
     ptr = np.zeros((n_obs, n_states), dtype=np.int32)
 
-    logv[0] = log_start + log_emission_obs[0]
+    prev = np.asarray(log_start, dtype=float) + log_emission_obs[0]
+    if keep_scores:
+        logv[0] = prev
 
     state_idx = np.arange(n_states)
     for i in range(1, n_obs):
         # cand[k, l] = score of the best path reaching k at i-1, then k -> l
-        cand = logv[i - 1][:, None] + log_transition
+        cand = prev[:, None] + log_transition
         ptr[i] = np.argmax(cand, axis=0)
-        logv[i] = cand[ptr[i], state_idx] + log_emission_obs[i]
+        prev = cand[ptr[i], state_idx] + log_emission_obs[i]
+        if keep_scores:
+            logv[i] = prev
 
-    return logv, ptr
+    return (logv if keep_scores else prev), ptr
+
+
+def _flat_transition_params(log_transition):
+    """(log_remain, log_change) if `log_transition` is flat, else None.
+
+    setup_transition_matrix() builds exactly one shape: `remain_prob` on the
+    diagonal and `change_prob / (n_states - 1)` on every off-diagonal cell. That
+    structure collapses the recursion from O(n_states**2) per window to
+    O(n_states) -- see _viterbi_forward_flat() -- which is what makes a state
+    grid wide enough for a 100x amplification affordable.
+
+    DETECTED rather than assumed, because make_viterbi_mat() is public and takes
+    whatever transition matrix a caller hands it. Exact equality, not a
+    tolerance: every cell of a flat matrix comes from one of two floats written
+    by np.full() and a diagonal assignment, so it is flat to the bit, and a
+    tolerance would let a genuinely structured matrix take the fast path.
+    """
+    log_transition = np.asarray(log_transition, dtype=float)
+    if log_transition.ndim != 2:
+        return None
+    n, m = log_transition.shape
+    if (n != m) or (n < 2):
+        return None
+
+    diag = np.diagonal(log_transition)
+    off = log_transition[~np.eye(n, dtype=bool)]
+    if not (np.all(diag == diag[0]) and np.all(off == off[0])):
+        return None
+    return float(diag[0]), float(off[0])
+
+
+def _viterbi_forward_flat(log_emission_obs, log_start, log_remain, log_change,
+                          keep_scores=True):
+    """_viterbi_forward() for a flat transition, in O(n_states) per window.
+
+    With every off-diagonal cell equal, the best predecessor of state `l` is one
+    of two candidates: `l` itself, scored prev[l] + log_remain, or the best OTHER
+    state, scored prev[k] + log_change. Building the full (n_states, n_states)
+    `cand` to discover that is the only reason the general recursion is
+    quadratic.
+
+    "Best other" is not simply argmax(prev): the off-diagonal candidates for
+    target l exclude k == l, so when l is itself the best state the jump has to
+    come from the runner-up. Using the global best there would price an l -> l
+    transition at log_change, which is wrong whenever log_change > log_remain --
+    degenerate, but reachable through `changeprob` on a narrow grid.
+
+    Tie-breaking is the rest of the difficulty. np.argmax(cand, axis=0) returns
+    the LOWEST index attaining the maximum, so this must too, or the two paths
+    diverge on ties -- which a flat matrix makes common, since equal prev values
+    give equal candidates. The best-other index is already the lowest attaining
+    its maximum, so when the two candidates tie the answer is min(l, other).
+    """
+    log_emission_obs = np.asarray(log_emission_obs, dtype=float)
+    n_obs, n_states = log_emission_obs.shape
+
+    logv = np.full((n_obs, n_states), -np.inf) if keep_scores else None
+    ptr = np.zeros((n_obs, n_states), dtype=np.int32)
+
+    prev = np.asarray(log_start, dtype=float) + log_emission_obs[0]
+    if keep_scores:
+        logv[0] = prev
+
+    state_idx = np.arange(n_states)
+    for i in range(1, n_obs):
+        best = int(np.argmax(prev))
+        runner_up = prev.copy()
+        runner_up[best] = -np.inf
+        second = int(np.argmax(runner_up))
+
+        other = np.where(state_idx == best, second, best)
+        jump = prev[other] + log_change
+        stay = prev + log_remain
+
+        # An all -inf row leaves every comparison equal, so this lands on
+        # min(l, 0) == 0 for every state -- the column np.argmax also picks when
+        # every candidate is -inf.
+        ptr[i] = np.where(stay > jump, state_idx,
+                          np.where(stay < jump, other, np.minimum(state_idx, other)))
+        prev = np.maximum(stay, jump) + log_emission_obs[i]
+        if keep_scores:
+            logv[i] = prev
+
+    return (logv if keep_scores else prev), ptr
 
 
 def _backtrace(logv, ptr):
@@ -4641,10 +4750,15 @@ def _backtrace(logv, ptr):
     a path at all. Inside an elevated run the high-state column climbs relative
     to CN1 window by window and only overtakes at the last one, which is why an
     amplification could come out labelled `1,1,3`.
+
+    `logv` may be the full score matrix or just its final row: only that row is
+    read, which is what lets the forward pass skip building the rest.
     """
-    n_obs = logv.shape[0]
+    logv = np.asarray(logv, dtype=float)
+    last = logv[-1] if logv.ndim == 2 else logv
+    n_obs = ptr.shape[0]
     path = np.empty(n_obs, dtype=int)
-    path[-1] = int(np.argmax(logv[-1]))
+    path[-1] = int(np.argmax(last))
     for i in range(n_obs - 1, 0, -1):
         path[i - 1] = ptr[i, path[i]]
     return path
@@ -4652,8 +4766,14 @@ def _backtrace(logv, ptr):
 
 def viterbi_path(log_emission_obs, log_transition, log_start):
     """Most probable state path. See _viterbi_forward() for the conventions."""
-    logv, ptr = _viterbi_forward(log_emission_obs, log_transition, log_start)
-    return _backtrace(logv, ptr)
+    flat = _flat_transition_params(log_transition)
+    if flat is None:
+        last, ptr = _viterbi_forward(log_emission_obs, log_transition, log_start,
+                                     keep_scores=False)
+    else:
+        last, ptr = _viterbi_forward_flat(log_emission_obs, log_start, flat[0], flat[1],
+                                          keep_scores=False)
+    return _backtrace(last, ptr)
 
 
 def _default_log_start(log_transition):
@@ -4799,7 +4919,7 @@ def bias_offsets(df, bias="all"):
 
 def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
             n_states=5, changeprob=None,
-            max_copy_number=100, min_called_windows=100, bias="all",
+            max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100, bias="all",
             change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
             genome_id=None):
     """
@@ -5002,6 +5122,17 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         log_emission_obs=this_log_emission,
         emission_weight=emission_weight,
     )
+
+    # A call that lands exactly on the ceiling is not a measurement -- it is the
+    # largest number the grid could express, and every consumer downstream
+    # (breseq writes it straight into an AMP's new_copy_number) will read it as
+    # one. Say so, rather than letting it pass as a number someone fitted.
+    if write and len(copy_numbers) and (n_states >= int(max_copy_number)):
+        called_max = int(copy_numbers["State"].max())
+        if called_max >= n_states:
+            print(f"{samplename}: WARNING: copy number {called_max} is the state "
+                  f"grid's ceiling (--max-copy-number {int(max_copy_number)}), so the "
+                  f"true copy number may be higher. Re-run with a larger value.")
 
     if write:
         brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")

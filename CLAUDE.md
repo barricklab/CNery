@@ -574,10 +574,35 @@ are rejected before `get_CNV.main` creates any output directory.
 - `robust_state_count` sizes the state space from a 3-window rolling median, not `int(max(coverage))`
   — with a flat off-diagonal the switch cost carries `-log(n_states)`, so one outlier window would
   otherwise make every duplication call dearer genome-wide.
+- **`DEFAULT_MAX_COPY_NUMBER` (500) is a ceiling on that grid, not the grid.** It is the default for
+  *both* `robust_state_count(max_states=...)` and `run_HMM(max_copy_number=...)`, and must stay that
+  way: the two used to carry independent literals of 100, and because `run_HMM` always passed its own
+  value the signature that read as the authority was never consulted. That is how the ceiling stayed
+  invisible while a breseq sample's 991 bp amplification, measured at 135x, was called at exactly 100
+  — the largest state the grid held. breseq writes `prob_copy_number` straight into an AMP's
+  `new_copy_number`, so it reached the user as "991 bp x100" over a coverage plot sitting 35 copies
+  higher. `run_HMM` now says so when a call lands on the ceiling: a clipped value looks exactly like a
+  measurement, and nothing downstream can tell them apart. Raising the ceiling is free on a genome
+  that does not need it — the grid is still sized from the data — and costs memory linear in the
+  states actually used.
 - The decode is a **real Viterbi backtrace**. `make_viterbi_mat` returns forward scores only; the
   path comes from `viterbi_path`. Taking `np.argmax(logv, axis=1)` per window is *not* a path — it
   can name a state no single path passes through, which is how a 3-window amplification came out
   labelled `1,1,3`, on its lowest window. `log_transition` is indexed **`[from, to]`**.
+- **A flat transition decodes in `O(n_states)` per window, and `viterbi_path` detects that.** With one
+  value on the diagonal and one everywhere else, the best predecessor of state `l` is either `l`
+  itself (`log_remain`) or the best *other* state (`log_change`) — building the full `(n_states,
+  n_states)` `cand` to discover that is the only reason the general recursion is quadratic. Two
+  traps, both silent: the jump source must be the **runner-up** when `l` is itself the best state,
+  since the off-diagonal candidates exclude `k == l` (using the global argmax misprices an `l -> l`
+  move whenever `log_change > log_remain`, reachable with a large `changeprob` on a narrow grid); and
+  ties must break to the **lowest index**, as `np.argmax` does, or the two recursions decode
+  different — equally likely — paths and stop being substitutable. `_flat_transition_params` detects
+  flatness by exact equality rather than assuming it, because `make_viterbi_mat` is public and takes
+  whatever matrix a caller hands it. `tests/test_hmm.py::TestFlatTransitionFastPath` pins both traps.
+- `viterbi_path` passes `keep_scores=False`: `_backtrace` reads only the final row, and on a wide
+  grid the full score matrix is the largest array in the run (180 MB at 500 states over a 4.6 Mb
+  genome, against 90 MB of backpointers that cannot be avoided). `make_viterbi_mat` still keeps it.
 - `OTR_corr/<sample><seq_id>_otr_results.json` carries **`"Relative copy number"`**: this sequence's
   coverage relative to the longest sequence in the run, which reads exactly 1.0. Deliberately
   non-integral — 2.95 copies is a measurement. Computed by `relative_copy_numbers()` from the censored

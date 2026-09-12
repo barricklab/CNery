@@ -9,6 +9,7 @@ from .core import (
     relative_copy_numbers,
     DEFAULT_DELETION_COVERAGE_FRACTION,
     DEFAULT_FILE_ENDINGS,
+    DEFAULT_MAX_COPY_NUMBER,
     parse_region,
     process_multi_genome,
     resolve_coverage_inputs,
@@ -207,6 +208,23 @@ def main():
             "-w/-s no longer changes the implied biology. Read 1/rate as the "
             "expected segment length: the default 1e-06 is one copy-number "
             "boundary per megabase. Larger values give more, shorter segments."
+        ),
+    )
+    parser.add_argument(
+        "--max-copy-number",
+        action="store",
+        dest="max_copy_number",
+        default=DEFAULT_MAX_COPY_NUMBER,
+        required=False,
+        type=int,
+        help=(
+            "Highest copy number the HMM can call. This is a CEILING, not the "
+            "grid: the number of states is sized from the data, so raising this "
+            "changes nothing unless the sample really does carry a segment above "
+            "the old value. Memory is linear in the states actually used. A call "
+            "that lands exactly on the ceiling is reported as such, because it is "
+            "a clipped value rather than a measurement. Default: %d."
+            % DEFAULT_MAX_COPY_NUMBER
         ),
     )
     parser.add_argument(
@@ -484,6 +502,7 @@ def main():
                         df_deg, out_dir,
                         deletion_coverage_fraction=options.deletion_coverage_fraction,
                         bias=options.bias, change_rate=options.change_rate,
+                        max_copy_number=options.max_copy_number,
                         write=True, genome_id=genome_id,
                     )
                     # Same figures the ordinary path emits, each saying why it
@@ -551,7 +570,8 @@ def main():
             df_called = run_HMM(
                 df_corr, out_dir,
                 deletion_coverage_fraction=options.deletion_coverage_fraction,
-                bias=options.bias, change_rate=options.change_rate, write=False,
+                bias=options.bias, change_rate=options.change_rate,
+                max_copy_number=options.max_copy_number, write=False,
             )
             df_staged, cn_applied = stage_pass1(df_called)
             n_censored = int(df_staged["is_cn_variant"].sum())
@@ -640,6 +660,7 @@ def main():
             deletion_coverage_fraction=options.deletion_coverage_fraction,
             bias=options.bias,
             change_rate=options.change_rate,
+            max_copy_number=options.max_copy_number,
         )
         if "prob_copy_number_pass1" in df_cnv.columns:
             moved = int((df_cnv["prob_copy_number"].to_numpy()

@@ -371,7 +371,7 @@ $ CNery -h
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
              [-w W] [-s S] [-f F]
              [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
-             [--bias {all,none,gc,otr}]
+             [--max-copy-number MAX_COPY_NUMBER] [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -443,6 +443,15 @@ options:
                         length: the default 1e-06 is one copy-number boundary
                         per megabase. Larger values give more, shorter
                         segments.
+  --max-copy-number MAX_COPY_NUMBER
+                        Highest copy number the HMM can call. This is a
+                        CEILING, not the grid: the number of states is sized
+                        from the data, so raising this changes nothing unless
+                        the sample really does carry a segment above the old
+                        value. Memory is linear in the states actually used. A
+                        call that lands exactly on the ceiling is reported as
+                        such, because it is a clipped value rather than a
+                        measurement. Default: 500.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'

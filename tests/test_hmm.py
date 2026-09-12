@@ -22,6 +22,11 @@ from CNery.core import (
     _log_emission_lookup,
     _default_log_start,
     _segments_from_path,
+    _viterbi_forward,
+    _viterbi_forward_flat,
+    _flat_transition_params,
+    _backtrace,
+    DEFAULT_MAX_COPY_NUMBER,
 )
 
 
@@ -866,3 +871,195 @@ class TestNothingToCall:
         p, size = solve_pr(50.0, 100.0)
         assert size == pytest.approx(50.0)
         assert p == pytest.approx(0.5)
+
+
+class TestFlatTransitionFastPath:
+    """The O(n_states) recursion must decode identically to the O(n_states**2) one.
+
+    setup_transition_matrix() is flat -- one value on the diagonal, one
+    everywhere else -- which makes the best predecessor of a state one of two
+    candidates instead of all of them. That is what makes a state grid wide
+    enough for a 100x amplification affordable, but it is only safe if it agrees
+    with the general recursion on every path, ties included.
+    """
+
+    def _emission(self, n_obs, n_states, seed):
+        rng = np.random.default_rng(seed)
+        return rng.normal(size=(n_obs, n_states)) * 3.0
+
+    def _both(self, log_emission, remain_prob, n_states):
+        tm = setup_transition_matrix(n_states, remain_prob=remain_prob)
+        log_transition = np.log(tm)
+        log_start = _default_log_start(log_transition)
+        general = _backtrace(*_viterbi_forward(log_emission, log_transition, log_start))
+        flat = _flat_transition_params(log_transition)
+        assert flat is not None
+        fast = _backtrace(*_viterbi_forward_flat(log_emission, log_start, flat[0], flat[1]))
+        return general, fast
+
+    @pytest.mark.parametrize("seed", range(8))
+    def test_paths_agree_on_random_emissions(self, seed):
+        log_emission = self._emission(n_obs=120, n_states=9, seed=seed)
+        general, fast = self._both(log_emission, remain_prob=1 - 1e-4, n_states=8)
+        assert np.array_equal(general, fast)
+
+    def test_scores_agree_too(self):
+        log_emission = self._emission(n_obs=60, n_states=7, seed=11)
+        tm = setup_transition_matrix(6, remain_prob=1 - 1e-4)
+        log_transition = np.log(tm)
+        log_start = _default_log_start(log_transition)
+        logv, ptr = _viterbi_forward(log_emission, log_transition, log_start)
+        flat = _flat_transition_params(log_transition)
+        logv_fast, ptr_fast = _viterbi_forward_flat(log_emission, log_start, flat[0], flat[1])
+        assert np.array_equal(logv, logv_fast)
+        assert np.array_equal(ptr, ptr_fast)
+
+    def test_ties_break_the_same_way(self):
+        """Equal emissions make every candidate tie, so tie-breaking is the test.
+
+        np.argmax returns the LOWEST index attaining the maximum; a fast path
+        that picked any other maximiser would decode a different -- equally
+        likely, but different -- path, and the two would stop being substitutable.
+        """
+        log_emission = np.zeros((40, 6))
+        general, fast = self._both(log_emission, remain_prob=1 - 1e-4, n_states=5)
+        assert np.array_equal(general, fast)
+
+    def test_an_all_neg_inf_row_agrees(self):
+        log_emission = np.zeros((20, 5))
+        log_emission[7] = -np.inf
+        general, fast = self._both(log_emission, remain_prob=1 - 1e-4, n_states=4)
+        assert np.array_equal(general, fast)
+
+    def test_agrees_when_changing_is_likelier_than_staying(self):
+        """The degenerate case the 'best other' predecessor exists for.
+
+        The off-diagonal candidates for target l exclude k == l, so when l is
+        itself the best state the jump must come from the RUNNER-UP. Using the
+        global argmax there prices an l -> l move at log_change, which only shows
+        up as a wrong path once log_change exceeds log_remain -- reachable with a
+        large changeprob on a narrow grid, and silent everywhere else.
+        """
+        log_emission = self._emission(n_obs=80, n_states=5, seed=3)
+        general, fast = self._both(log_emission, remain_prob=0.01, n_states=4)
+        assert np.array_equal(general, fast)
+
+    def test_a_structured_transition_is_not_taken_for_flat(self):
+        """make_viterbi_mat() is public and takes any matrix; only flat ones qualify."""
+        tm = setup_transition_matrix(5, remain_prob=1 - 1e-4)
+        assert _flat_transition_params(np.log(tm)) is not None
+        tm[0, 1] *= 0.5
+        assert _flat_transition_params(np.log(tm)) is None
+
+    def test_viterbi_path_declining_scores_changes_nothing(self):
+        """viterbi_path() drops the score matrix to save memory, not to save work."""
+        log_emission = self._emission(n_obs=50, n_states=6, seed=17)
+        tm = setup_transition_matrix(5, remain_prob=1 - 1e-4)
+        log_transition = np.log(tm)
+        log_start = _default_log_start(log_transition)
+        kept, ptr = _viterbi_forward(log_emission, log_transition, log_start)
+        dropped, ptr_dropped = _viterbi_forward(log_emission, log_transition, log_start,
+                                                keep_scores=False)
+        assert dropped.shape == (log_emission.shape[1],)
+        assert np.array_equal(dropped, kept[-1])
+        assert np.array_equal(ptr, ptr_dropped)
+        assert np.array_equal(viterbi_path(log_emission, log_transition, log_start),
+                              _backtrace(kept, ptr))
+
+
+class TestCopyNumberCeiling:
+    """A call pinned at the ceiling is a clipped value, not a measurement."""
+
+    def _frame(self, n=300, amp=slice(150, 160), fold=135.0, depth=50.0, seed=7):
+        """Flat coverage with a `fold`-times block, at realistic dispersion.
+
+        Noise matters: a frame with zero variance sends run_HMM down its moment
+        fallback instead of the censored negative-binomial fit, and the fitted
+        baseline then chases the amplification instead of the single-copy level.
+        Same construction as _frame_with_partial_deletion() above.
+        """
+        rng = np.random.default_rng(seed)
+        size = 1.0 / max(0.0266 - 1.0 / depth, 1e-4)
+        level = np.full(n, 1.0)
+        level[amp] = fold
+        counts = nbinom.rvs(size, size / (size + depth * level),
+                            random_state=rng).astype(float)
+        # The MEDIAN is the single-copy level here, which is the point: a mean
+        # would be dragged up by the amplification it is supposed to measure.
+        norm = counts / np.median(counts)
+        win_st = np.arange(n) * 100
+        return pd.DataFrame({
+            "genome_id": "chr1",
+            "win_st": win_st,
+            "win_end": win_st + 100,
+            "win_len": 100,
+            "gc_percent": 0.5,
+            "read_count_cov": counts,
+            "norm_raw_cov": norm,
+            "gc_corr_norm_cov": norm,
+            "otr_gc_corr_norm_cov": norm,
+            "gc_corr_fact": np.ones(n),
+            "otr_gc_corr_fact": np.ones(n),
+            "pct_redundant": 0.0,
+            "is_redundant": False,
+            "is_deletion": False,
+        })
+
+    def test_a_135x_block_is_called_135_not_100(self, tmp_path):
+        """The case this ceiling was raised for.
+
+        On breseq sample SRR37077254 a 991 bp tandem amplification measured at
+        135x came back as exactly 100 -- the largest state the grid held. breseq
+        writes that straight into an AMP's new_copy_number, so it reached the
+        user as "991 bp x100" with a coverage plot sitting 35 copies above it.
+        """
+        called = int(run_HMM(self._frame(), str(tmp_path), write=False)
+                     ["prob_copy_number"].max())
+        # Ten windows at 135x carry real sampling error, so the tolerance is
+        # wide. What it has to exclude is the old answer: a value sitting on a
+        # round ceiling rather than anywhere near the coverage.
+        assert called != 100
+        assert called == pytest.approx(135, rel=0.12)
+
+    def test_the_ceiling_still_clips_when_asked_to(self, tmp_path):
+        out = run_HMM(self._frame(), str(tmp_path), write=False, max_copy_number=100)
+        assert int(out["prob_copy_number"].max()) == 100
+
+    def test_an_ordinary_genome_is_unaffected_by_where_the_ceiling_sits(self, tmp_path):
+        """The grid is sized from the data; the ceiling only clips it.
+
+        Raising the default must not change a sample that never approaches it --
+        n_states feeds a -log(n_states) cost into every state change, so a grid
+        that grew for no reason would cost sensitivity genome-wide.
+        """
+        df = self._frame(fold=3.0)
+        wide = run_HMM(df, str(tmp_path), write=False, max_copy_number=500)
+        narrow = run_HMM(df, str(tmp_path), write=False, max_copy_number=100)
+        assert np.array_equal(wide["prob_copy_number"].to_numpy(),
+                              narrow["prob_copy_number"].to_numpy())
+
+    def test_saturation_is_reported(self, tmp_path, capsys):
+        import os
+        out = str(tmp_path / "hmm_out")
+        os.makedirs(os.path.join(out, "CNV_csv"), exist_ok=True)
+        run_HMM(self._frame(), out, max_copy_number=100)
+        assert "ceiling" in capsys.readouterr().out
+
+    def test_a_call_below_the_ceiling_is_not_reported_as_saturated(self, tmp_path, capsys):
+        import os
+        out = str(tmp_path / "hmm_out")
+        os.makedirs(os.path.join(out, "CNV_csv"), exist_ok=True)
+        run_HMM(self._frame(fold=3.0), out)
+        assert "ceiling" not in capsys.readouterr().out
+
+    def test_the_two_ceiling_defaults_cannot_drift_apart(self):
+        """robust_state_count()'s default used to say 100 while run_HMM passed 100.
+
+        Two independent literals for one ceiling is how it stayed invisible: the
+        signature read as the authority and was never consulted.
+        """
+        import inspect
+        assert (inspect.signature(robust_state_count).parameters["max_states"].default
+                is DEFAULT_MAX_COPY_NUMBER)
+        assert (inspect.signature(run_HMM).parameters["max_copy_number"].default
+                is DEFAULT_MAX_COPY_NUMBER)
