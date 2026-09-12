@@ -4549,6 +4549,26 @@ def setup_emission_matrix(n_states, mean, variance, absmax,
 #: ~1 Mb, against the ~25-40 segments these genomes actually carry.
 DEFAULT_CHANGE_RATE = 1e-6
 
+#: Same thing for a boundary INSIDE an already-altered region -- one amplified
+#: state abutting another, with no return to single copy between them. A hundred
+#: times rarer than an ordinary boundary, because it takes two events rather than
+#: one. Same units as DEFAULT_CHANGE_RATE, converted through the same
+#: remain_prob_for_step(), so re-tiling the genome does not restate either.
+DEFAULT_INTERIOR_CHANGE_RATE = 1e-8
+
+#: Penalty in NATS for an interior boundary, per doubling: the cost of moving
+#: from copy number k to l is this divided by |log2(l/k)|. So it is 2 nats at a
+#: 2-fold change, 14 at 10%, 140 at 1% -- scale-free, so 1 -> 2 and 100 -> 200
+#: cost the same, which is what "percentage change" means.
+#:
+#: The shape is the point. Coverage at 6,600 reads/window has a counting-noise
+#: floor of 1.2%, so an HMM with no notion of fractional change will happily
+#: resolve 126 from 139 on six sigma of evidence and split one amplification into
+#: a segment and a shoulder. Which of the two it picks for any given window is
+#: arbitrary -- on SRR37077254 it split off a window reading 122 while leaving a
+#: window reading 127 alone. Distinctions that fine are not measurements.
+DEFAULT_FOLD_CHANGE_PENALTY = 2.0
+
 #: Coverage a deleted region still shows, as a fraction of the single-copy
 #: level. Measured on REL606's called deletions: mean 2.2% of baseline, 90th
 #: percentile 3.2% -- mismapping and repeat spill. It sets the mean of the
@@ -4594,18 +4614,98 @@ def remain_prob_for_step(change_rate, step):
 
 
 #Transition Matrix setup
-def setup_transition_matrix(n_states, remain_prob):
+def setup_transition_matrix(n_states, remain_prob, interior_change_prob=None,
+                            fold_change_penalty=0.0):
+    """Row-stochastic (n_states + 1) square transition matrix, states 0..n_states.
+
+    The off-diagonal used to be one number, which said that CN 0 -> CN 7 costs
+    precisely what CN 126 -> CN 139 costs. Two things are wrong with that. A
+    boundary between two already-amplified states takes two events rather than
+    one, so it is rarer; and when the two states are close in ratio it is a
+    distinction the coverage cannot support -- at 6,600 reads/window the counting
+    floor is 1.2%, so a uniform prior lets six sigma of noise split one
+    amplification into a segment and a shoulder.
+
+    Both corrections apply ONLY between two amplified states (k >= 2 and l >= 2):
+
+        r = interior_change_prob / change_prob
+
+        weight(k, l) = 1                                       if k <= 1 or l <= 1
+                     = r * exp(-penalty / |log2(l / k)|)       otherwise
+
+        transition[k, l] = change_prob * weight(k, l) / sum(weight(k, .))
+
+    Normalizing to `change_prob` keeps every row summing to 1 AND keeps the total
+    escape probability from every state at `change_prob`, so `remain_prob` still
+    means what it meant -- only where a change GOES has moved. What it moves
+    toward is the baseline: from an amplified state nearly all of the mass now
+    lands on states 0 and 1, which is the biology (a segment ends by returning to
+    single copy). It cannot cause a spurious drop to CN 1 inside an array,
+    because the CN 1 emission at 6,600x is astronomically bad.
+
+    **State 0 is exempt**, via the `k <= 1` branch: log(l / 0) is undefined, and
+    a deletion abutting an amplification is a real IS-mediated configuration
+    rather than a modelling artifact.
+
+    **Rows 0 and 1 are left uniform.** That keeps every ordinary duplication call
+    (1 -> 2) at exactly its old cost, and it leaves _default_log_start() -- which
+    reads row 1 as the start distribution -- untouched.
+
+    Neutral arguments rebuild the old matrix through the old two lines, BIT for
+    bit. That is deliberate: _flat_transition_params() detects flatness
+    structurally rather than from a flag, so the O(n_states) decode keeps
+    engaging on its own wherever these corrections are switched off.
+    """
     #include zero state:
     n_states += 1
-    
+
     change_prob = 1 - remain_prob
     per_state_prob = change_prob / (n_states - 1)
-    
+
     transition = np.full((n_states, n_states), per_state_prob)
-    
+
     for i in range(n_states):
         transition[i, i] = remain_prob
-    # np.savetxt("transition.csv", transition, delimiter=",") 
+
+    r = 1.0 if interior_change_prob is None else (
+        float(interior_change_prob) / change_prob if change_prob > 0 else 1.0)
+    r = float(np.clip(r, 0.0, 1.0))
+    penalty = float(fold_change_penalty)
+
+    # Neutral: the matrix above is already the answer, and is flat to the bit.
+    if (r == 1.0) and (penalty == 0.0):
+        # np.savetxt("transition.csv", transition, delimiter=",")
+        return transition
+
+    # Only the amplified block is reweighted, so a grid with no room for two
+    # distinct amplified states has nothing to do.
+    states = np.arange(n_states, dtype=float)
+    amplified = states >= 2.0
+    if amplified.sum() < 2:
+        return transition
+
+    log2_states = np.full(n_states, np.nan)
+    log2_states[amplified] = np.log2(states[amplified])
+
+    for k in range(2, n_states):
+        weight = np.ones(n_states)
+        # |log2(l/k)| is 0 at l == k, which would divide by zero. The diagonal is
+        # not a target, so it is excluded rather than guarded.
+        gap = np.abs(log2_states - log2_states[k])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            interior = r * np.exp(-penalty / gap)
+        interior[~np.isfinite(interior)] = 0.0
+        weight[amplified] = interior[amplified]
+        weight[k] = 0.0
+
+        total = weight.sum()
+        if total <= 0.0:
+            continue
+        row = change_prob * weight / total
+        row[k] = remain_prob
+        transition[k] = row
+
+    # np.savetxt("transition.csv", transition, delimiter=",")
     return transition
 
 def _log_emission_lookup(obs, emission_matrix):
@@ -4921,7 +5021,9 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
             n_states=5, changeprob=None,
             max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100, bias="all",
             change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
-            genome_id=None):
+            genome_id=None,
+            interior_change_rate=DEFAULT_INTERIOR_CHANGE_RATE,
+            fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY):
     """
     Viterbi copy-number calling.
 
@@ -5100,7 +5202,19 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     else:
         remain_prob = remain_prob_for_step(change_rate, step_bp)
 
-    this_transition = setup_transition_matrix(n_states, remain_prob=remain_prob)
+    # An interior boundary is priced as a rate per base, like every other
+    # boundary, so that -w/-s stays a resolution knob rather than a statement
+    # about the biology. (`changeprob` bypasses the step conversion for the
+    # ordinary rate; the interior rate still goes through it. That path has no
+    # production caller -- it is an in-process escape hatch -- so the two are
+    # allowed to disagree there rather than growing a second override.)
+    interior_change_prob = 1.0 - remain_prob_for_step(interior_change_rate, step_bp)
+
+    this_transition = setup_transition_matrix(
+        n_states, remain_prob=remain_prob,
+        interior_change_prob=interior_change_prob,
+        fold_change_penalty=fold_change_penalty,
+    )
 
     # Every observed transition is charged one step, whatever gap the censored
     # windows left. Pricing a wide repeat gap as a proportionally cheaper

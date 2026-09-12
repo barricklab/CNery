@@ -27,6 +27,9 @@ from CNery.core import (
     _flat_transition_params,
     _backtrace,
     DEFAULT_MAX_COPY_NUMBER,
+    DEFAULT_CHANGE_RATE,
+    DEFAULT_INTERIOR_CHANGE_RATE,
+    DEFAULT_FOLD_CHANGE_PENALTY,
 )
 
 
@@ -790,7 +793,15 @@ class TestUncertaintySuppressesAGcSliver:
             # measurably worse on real data.
             df["gc_corr_tau"] = np.where(
                 df["gc_corr_fact"].to_numpy() < 0.95, tau, tau / 10.0)
-        cnv = run_HMM(df, str(out_dir), write=False)
+        # The interior-boundary prior is held NEUTRAL here so these three tests
+        # keep measuring tau and only tau. It is not idle in this geometry -- the
+        # spurious sliver is CN 3 inside CN 3 reading as 4, a 1.33-fold interior
+        # step, which is exactly what that prior is for, and at defaults it
+        # suppresses 4 of these 6 seeds by itself. Two mechanisms aimed at one
+        # artifact is fine; a control that cannot say which one fired is not.
+        cnv = run_HMM(df, str(out_dir), write=False,
+                      fold_change_penalty=0.0,
+                      interior_change_rate=DEFAULT_CHANGE_RATE)
         inside = ((cnv["win_st"] >= self.AMP[0] * 100)
                   & (cnv["win_st"] < self.AMP[1] * 100)).to_numpy()
         return sorted(set(cnv.loc[inside, "prob_copy_number"].tolist())) == [3]
@@ -1063,3 +1074,204 @@ class TestCopyNumberCeiling:
                 is DEFAULT_MAX_COPY_NUMBER)
         assert (inspect.signature(run_HMM).parameters["max_copy_number"].default
                 is DEFAULT_MAX_COPY_NUMBER)
+
+
+class TestInteriorBoundaryPrior:
+    """A boundary between two amplified states is rarer, and costs more when the
+    two are close in ratio.
+
+    The flat off-diagonal said CN 0 -> CN 7 costs precisely what CN 126 -> CN 139
+    costs. At 6,600 reads/window the counting floor is 1.2%, so that let six sigma
+    of noise split one amplification into a segment and a shoulder.
+    """
+
+    STEP = 100
+
+    def _matrices(self, n=139, rate=DEFAULT_CHANGE_RATE,
+                  interior_rate=DEFAULT_INTERIOR_CHANGE_RATE,
+                  penalty=DEFAULT_FOLD_CHANGE_PENALTY):
+        remain = remain_prob_for_step(rate, self.STEP)
+        interior = 1.0 - remain_prob_for_step(interior_rate, self.STEP)
+        old = setup_transition_matrix(n, remain_prob=remain)
+        new = setup_transition_matrix(n, remain_prob=remain,
+                                      interior_change_prob=interior,
+                                      fold_change_penalty=penalty)
+        return old, new
+
+    def _extra_nats(self, old, new, k, l):
+        return float(np.log(old[k, l]) - np.log(new[k, l]))
+
+    def test_neutral_arguments_rebuild_the_old_matrix_bit_for_bit(self):
+        """Not merely close: _flat_transition_params compares with `==`.
+
+        Flatness is detected structurally rather than from a flag, so the
+        O(n_states) decode has to keep engaging on its own when these corrections
+        are off. A neutral matrix that differed in the last bit would silently
+        cost every ordinary run its fast path.
+        """
+        remain = remain_prob_for_step(DEFAULT_CHANGE_RATE, self.STEP)
+        old = setup_transition_matrix(30, remain_prob=remain)
+        neutral = setup_transition_matrix(30, remain_prob=remain,
+                                          interior_change_prob=1.0 - remain,
+                                          fold_change_penalty=0.0)
+        assert np.array_equal(old, neutral)
+        assert _flat_transition_params(np.log(neutral)) is not None
+
+    def test_the_active_matrix_is_still_a_probability_matrix(self):
+        _, new = self._matrices()
+        assert np.allclose(new.sum(axis=1), 1.0)
+        assert np.all(new >= 0.0)
+        assert np.all(np.isfinite(new))
+
+    def test_a_small_fractional_change_is_priced_out(self):
+        """The case this exists for: 126 -> 139 is a 10% step on 6,600 reads."""
+        old, new = self._matrices()
+        # Splitting that window buys ~25 nats of likelihood against a ~14 nat
+        # transition cost, so the fix has to find more than ~11.
+        assert self._extra_nats(old, new, 126, 139) > 11.0
+        # And a 1% step should be beyond any evidence a genome can supply.
+        assert self._extra_nats(old, new, 126, 127) > 100.0
+
+    def test_a_real_stepped_array_is_barely_taxed(self):
+        """A doubling is a claim the data can support; it must stay affordable."""
+        old, new = self._matrices()
+        assert self._extra_nats(old, new, 50, 100) < 5.0
+
+    def test_the_kernel_is_scale_free(self):
+        """1 -> 2 and 100 -> 200 are the same event, which is what "%" means.
+
+        Compared WITHIN one row, because the row normalizer legitimately differs
+        between rows -- state 4 and state 50 do not have the same neighbours.
+        Halving and doubling from the same state are equidistant in log space, so
+        they must come out equal.
+        """
+        _, new = self._matrices()
+        for k in (4, 8, 50):
+            assert new[k, k // 2] == pytest.approx(new[k, k * 2], rel=1e-12)
+
+    def test_returning_to_baseline_gets_cheaper_not_dearer(self):
+        """The mass taken off interior targets has to go somewhere, and it goes
+        to single copy -- which is how copy-number segments actually end."""
+        old, new = self._matrices()
+        assert self._extra_nats(old, new, 126, 1) < 0.0
+        assert self._extra_nats(old, new, 126, 0) < 0.0
+
+    def test_baseline_and_deletion_rows_are_untouched(self):
+        """Scoped to amplified states, so an ordinary duplication call pays
+        nothing -- and _default_log_start() reads row 1 as the start
+        distribution, so a changed row 1 would quietly restate that too."""
+        old, new = self._matrices()
+        assert np.array_equal(old[0], new[0])
+        assert np.array_equal(old[1], new[1])
+
+    def test_the_deletion_state_is_exempt_as_a_target(self):
+        """log(l / 0) is undefined, and a deletion abutting an amplification is a
+        real IS-mediated configuration rather than a modelling artifact."""
+        old, new = self._matrices()
+        assert self._extra_nats(old, new, 5, 0) == self._extra_nats(old, new, 5, 1)
+
+    def test_a_grid_too_narrow_to_have_an_interior_is_left_alone(self):
+        remain = remain_prob_for_step(DEFAULT_CHANGE_RATE, self.STEP)
+        interior = 1.0 - remain_prob_for_step(DEFAULT_INTERIOR_CHANGE_RATE, self.STEP)
+        for n in (1, 2):
+            plain = setup_transition_matrix(n, remain_prob=remain)
+            active = setup_transition_matrix(n, remain_prob=remain,
+                                             interior_change_prob=interior,
+                                             fold_change_penalty=2.0)
+            assert np.array_equal(plain, active)
+
+    #: The ten windows of SRR37077254's amplification, in otr_gc_corr_norm_cov --
+    #: the bias-corrected relative coverage the HMM actually decides on, not the
+    #: raw counts. The distinction matters: window 1 reads a mid-range 6446 raw
+    #: but carries the highest GC factor of the ten, so correcting it produces the
+    #: LOWEST corrected value, 122. Reproducing this from raw counts with the
+    #: offsets set to 1 loses the very window that got split off.
+    #:
+    #: Verbatim rather than simulated. Their scatter is 4.4% where a negative
+    #: binomial at 6,600 reads predicts 1.7%, and that gap IS the problem --
+    #: but ten normal draws at 4.4% routinely throw a -14% outlier, which these do
+    #: not, so a simulated frame tests a harder case than the one that occurs.
+    SRR37077254_AMP_LEVELS = [122.05, 132.31, 132.66, 134.41, 139.49,
+                              138.75, 141.40, 133.08, 132.84, 126.79]
+
+    def _amplification_frame(self, levels=None, n=300, amp_start=150,
+                             depth=48.9, size=100.0, seed=13):
+        """Flat single-copy coverage with a measured high-copy block dropped in.
+
+        `levels` are relative to single copy, and the bias offsets are left at 1,
+        so a level of 122.05 is a window the HMM should read as copy number 122.
+
+        `depth` is the run's own 48.9x. `size` is NOT: breseq fitted 51.7 on this
+        sample, but breseq's least-squares fit is not comparable to CNery's
+        truncated-likelihood one (see CLAUDE.md), and a baseline drawn at 52 sits
+        just short of splitting, so the un-penalized control below would pass for
+        the wrong reason. 100 puts the frame in the regime the real run was
+        demonstrably in -- it split there. The separation is not knife-edge: every
+        value from 80 to 250 splits without the prior and holds together with it,
+        on more than one seed.
+        """
+        levels = list(self.SRR37077254_AMP_LEVELS if levels is None else levels)
+        rng = np.random.default_rng(seed)
+        obs = nbinom.rvs(size, size / (size + depth), size=n,
+                         random_state=rng).astype(float)
+        obs[amp_start:amp_start + len(levels)] = [v * depth for v in levels]
+        norm = obs / np.median(obs)
+        win_st = np.arange(n) * 100
+        return pd.DataFrame({
+            "genome_id": "chr1",
+            "win_st": win_st,
+            "win_end": win_st + 100,
+            "win_len": 100,
+            "gc_percent": 0.5,
+            "read_count_cov": obs,
+            "norm_raw_cov": norm,
+            "gc_corr_norm_cov": norm,
+            "otr_gc_corr_norm_cov": norm,
+            "gc_corr_fact": np.ones(n),
+            "otr_gc_corr_fact": np.ones(n),
+            "pct_redundant": 0.0,
+            "is_redundant": False,
+            "is_deletion": False,
+        })
+
+    def test_a_noisy_high_copy_block_gets_one_consensus_call(self, tmp_path):
+        """On SRR37077254 this came back as 126 over one window and 139 over the
+        other nine -- and which window got split off was arbitrary, since a
+        window reading 127 was left inside while one reading 122 was not."""
+        out = run_HMM(self._amplification_frame(), str(tmp_path), write=False)
+        amplified = out.loc[out["prob_copy_number"] > 1, "prob_copy_number"]
+        assert len(amplified) == len(self.SRR37077254_AMP_LEVELS)
+        assert amplified.nunique() == 1
+
+    def test_switching_the_prior_off_brings_the_shoulder_back(self, tmp_path):
+        """Pins the cause, not just the symptom. Without this the test above
+        passes for any reason at all -- a different fitted mu, a quiet seed --
+        and stops being evidence about the prior."""
+        out = run_HMM(self._amplification_frame(), str(tmp_path), write=False,
+                      fold_change_penalty=0.0,
+                      interior_change_rate=DEFAULT_CHANGE_RATE)
+        amplified = out.loc[out["prob_copy_number"] > 1, "prob_copy_number"]
+        assert amplified.nunique() > 1
+
+    def test_a_genuine_two_level_array_is_still_split(self, tmp_path):
+        """50x abutting 100x is a doubling -- a real event, and it must survive.
+
+        Built from the model's own noise at each level rather than from injected
+        scatter: the question here is whether the prior swallows a real step, not
+        how the model handles excess dispersion.
+        """
+        depth, size = 48.9, 100.0
+        rng = np.random.default_rng(29)
+        levels = []
+        for cn in (50, 100):
+            draws = nbinom.rvs(cn * size, (cn * size) / (cn * size + cn * depth),
+                               size=10, random_state=rng).astype(float)
+            levels.extend(draws / depth)
+        # 800 windows, not the usual 300: fit_censored_negative_binomial searches
+        # upward for the mode from mean/4, and twenty windows at 50-100x drag the
+        # mean so far up on a short frame that the search starts ABOVE the single-
+        # copy mode and never finds it. The whole genome then comes back CN 3.
+        out = run_HMM(self._amplification_frame(levels=levels, n=800),
+                      str(tmp_path), write=False)
+        amplified = out.loc[out["prob_copy_number"] > 1, "prob_copy_number"]
+        assert amplified.nunique() == 2

@@ -14,6 +14,11 @@ Recent updates (latest commits):
 - **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
   number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
   Read `1/rate` as the expected segment length.
+- **Boundaries priced by fractional change** — a boundary *inside* an already-amplified region is
+  both rarer (`--interior-change-rate`) and, when the two states are close in ratio, a claim the
+  coverage cannot support (`--fold-change-penalty`, charged per doubling as `BETA / |log2(l/k)|`).
+  Without this, deep coverage resolves 126 copies from 139 on counting noise alone and reports one
+  amplification as a segment plus a shoulder.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
 
@@ -371,6 +376,8 @@ $ CNery -h
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
              [-w W] [-s S] [-f F]
              [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
+             [--interior-change-rate INTERIOR_CHANGE_RATE]
+             [--fold-change-penalty FOLD_CHANGE_PENALTY]
              [--max-copy-number MAX_COPY_NUMBER] [--bias {all,none,gc,otr}]
              [INPUT ...]
 
@@ -443,6 +450,25 @@ options:
                         length: the default 1e-06 is one copy-number boundary
                         per megabase. Larger values give more, shorter
                         segments.
+  --interior-change-rate INTERIOR_CHANGE_RATE
+                        Prior probability PER BASE of a boundary INSIDE an
+                        already-altered region -- one amplified state abutting
+                        another, with no return to single copy between them.
+                        Same units as --change-rate and converted the same way,
+                        so -w/-s does not restate it. Rarer than an ordinary
+                        boundary because it takes two events rather than one.
+                        Default: 1e-08, one per 100 Mb.
+  --fold-change-penalty FOLD_CHANGE_PENALTY
+                        Extra cost in NATS for an interior boundary, per
+                        doubling: moving from copy number k to l costs this
+                        divided by |log2(l/k)|. So it is 2 nats at a 2-fold
+                        change, 7x that at 10%, 70x at 1% -- scale-free, so
+                        1 -> 2 and 100 -> 200 cost the same. It is what stops
+                        deep coverage resolving 126 from 139 and splitting one
+                        amplification into a segment and a shoulder. Applies
+                        only between two amplified states; transitions to or
+                        from single copy and the deletion state are untouched.
+                        0 disables it. Default: 2.
   --max-copy-number MAX_COPY_NUMBER
                         Highest copy number the HMM can call. This is a
                         CEILING, not the grid: the number of states is sized

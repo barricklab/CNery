@@ -251,15 +251,36 @@ class TestFlagSpellings:
     that, because nothing exercised the flags.
     """
 
+    def test_help_renders(self, monkeypatch, capsys):
+        """`-h` is a code path, and argparse makes it a fragile one.
+
+        argparse runs `help % params` over every help string, so one literal
+        percent that is not doubled raises at -h -- for every user, on a flag
+        whose only sin is mentioning a percentage. Building a help string with
+        %-formatting halves the doubled ones before argparse ever sees them,
+        which is exactly how --fold-change-penalty shipped broken.
+        """
+        monkeypatch.setattr(sys, "argv", ["CNery", "-h"])
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+        assert exit_info.value.code == 0
+        rendered = capsys.readouterr().out
+        for flag in ("--change-rate", "--interior-change-rate",
+                     "--fold-change-penalty", "--max-copy-number"):
+            assert flag in rendered
+
     @pytest.mark.parametrize("flag", [
         "--file-ending", "--region", "-o", "--output", "-w", "--window",
         "-s", "--step-size", "-f", "--frag-size",
         "-z", "--deletion-coverage-fraction", "--bias",
+        "--interior-change-rate", "--fold-change-penalty", "--max-copy-number",
     ])
     def test_flag_is_accepted(self, flag, tmp_path, monkeypatch):
         parser_args = {
             "--file-ending": "coverage.tsv", "--region": "100-2000",
             "--bias": "none",
+            "--interior-change-rate": "1e-8", "--fold-change-penalty": "2",
+            "--max-copy-number": "50",
             # A fraction of baseline now, so the generic "100" would ask the
             # zero state to expect 100x the single-copy level.
             "-z": "0.05", "--deletion-coverage-fraction": "0.05",

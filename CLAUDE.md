@@ -572,8 +572,46 @@ are rejected before `get_CNV.main` creates any output directory.
   `w=100` against 54 at `w=200`), so `-w` remains a resolution knob. That is why the default is
   `-w 100 -s 100`: at `-w 200` the weakest two-window events stop being callable.
 - `robust_state_count` sizes the state space from a 3-window rolling median, not `int(max(coverage))`
-  — with a flat off-diagonal the switch cost carries `-log(n_states)`, so one outlier window would
-  otherwise make every duplication call dearer genome-wide.
+  — the switch cost carries `-log(n_states)` from the uniform division at `per_state_prob`, so one
+  outlier window would otherwise make every duplication call dearer genome-wide. (Still true under
+  the interior prior below: that reweights rows 2 and up, and the uniform division survives in rows
+  0 and 1 and in the normalizer everywhere else.)
+- **An interior boundary — one amplified state abutting another — is priced separately, by two
+  knobs.** `--interior-change-rate` (`DEFAULT_INTERIOR_CHANGE_RATE`, 1e-8) is a per-base rate like
+  `--change-rate`, converted through the same `remain_prob_for_step()`; `--fold-change-penalty`
+  (`DEFAULT_FOLD_CHANGE_PENALTY`, 2) charges `BETA / |log2(l/k)|` nats, i.e. per doubling, so it is
+  scale-free and 1→2 costs what 100→200 costs. Both apply **only when k ≥ 2 and l ≥ 2**.
+  - **Why it exists.** The off-diagonal was one number, so CN 0 → CN 7 cost precisely what CN 126 →
+    CN 139 cost. At 6,600 reads/window the counting floor is 1.2% and the NB adds little, so the
+    emission expects ~1.7% scatter and real coverage shows ~4.4%; a 10% shoulder then reads as six
+    sigma. On SRR37077254 that split one amplification into 126 over a single window and 139 over
+    the other nine — and arbitrarily, since a window reading 127 stayed inside while one reading
+    122 did not. Measured: the split bought ~25 nats against a ~14 nat boundary; the two knobs add
+    ~14.6 at that ratio, and ~176 at a 1% step.
+  - **Rows 0 and 1 are left uniform, deliberately.** An ordinary duplication call (1→2) pays
+    nothing, and `_default_log_start()` reads row 1 as the start distribution — reweighting it would
+    quietly restate that too. State 0 is exempt as a target for the same reason it has its own
+    emission row: `log(l/0)` is undefined, and a deletion abutting an amplification is a real
+    IS-mediated configuration.
+  - **Normalizing to `change_prob` is what keeps `remain_prob` meaning what it meant.** Every row
+    still sums to 1 and the total escape probability is unchanged; only the destination moves, and
+    it moves toward baseline (from an amplified state, returning to CN 1 gets ~4 nats *cheaper*).
+    That is the biology — segments end by returning to single copy — and it cannot cause a spurious
+    drop inside an array, because the CN 1 emission at 6,600x is astronomically bad.
+  - It is a penalty, not a prohibition, and the goldens show the difference: on
+    `ltee_ara_m3_32k_2rg` it removed the two spurious 3↔4 interior boundaries that
+    `TestUncertaintySuppressesAGcSliver` documents as a GC artifact on that very dataset, while
+    leaving the 4→3 boundary at 647501 — the same 1.33 ratio — standing, because the evidence there
+    is real. That was the only one of the eight authentic goldens to move.
+  - **It overlaps `offset_tau`**: at defaults it independently suppresses 4 of the 6 seeds in
+    `TestUncertaintySuppressesAGcSliver`, whose sliver is a 1.33-fold interior step. That class
+    therefore runs with this prior held neutral, so it still measures tau and only tau.
+  - **Neutral arguments rebuild the old matrix bit for bit**, via an explicit early return. That is
+    load-bearing, not tidiness: `_flat_transition_params` detects flatness with `==`, so a neutral
+    matrix differing in the last bit would silently cost every run its O(n_states) decode.
+  - **Cost**: at non-neutral settings the matrix is not flat, so decoding is O(n_states²) per window
+    — nothing at the usual `n_states=5`, and 41 s for the whole pipeline on a 4.6 Mb genome at
+    `n_states≈139`.
 - **`DEFAULT_MAX_COPY_NUMBER` (500) is a ceiling on that grid, not the grid.** It is the default for
   *both* `robust_state_count(max_states=...)` and `run_HMM(max_copy_number=...)`, and must stay that
   way: the two used to carry independent literals of 100, and because `run_HMM` always passed its own

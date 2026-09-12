@@ -9,6 +9,8 @@ from .core import (
     relative_copy_numbers,
     DEFAULT_DELETION_COVERAGE_FRACTION,
     DEFAULT_FILE_ENDINGS,
+    DEFAULT_FOLD_CHANGE_PENALTY,
+    DEFAULT_INTERIOR_CHANGE_RATE,
     DEFAULT_MAX_COPY_NUMBER,
     parse_region,
     process_multi_genome,
@@ -208,6 +210,46 @@ def main():
             "-w/-s no longer changes the implied biology. Read 1/rate as the "
             "expected segment length: the default 1e-06 is one copy-number "
             "boundary per megabase. Larger values give more, shorter segments."
+        ),
+    )
+    parser.add_argument(
+        "--interior-change-rate",
+        action="store",
+        dest="interior_change_rate",
+        default=DEFAULT_INTERIOR_CHANGE_RATE,
+        required=False,
+        type=float,
+        help=(
+            "Prior probability PER BASE of a boundary INSIDE an already-altered "
+            "region -- one amplified state abutting another, with no return to "
+            "single copy between them. Same units as --change-rate and converted "
+            "the same way, so -w/-s does not restate it. Rarer than an ordinary "
+            "boundary because it takes two events rather than one. Default: %g, "
+            "one per 100 Mb." % DEFAULT_INTERIOR_CHANGE_RATE
+        ),
+    )
+    parser.add_argument(
+        "--fold-change-penalty",
+        action="store",
+        dest="fold_change_penalty",
+        default=DEFAULT_FOLD_CHANGE_PENALTY,
+        required=False,
+        type=float,
+        # NOT %-formatted, unlike its neighbours: argparse runs `help % params`
+        # of its own, so a literal percent has to reach it still doubled. Doing
+        # the substitution here first would halve them and argparse would then
+        # die on "10%," with `ValueError: unsupported format character ','` --
+        # at -h, for every user, and only for the flags that mention a percentage.
+        help=(
+            "Extra cost in NATS for an interior boundary, per doubling: moving "
+            "from copy number k to l costs this divided by |log2(l/k)|. So it is "
+            f"{DEFAULT_FOLD_CHANGE_PENALTY:g} nats at a 2-fold change, 7x that at "
+            "10%%, 70x at 1%% -- scale-free, so 1 -> 2 and 100 -> 200 cost the "
+            "same. It is what stops deep coverage resolving 126 from 139 and "
+            "splitting one amplification into a segment and a shoulder. Applies "
+            "only between two amplified states; transitions to or from single "
+            "copy and the deletion state are untouched. 0 disables it. "
+            f"Default: {DEFAULT_FOLD_CHANGE_PENALTY:g}."
         ),
     )
     parser.add_argument(
@@ -503,6 +545,8 @@ def main():
                         deletion_coverage_fraction=options.deletion_coverage_fraction,
                         bias=options.bias, change_rate=options.change_rate,
                         max_copy_number=options.max_copy_number,
+                        interior_change_rate=options.interior_change_rate,
+                        fold_change_penalty=options.fold_change_penalty,
                         write=True, genome_id=genome_id,
                     )
                     # Same figures the ordinary path emits, each saying why it
@@ -571,7 +615,9 @@ def main():
                 df_corr, out_dir,
                 deletion_coverage_fraction=options.deletion_coverage_fraction,
                 bias=options.bias, change_rate=options.change_rate,
-                max_copy_number=options.max_copy_number, write=False,
+                max_copy_number=options.max_copy_number,
+                interior_change_rate=options.interior_change_rate,
+                fold_change_penalty=options.fold_change_penalty, write=False,
             )
             df_staged, cn_applied = stage_pass1(df_called)
             n_censored = int(df_staged["is_cn_variant"].sum())
@@ -661,6 +707,8 @@ def main():
             bias=options.bias,
             change_rate=options.change_rate,
             max_copy_number=options.max_copy_number,
+            interior_change_rate=options.interior_change_rate,
+            fold_change_penalty=options.fold_change_penalty,
         )
         if "prob_copy_number_pass1" in df_cnv.columns:
             moved = int((df_cnv["prob_copy_number"].to_numpy()
