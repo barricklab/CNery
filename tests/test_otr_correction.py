@@ -27,6 +27,7 @@ from CNery.core import (
     write_otr_results,
     _cnv_axis_limits,
     _cnv_axis_ticks,
+    _cnv_tick_locators,
     plot_copy,
     plottable,
     refit_gc_bias_pooled,
@@ -1271,6 +1272,20 @@ class TestCopyNumberPlotAxes:
         (lo1, _hi1), (lo2, _hi2) = _cnv_axis_limits(df, df, delta=85.0)
         assert lo1 == 0.0 and lo2 == 0.0
 
+    def test_the_floor_only_drops_below_zero_when_the_data_is_there(self):
+        """Headroom under the zero line exists so a CN-0 segment is not drawn on
+        the frame edge. Applying it unconditionally raised the floor ABOVE zero
+        on any sequence without a deletion -- 85 reads on this 170x fixture --
+        and a coverage axis that does not show zero has lost its reference."""
+        df = self._frame()
+        (_lo1, _hi1), (lo2, _hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        assert lo2 == 0.0
+
+        df.loc[:9, "read_count_cov"] = 0.0
+        df.loc[:9, "otr_gc_corr_rdcnt_cov"] = 0.0
+        (_lo1, _hi1), (lo2, _hi2) = _cnv_axis_limits(df, df, delta=85.0)
+        assert lo2 == -85.0
+
     def test_zero_coverage_is_still_inside_the_axis(self):
         """Real deletions sit at zero, and they have to remain visible."""
         df = self._frame()
@@ -1343,6 +1358,27 @@ class TestCopyNumberPlotAxes:
         (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df, df, delta=85.0)
         cn, _reads = _cnv_axis_ticks([-4, 0, 2, 1e6], lo1, hi1, lo2, hi2)
         assert all(lo1 <= t <= hi1 for t in cn)
+
+    @pytest.mark.parametrize("hi", [3.5, 12.0, 150.0, 520.0])
+    def test_the_axis_never_asks_for_more_labels_than_it_can_show(self, hi):
+        """Tick SPACING has to come from the range, not from a constant.
+
+        A fixed MultipleLocator(2) is readable on the CN 0-3 axis it was written
+        for and unreadable anywhere else: on a genome carrying a 137-copy
+        amplification it asks for 75 labels, which render as a black smear down
+        both spines -- the right one included, since _cnv_axis_ticks mirrors
+        whatever the left produces.
+        """
+        major, _minor = _cnv_tick_locators()
+        ticks = [t for t in major.tick_values(0.0, hi) if 0.0 <= t <= hi]
+        assert 2 <= len(ticks) <= 12
+        assert all(float(t).is_integer() for t in ticks)
+
+    def test_a_low_copy_axis_still_gets_every_integer(self):
+        """The CN 0-3 case is the common one and must not lose resolution."""
+        major, _minor = _cnv_tick_locators()
+        ticks = [t for t in major.tick_values(0.0, 3.5) if 0.0 <= t <= 3.5]
+        assert ticks == [0.0, 1.0, 2.0, 3.0]
 
     def test_a_degenerate_range_still_yields_ticks(self):
         cn, reads = _cnv_axis_ticks([0, 1], 0.0, 0.0, 0.0, 0.0)

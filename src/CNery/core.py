@@ -3991,6 +3991,23 @@ def plot_gc_skew(df, output, result):
     return plt_full_path
 
 
+def _cnv_tick_locators():
+    """(major, minor) locators for plot_copy's copy-number axis.
+
+    The tick spacing has to come from the RANGE, not from a constant. A fixed
+    MultipleLocator(2) is readable on the CN 0-3 axis it was written for and
+    unreadable anywhere else: on a genome carrying a 137-copy amplification it
+    asks for 75 labels per axis, which render as a black smear down both spines
+    and take the right axis with them, since _cnv_axis_ticks mirrors whatever
+    the left one produces. The same mistake cost this plot its right spine once
+    already, as a MultipleLocator(1) MINOR locator drawing one tick per read.
+
+    `integer=True` because a copy number of 2.5 is not a thing; it also keeps the
+    low-copy case at exactly the 0, 1, 2, 3 that the constant spacing gave.
+    """
+    return ticker.MaxNLocator(nbins=11, integer=True), ticker.AutoMinorLocator()
+
+
 def _cnv_axis_ticks(candidate_cn_ticks, lo1, hi1, lo2, hi2):
     """(copy-number ticks, read-count ticks) at the SAME heights.
 
@@ -4038,10 +4055,18 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
     if not shown.size:
         shown = np.array([0.0])
 
-    # Equal Delta across both axes since the zero copy was
-    # hard to see as the floor was at zero. Same scaling as the hi-limit
-    # used for the lo-limit. Needs testing against a lot of examples.
-    lo2 = float(shown.min()) - delta
+    # THE AXIS ALWAYS INCLUDES ZERO, with headroom below it only when the data
+    # actually sits there. A copy-number-0 segment drawn at exactly y=0 lands on
+    # the frame edge and is invisible, which is why the floor is padded at all;
+    # but padding it unconditionally raises the floor ABOVE zero on any sequence
+    # without a deletion -- 85 reads on the 170x fixture -- and then the plot no
+    # longer shows what the coverage is being measured against, which is the one
+    # thing a coverage axis is for.
+    #
+    # Negative read counts never reach a tick label: ax1's MultipleLocator(2)
+    # cannot place one inside the half-copy of headroom this leaves, and
+    # _cnv_axis_ticks derives the right axis from whatever survives on the left.
+    lo2 = min(0.0, float(shown.min()) - delta)
     hi2 = float(shown.max()) + delta
     return (lo2 / scale, hi2 / scale), (lo2, hi2)
 
@@ -4049,7 +4074,13 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
 def plot_copy(df_cnv, pltstart, pltend, output):
     
     genome_id = str(df_cnv["genome_id"].iloc[0])
-    samplename = sample_prefix(output) + "_" + genome_id
+    # No separator, like every other writer in this file -- run_HMM names this
+    # same sequence's CSVs `<prefix><seq_id>_CNV.csv`, and seven other plot and
+    # JSON writers agree. An underscore here made the CN plot the one output
+    # whose stem did not match its own run's CSVs (`CNV_out_REL606_...pdf`
+    # beside `CNV_outREL606_CNV.csv`), which is also what made the plot land at a
+    # name no caller expected. The title below supplies its own separator.
+    samplename = sample_prefix(output) + genome_id
     # samplename = sample.strip().split('.')[0]
     saveplt = str(output+"/CNV_plt/")
     
@@ -4158,9 +4189,10 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     ax1.set_ylim(lo1, hi1)
     ax2.set_ylim(lo2, hi2)
 
-    ax1.yaxis.set_major_locator(ticker.MultipleLocator(2))
+    major, minor = _cnv_tick_locators()
+    ax1.yaxis.set_major_locator(major)
     ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
-    ax1.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+    ax1.yaxis.set_minor_locator(minor)
 
     # THE RIGHT AXIS IS LABELLED AT THE LEFT AXIS'S TICKS, times the median depth.
     #
