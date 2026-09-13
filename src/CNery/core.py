@@ -1102,7 +1102,8 @@ def pass1_summary(otr_fit_result, df_staged):
 CN_CENSOR_MIN_KEEP = 0.5
 
 
-def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP):
+def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP,
+                  polymorphism=False, resolution=None):
     """Flag windows a previous pass's HMM did not call CN = 1, for the next pass.
 
     Writes `is_cn_variant` and folds it into `exclude_from_fit`, which is the
@@ -1129,7 +1130,31 @@ def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP):
         return df, False
 
     cn = df[cn_col].to_numpy(dtype=float)
-    is_variant = np.isfinite(cn) & (np.rint(cn) != 1)
+    if polymorphism:
+        # ONE GRID STEP, not np.rint()'s half unit and not exact equality.
+        #
+        # Exact equality was tried first and measured on the corpus: it censors
+        # 51-66% of the windows on four of the eight sequences and tips three of
+        # them past `min_keep`, which silently reverts pass 2 to pass 1's
+        # censoring. The diagnosis is in WHERE those windows sit -- almost all of
+        # them are at exactly 0.95 or 1.05, one step either side and roughly
+        # symmetric (cwbi's chromosome: 2261 windows at 1.00, 2045 at 1.05, 1938
+        # at 0.95), and the two worst sequences are the two with the strongest
+        # residual replication ramp. That is leftover GC/OTR bias being resolved
+        # at the grid's own limit, not copy number, and censoring it would strip
+        # the bias fits of exactly the windows that inform them.
+        #
+        # One step is the finest distinction the model claims to make, so a
+        # window one step off baseline is not a variant it can stand behind. The
+        # threshold is `resolution` itself rather than a new constant. The cost
+        # is explicit: a genuine subclonal event at exactly 1 +/- resolution
+        # stays in the pass-2 fits. It is by construction the smallest level the
+        # grid can express, and at that size it is not separable from residual
+        # bias anyway.
+        band = DEFAULT_CN_RESOLUTION if resolution is None else float(resolution)
+        is_variant = np.isfinite(cn) & (np.abs(cn - 1.0) > band + 1e-9)
+    else:
+        is_variant = np.isfinite(cn) & (np.rint(cn) != 1)
 
     base = np.zeros(n, dtype=bool)
     for column in ("is_deletion", "is_redundant"):
@@ -1149,7 +1174,8 @@ def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP):
     return df, True
 
 
-def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP):
+def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP, polymorphism=False,
+                resolution=None):
     """Snapshot the first pass's results and build the censor for the second.
 
     Every column the first pass produced is copied to a `*_pass1` name before the
@@ -1171,7 +1197,8 @@ def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP):
         # apply_otr_correction() never ran.
         if column in df.columns:
             df[f"{column}_pass1"] = df[column].to_numpy()
-    return add_cn_censor(df, min_keep=min_keep)
+    return add_cn_censor(df, min_keep=min_keep, polymorphism=polymorphism,
+                         resolution=resolution)
 
 
 #: Bootstrap replicates for the GC curve's pointwise uncertainty. This is a
@@ -3991,7 +4018,7 @@ def plot_gc_skew(df, output, result):
     return plt_full_path
 
 
-def _cnv_tick_locators():
+def _cnv_tick_locators(integer=True):
     """(major, minor) locators for plot_copy's copy-number axis.
 
     The tick spacing has to come from the RANGE, not from a constant. A fixed
@@ -4002,10 +4029,15 @@ def _cnv_tick_locators():
     the left one produces. The same mistake cost this plot its right spine once
     already, as a MultipleLocator(1) MINOR locator drawing one tick per read.
 
-    `integer=True` because a copy number of 2.5 is not a thing; it also keeps the
-    low-copy case at exactly the 0, 1, 2, 3 that the constant spacing gave.
+    `integer=True` keeps the low-copy case at exactly the 0, 1, 2, 3 that the
+    constant spacing gave. It used to be unconditional, on the grounds that a
+    copy number of 2.5 is not a thing -- which is exactly what polymorphism mode
+    contradicts, so the caller now decides. It DETECTS the answer from the calls
+    rather than taking a mode flag, on the same principle as
+    _flat_transition_params() and _detect_delimiter(): the data already says.
     """
-    return ticker.MaxNLocator(nbins=11, integer=True), ticker.AutoMinorLocator()
+    return (ticker.MaxNLocator(nbins=11, integer=bool(integer)),
+            ticker.AutoMinorLocator())
 
 
 def _cnv_axis_ticks(candidate_cn_ticks, lo1, hi1, lo2, hi2):
@@ -4189,9 +4221,17 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     ax1.set_ylim(lo1, hi1)
     ax2.set_ylim(lo2, hi2)
 
-    major, minor = _cnv_tick_locators()
+    # Whether the copy-number axis is integral is read off the CALLS, not off a
+    # mode flag: in consensus mode every call is an integer and this is exactly
+    # the old behaviour, while polymorphism-mode calls label to the precision
+    # the grid actually resolved. ax2 is read counts and stays "%d" either way.
+    cn_finite = cn_all[np.isfinite(cn_all)]
+    cn_is_integral = bool(cn_finite.size == 0 or np.all(cn_finite == np.rint(cn_finite)))
+    cn_format = "%d" if cn_is_integral else "%.2f"
+
+    major, minor = _cnv_tick_locators(integer=cn_is_integral)
     ax1.yaxis.set_major_locator(major)
-    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
+    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter(cn_format))
     ax1.yaxis.set_minor_locator(minor)
 
     # THE RIGHT AXIS IS LABELLED AT THE LEFT AXIS'S TICKS, times the median depth.
@@ -4210,6 +4250,7 @@ def plot_copy(df_cnv, pltstart, pltend, output):
     # run.
     ticks_cn, ticks_reads = _cnv_axis_ticks(ax1.get_yticks(), lo1, hi1, lo2, hi2)
     ax1.yaxis.set_major_locator(ticker.FixedLocator(ticks_cn))
+    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter(cn_format))
     ax2.yaxis.set_major_locator(ticker.FixedLocator(ticks_reads))
     ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter("%d"))
     ax2.yaxis.set_minor_locator(ticker.NullLocator())
@@ -4496,16 +4537,202 @@ def robust_state_count(counts, offsets, mu, min_states=5,
     return int(min(max(needed, int(min_states)), int(max_states)))
 
 
-def log_emission_with_offsets(counts, offsets, mu, size, n_states,
-                              deletion_coverage_fraction, offset_tau=None):
-    """(n_obs, n_states + 1) log emission matrix with per-window bias offsets.
+#: Default spacing of the polymorphism-mode copy-number grid, in copies. 0.05 is
+#: not a taste: at the CLI geometry the fitted dispersion gives a relative sd per
+#: window of sqrt(1/mu + 1/size) ~= 0.153, so the smallest level difference a
+#: 100-window (10 kb) segment resolves at 3 sigma is 3 * 0.153 / sqrt(100)
+#: = 0.046. 0.05 is therefore about the finest step a 10 kb event supports.
+DEFAULT_CN_RESOLUTION = 0.05
 
-    State index == copy number. Row k is NegBinom(mu = k * mu * offset_i,
-    size = k * size); scaling `size` with the state alongside the mean keeps
-    variance proportional to copy number. Row 0 is a geometric of mean
-    `deletion_coverage_fraction * mu * offset_i`, so it is the same statement
-    with k = deletion_coverage_fraction rather than a special case -- every row
-    now reads the fitted baseline and the window's bias offset.
+#: Top of the finely-spaced band. Below this the grid is `resolution`-spaced;
+#: above it the grid is the integers, refined on demand (see refine_levels()).
+#: 2.0 because that is where the user-visible question changes: between 0 and 2
+#: the interesting quantity is a continuous level, and above it the interesting
+#: quantity is which integer amplification a segment sits on.
+CN_FINE_BAND_TOP = 2.0
+
+#: Most refinement rounds run_HMM() will take. Refinement only ever adds levels
+#: around an occupied COARSE level, and after one round every occupied coarse
+#: level has been refined, so two decodes is typical and three is the ceiling.
+CN_REFINE_MAX_ROUNDS = 2
+
+#: A coarse level carrying fewer windows than this is not refined. Same argument
+#: as robust_state_count(support=3): a one-window excursion cannot pay for its
+#: own entry and exit regardless, so spending states to resolve it buys nothing.
+CN_REFINE_MIN_WINDOWS = 3
+
+#: Relative move in mu below which the baseline is considered anchored. 0.1% is
+#: far under one grid step at any usable resolution, so this stops the loop on
+#: convergence rather than on a threshold that could mask a real shift.
+CN_ANCHOR_TOL = 1e-3
+
+#: Most baseline re-anchoring rounds. The modal level converges to 1.0 in one
+#: or two rounds because each round divides the residual offset out; the cap
+#: only bounds a pathological genome with no single dominant level.
+CN_ANCHOR_MAX_ROUNDS = 3
+
+#: Hard bound on the grid width, for memory rather than for modelling. The
+#: backpointers are (n_windows, n_levels) int; at 46,000 windows 512 levels is
+#: ~94 MB, which is the budget DEFAULT_MAX_COPY_NUMBER already implies.
+CN_MAX_LEVELS = 512
+
+
+def consensus_levels(n_states):
+    """The integer copy-number grid, 0..n_states -- what the model always used.
+
+    Returning it as an explicit array rather than leaving it implicit in
+    `range()` is what lets every downstream stage stop assuming that the state
+    INDEX is the copy number. On this grid the two coincide, which is why
+    passing it changes nothing: see
+    tests/test_hmm.py::TestConsensusPathIsUnchanged.
+    """
+    return np.arange(int(n_states) + 1, dtype=float)
+
+
+def snap_cn_resolution(resolution):
+    """Round `resolution` to one that divides 1.0 exactly, as 1/round(1/r).
+
+    1.0 MUST be a grid point: _default_log_start() reads the row of level 1.0 as
+    the start distribution and add_cn_censor() tests against it exactly. A
+    resolution of 0.03 would otherwise build a grid running ... 0.99, 1.02 ...
+    with no single-copy state on it at all, which is not a subtle failure but is
+    a silent one -- every window would be called at a level near 1 and nothing
+    would ever equal 1.
+    """
+    resolution = float(resolution)
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError(f"copy-number resolution must be positive, got {resolution}")
+    steps = int(round(1.0 / resolution))
+    if steps < 2:
+        raise ValueError(
+            f"copy-number resolution {resolution} is coarser than 0.5; "
+            "there would be no level between 0 and 1"
+        )
+    return 1.0 / steps
+
+
+def polymorphism_levels(n_states, resolution, fine_band_top=CN_FINE_BAND_TOP):
+    """The continuous copy-number grid: fine to `fine_band_top`, then integers.
+
+    `resolution`-spaced over [0, fine_band_top] -- BOTH halves, [0, 1] and
+    [1, 2], because a level below single copy is as real a measurement as one
+    above it (a deletion carried by part of the population) -- then the integers
+    up to `n_states`, which refine_levels() fills in on demand.
+
+    Built with linspace per unit interval rather than arange over the whole
+    range, so 1.0 and 2.0 are exact by linspace's endpoint contract rather than
+    by luck of floating-point accumulation.
+    """
+    resolution = snap_cn_resolution(resolution)
+    steps = int(round(1.0 / resolution))
+    top = int(round(float(fine_band_top)))
+
+    bands = [np.linspace(float(u), float(u + 1), steps + 1) for u in range(top)]
+    fine = np.unique(np.concatenate(bands))
+    coarse = np.arange(float(top) + 1.0, float(int(n_states)) + 1.0)
+    return np.unique(np.concatenate([fine, coarse])) if coarse.size else fine
+
+
+def level_spacing(levels):
+    """Width each level stands for, as a central difference with full-step ends.
+
+    This is the density weight setup_transition_matrix() divides the escape mass
+    by, and the END CONVENTION IS LOAD-BEARING. On the integer grid every width
+    comes out exactly 1.0, so `change_prob * w / (sum(w) - w[k])` reduces to the
+    historical `change_prob / (n_states - 1)` BIT FOR BIT -- which is what keeps
+    every golden and the flat fast path intact. The natural-looking alternative,
+    half-width Voronoi cells at the two ends, gives 0.5 there and silently moves
+    every transition probability in the matrix. Measured: it breaks bit-identity
+    at n_states 5, 8 and 39.
+    """
+    levels = np.asarray(levels, dtype=float)
+    if levels.size < 2:
+        return np.ones(levels.size, dtype=float)
+    widths = np.empty(levels.size, dtype=float)
+    widths[0] = levels[1] - levels[0]
+    widths[-1] = levels[-1] - levels[-2]
+    widths[1:-1] = (levels[2:] - levels[:-2]) / 2.0
+    return widths
+
+
+def refine_step(level, resolution):
+    """Grid step to use when refining around `level`.
+
+    Absolute `resolution` inside the fine band, and `resolution * level / 2`
+    above it -- the same FRACTIONAL step that `resolution` represents at the top
+    of the fine band, so the two regimes agree exactly at the edge.
+
+    Relative above the band because the transition prior is scale-free: the
+    fold-change kernel charges BETA / |log2(l/k)|, which at copy number 34 prices
+    an absolute 0.05 step at 943 nats. An absolute grid there would spend ~38
+    states the prior then forbids the decode from ever using, and a uniformly
+    spaced grid under a log-spaced prior is a contradiction the decode resolves
+    by ignoring most of the grid. Relative spacing degrades into the integers
+    above copy number ~2/resolution, which is the correct limit.
+    """
+    return max(float(resolution), float(resolution) * float(level) / CN_FINE_BAND_TOP)
+
+
+def refine_levels(levels, around, resolution, max_levels=CN_MAX_LEVELS):
+    """Add a fine band around each level in `around`, at refine_step() spacing.
+
+    The band is [c - 1, c + 1]: the neighbouring integers are already grid
+    points, so the coarse decode has already preferred `c` over both of them and
+    a refined call cannot travel further than one copy without that decode
+    having said so.
+
+    Returns `levels` UNCHANGED (the same object) when there is nothing to add or
+    when the result would exceed `max_levels` -- the caller reports the decline
+    rather than silently coarsening, on the same principle as the copy-number
+    ceiling warning: a clipped grid looks exactly like a fitted one.
+    """
+    levels = np.asarray(levels, dtype=float)
+    if not len(around):
+        return levels
+
+    additions = [levels]
+    for centre in around:
+        step = refine_step(centre, resolution)
+        lo, hi = float(centre) - 1.0, float(centre) + 1.0
+        count = int(round((hi - lo) / step))
+        if count < 2:
+            continue
+        additions.append(np.linspace(lo, hi, count + 1))
+
+    if len(additions) == 1:
+        return levels
+
+    refined = np.unique(np.concatenate(additions))
+    refined = refined[refined >= 0.0]
+    if refined.size > int(max_levels):
+        return levels
+    # A band can land entirely on levels the grid already has -- which is the
+    # normal outcome high up, where refine_step() is coarser than the integers.
+    # Returning the same object rather than an equal copy is what lets the
+    # caller tell "nothing to do" from "grid grew" and skip a wasted decode.
+    if refined.size == levels.size and np.array_equal(refined, levels):
+        return levels
+    return refined
+
+
+def log_emission_with_offsets(counts, offsets, mu, size, n_states=None,
+                              deletion_coverage_fraction=None, offset_tau=None,
+                              levels=None):
+    """(n_obs, n_levels) log emission matrix with per-window bias offsets.
+
+    The grid is `levels`: row j is NegBinom(mu = levels[j] * mu * offset_i,
+    size = levels[j] * size); scaling `size` with the level alongside the mean
+    keeps variance proportional to copy number. Row 0 is level 0.0, a geometric
+    of mean `deletion_coverage_fraction * mu * offset_i`, so it is the same
+    statement with k = deletion_coverage_fraction rather than a special case --
+    every row now reads the fitted baseline and the window's bias offset.
+
+    Passing `n_states` instead builds consensus_levels(n_states), the integer
+    grid, where the row INDEX equals the copy number -- the assumption this
+    function used to make everywhere. The arithmetic was always continuous in
+    the state value; only the `range()` was integral, so evaluating it on the
+    integer grid reproduces the old matrix bit for bit (asserted by
+    tests/test_hmm.py::TestConsensusPathIsUnchanged).
 
     That matters because the zero state used to be `geom.pmf(count + 1,
     1 - error_rate)`, a geometric of mean `error_rate / (1 - error_rate)` =
@@ -4518,10 +4745,18 @@ def log_emission_with_offsets(counts, offsets, mu, size, n_states,
     the offsets vary per window, which no shared table can express. It also
     removes the table's `absmax` ceiling and the read-count clipping that fed it.
     """
+    if (n_states is None) == (levels is None):
+        raise ValueError("pass exactly one of n_states= or levels=")
+    if deletion_coverage_fraction is None:
+        raise ValueError("deletion_coverage_fraction is required")
+    if levels is None:
+        levels = consensus_levels(n_states)
+    levels = np.asarray(levels, dtype=float)
+
     counts = np.asarray(counts, dtype=float)
     offsets = np.asarray(offsets, dtype=float)
 
-    out = np.empty((counts.size, n_states + 1), dtype=float)
+    out = np.empty((counts.size, levels.size), dtype=float)
 
     # The floor is load-bearing, not defensive: on an all-zero frame the
     # censored fit declines and run_HMM falls back to moments, where mu is 0.
@@ -4546,11 +4781,13 @@ def log_emission_with_offsets(counts, offsets, mu, size, n_states,
         if not np.any(tau2 > 0):
             tau2 = None
 
-    for state in range(1, n_states + 1):
+    for column, state in enumerate(levels):
+        if column == 0:
+            continue                      # level 0.0 is the geometric row above
         state_size = state * size
         if tau2 is not None:
             state_size = state_size / (1.0 + state_size * tau2)
-        out[:, state] = _nb_logpmf_mu(counts, state * mu * offsets, state_size)
+        out[:, column] = _nb_logpmf_mu(counts, state * mu * offsets, state_size)
 
     out[~np.isfinite(out)] = -np.inf
     return out
@@ -4646,8 +4883,8 @@ def remain_prob_for_step(change_rate, step):
 
 
 #Transition Matrix setup
-def setup_transition_matrix(n_states, remain_prob, interior_change_prob=None,
-                            fold_change_penalty=0.0):
+def setup_transition_matrix(n_states=None, remain_prob=None, interior_change_prob=None,
+                            fold_change_penalty=0.0, levels=None):
     """Row-stochastic (n_states + 1) square transition matrix, states 0..n_states.
 
     The off-diagonal used to be one number, which said that CN 0 -> CN 7 costs
@@ -4688,6 +4925,19 @@ def setup_transition_matrix(n_states, remain_prob, interior_change_prob=None,
     structurally rather than from a flag, so the O(n_states) decode keeps
     engaging on its own wherever these corrections are switched off.
     """
+    if (n_states is None) == (levels is None):
+        raise ValueError("pass exactly one of n_states= or levels=")
+    if levels is not None:
+        return _levelled_transition_matrix(
+            levels, remain_prob, interior_change_prob, fold_change_penalty)
+
+    # ---- consensus mode: the integer grid, byte for byte as it always was ----
+    # This body is deliberately NOT routed through _levelled_transition_matrix()
+    # even though that function reproduces it exactly on the integer grid (see
+    # its docstring). _flat_transition_params() detects flatness with ==, so a
+    # neutral matrix differing in the last bit would silently cost every
+    # ordinary run its O(n_states) decode. Keeping the historical two lines
+    # where they are makes that impossible rather than merely unlikely.
     #include zero state:
     n_states += 1
 
@@ -4750,6 +5000,81 @@ def setup_transition_matrix(n_states, remain_prob, interior_change_prob=None,
 
     # np.savetxt("transition.csv", transition, delimiter=",")
     return transition
+
+
+def _levelled_transition_matrix(levels, remain_prob, interior_change_prob,
+                                fold_change_penalty):
+    """setup_transition_matrix() over an arbitrary, possibly non-uniform grid.
+
+    The escape mass is divided by LEVEL SPACING rather than by state count:
+
+        transition[k, l] = change_prob * w(l) / sum_{l != k} w(l)
+
+    with `w` from level_spacing(). On the integer grid every `w` is 1.0 and this
+    is exactly `change_prob / (n_states - 1)`, the historical off-diagonal, bit
+    for bit -- so this is not a new prior, it is the old one written in units
+    that survive a non-uniform grid.
+
+    Two things go wrong if the mass is divided by the state COUNT instead. A
+    finer grid would make every change dearer by -log(K), so the prior would
+    depend on the resolution rather than on the data -- measured, widening the
+    grid from 6 to 140 levels costs a segment 21.6 -> 28.3 nats. Worse, it would
+    break the refinement loop: `sum(w)` is the grid's SPAN, not its count, so
+    adding levels INSIDE the existing range leaves every other transition's
+    price untouched and refinement stays a local perturbation. Under
+    count-weighting, refining one band would re-price every transition in the
+    genome, and a segment megabases away could change call as a pure resolution
+    artifact -- indistinguishable, in the output, from data.
+
+    The interior discount and the fold-change kernel are unchanged, including
+    their scope: they apply only between two levels at or above 2.0. Extending
+    the kernel down to baseline was measured and rejected -- it is not needed
+    (46,000 windows of flat synthetic coverage on the r=0.05 grid come back
+    100% at level 1.0 in a single segment either way) and it triples the
+    evidence a real 1.05 segment must produce before it can be called.
+    """
+    levels = np.asarray(levels, dtype=float)
+    n = levels.size
+    change_prob = 1 - remain_prob
+    widths = level_spacing(levels)
+    total = widths.sum()
+
+    transition = np.empty((n, n), dtype=float)
+    for k in range(n):
+        transition[k] = change_prob * widths / (total - widths[k])
+        transition[k, k] = remain_prob
+
+    r = 1.0 if interior_change_prob is None else (
+        float(interior_change_prob) / change_prob if change_prob > 0 else 1.0)
+    r = float(np.clip(r, 0.0, 1.0))
+    penalty = float(fold_change_penalty)
+    if (r == 1.0) and (penalty == 0.0):
+        return transition
+
+    amplified = levels >= 2.0
+    if amplified.sum() < 2:
+        return transition
+
+    log2_levels = np.full(n, np.nan)
+    log2_levels[amplified] = np.log2(levels[amplified])
+
+    for k in np.flatnonzero(amplified):
+        base = transition[k].copy()
+        gap = np.abs(log2_levels - log2_levels[k])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            factor = r * np.exp(-penalty / gap)
+        factor[~np.isfinite(factor)] = 0.0
+
+        row = base
+        row[amplified] = base[amplified] * factor[amplified]
+        # As in the integer path, the mass removed goes to the DIAGONAL rather
+        # than to baseline, so leaving an amplified state costs what it did.
+        row[k] = 0.0
+        row[k] = 1.0 - row.sum()
+        transition[k] = row
+
+    return transition
+
 
 def _log_emission_lookup(obs, emission_matrix):
     """Select log emission probabilities for `obs` from a (state, count) table.
@@ -4919,7 +5244,7 @@ def viterbi_path(log_emission_obs, log_transition, log_start):
     return _backtrace(last, ptr)
 
 
-def _default_log_start(log_transition):
+def _default_log_start(log_transition, levels=None):
     """Start distribution: the reference is entered from copy number 1.
 
     Window 0 therefore contributes its own emission and may differ from CN1 at
@@ -4927,7 +5252,15 @@ def _default_log_start(log_transition):
     old `logv[0, 1] = log(1e-100)`. That matters for a circularly permuted
     reference, which can begin inside a deletion.
     """
-    return log_transition[1, :].copy()
+    if levels is None:
+        return log_transition[1, :].copy()
+    # The row of LEVEL 1.0, which on the integer grid is row 1. polymorphism_
+    # levels() guarantees 1.0 is on the grid exactly (see snap_cn_resolution),
+    # so this lookup cannot miss.
+    baseline = np.flatnonzero(np.asarray(levels, dtype=float) == 1.0)
+    if baseline.size == 0:
+        raise ValueError("the copy-number grid has no level 1.0")
+    return log_transition[int(baseline[0]), :].copy()
 
 
 #Make Viterbi Matrtix
@@ -4946,8 +5279,18 @@ def make_viterbi_mat(obs, transition_matrix, emission_matrix):
     return logv
 
 
-def _segments_from_path(path, win_st, win_end, chr_length):
-    """Collapse a per-window state path into Startpos/Endpos/State rows."""
+def _segments_from_path(path, win_st, win_end, chr_length, levels=None):
+    """Collapse a per-window state path into Startpos/Endpos/State rows.
+
+    `levels` maps the path's state INDEX to the copy-number level it stands for.
+    With `levels=None` the index is written straight through, which is the
+    integer grid's identity mapping and keeps `State` an int -- eight goldens
+    and breseq's Genome Diff parse both depend on that. The run-length break
+    below stays a comparison of path INDICES either way, so it is exact
+    regardless of what the levels are.
+    """
+    def _level(state):
+        return state if levels is None else levels[state]
     def _at(seq, i):
         return seq.iloc[i] if hasattr(seq, "iloc") else seq[i]
 
@@ -4974,7 +5317,7 @@ def _segments_from_path(path, win_st, win_end, chr_length):
             rows.append({
                 "Startpos": start_pos,
                 "Endpos": _at(win_end, i - 1),
-                "State": prev_state,
+                "State": _level(prev_state),
             })
             start_pos = _at(win_st, i)
         prev_state = state
@@ -4982,14 +5325,14 @@ def _segments_from_path(path, win_st, win_end, chr_length):
     rows.append({
         "Startpos": start_pos,
         "Endpos": chr_length,
-        "State": prev_state,
+        "State": _level(prev_state),
     })
 
     return pd.DataFrame(rows, columns=["Startpos", "Endpos", "State"])
 
 
 def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, chr_length,
-                    *, log_emission_obs=None, emission_weight=1.0):
+                    *, log_emission_obs=None, emission_weight=1.0, levels=None):
     """Segment the genome by Viterbi decoding.
 
     `log_emission_obs` lets a caller supply a per-window (n_obs, n_states) log
@@ -5004,11 +5347,18 @@ def HMM_copy_number(obs, transition_matrix, emission_matrix, win_st, win_end, ch
         log_emission_obs = _log_emission_lookup(obs, emission_matrix)
     log_emission_obs = np.asarray(log_emission_obs, dtype=float) * float(emission_weight)
 
-    log_transition = np.log(transition_matrix)
+    # A forbidden transition is an exact 0 and log(0) = -inf is the right
+    # answer for it, so the divide-by-zero warning is noise rather than news.
+    # The fine grid makes it routine: the fold-change kernel charges ~943 nats
+    # for an interior step between adjacent refined levels, and exp(-943)
+    # underflows to exactly 0.
+    with np.errstate(divide="ignore"):
+        log_transition = np.log(transition_matrix)
     path = viterbi_path(
-        log_emission_obs, log_transition, _default_log_start(log_transition)
+        log_emission_obs, log_transition,
+        _default_log_start(log_transition, levels=levels),
     )
-    return _segments_from_path(path, win_st, win_end, chr_length)
+    return _segments_from_path(path, win_st, win_end, chr_length, levels=levels)
 
 
 #: which correction factors compose the emission offset, per --bias mode.
@@ -5060,13 +5410,98 @@ def bias_offsets(df, bias="all"):
     return offsets
 
 
+def _called_levels_per_window(segments, win_st):
+    """The level each observation window was called at, from the segment table."""
+    win_st = np.asarray(win_st)
+    out = np.full(win_st.size, np.nan)
+    for row in segments.itertuples():
+        inside = (win_st >= int(row.Startpos)) & (win_st < int(row.Endpos))
+        out[inside] = float(row.State)
+    return out
+
+
+def _baseline_mu(segments, win_st, counts, offsets):
+    """Re-estimate the single-copy count from the windows on the modal level.
+
+    The modal level is weighted by WINDOWS rather than by segment count: one
+    long baseline is the genome's single-copy level even when a dozen short
+    segments disagree. Its mu is then the CONTINUOUS MLE over those windows,
+    `sum(counts) / sum(offsets)`, not the quantized level itself -- anchoring on
+    the grid value overshoots, because the level is only accurate to half a step
+    and the correction then lands on the far side. Measured: quantized anchoring
+    left a 30% block at 1.10 with 51% of the genome off baseline, where the MLE
+    converges in one round.
+
+    Returns None when there is nothing to anchor on.
+    """
+    called = _called_levels_per_window(segments, win_st)
+    finite = np.isfinite(called) & (called > 0)
+    if not finite.any():
+        return None
+    values, counts_ = np.unique(called[finite], return_counts=True)
+    modal = float(values[counts_.argmax()])
+
+    on_mode = finite & (called == modal)
+    denom = np.asarray(offsets, dtype=float)[on_mode].sum()
+    if denom <= 0:
+        return None
+    return float(np.asarray(counts, dtype=float)[on_mode].sum() / denom)
+
+
+def _levels_wanting_refinement(segments, win_st, counts, offsets, mu, levels,
+                               resolution, already, min_windows=CN_REFINE_MIN_WINDOWS):
+    """Which COARSE levels carry a segment whose own data wants a finer grid.
+
+    Two conditions, and the second is the loop's termination argument rather
+    than a heuristic:
+
+    1. The segment spans at least `min_windows` windows. Same reasoning as
+       robust_state_count(support=3) -- a one-window excursion cannot pay for
+       its own entry and exit whatever the grid, so refining around it spends
+       states for nothing.
+    2. The segment's own level estimate wants to move. At fixed dispersion the
+       level MLE is just the pooled ratio, `sum(counts) / (mu * sum(offsets))`.
+       Refine only when it sits further than half a step from the call. If it
+       does NOT, the current level is already the nearest point of the grid we
+       would add, so refinement PROVABLY cannot change the call -- which is what
+       stops a clean CN 3 amplification buying 25 states to confirm it is 3.
+
+    Only levels above the fine band are considered, and a level already refined
+    is never revisited, so the loop terminates by construction.
+    """
+    if not len(segments):
+        return ()
+
+    coarse = set()
+    win_st = np.asarray(win_st)
+    counts = np.asarray(counts, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+
+    for row in segments.itertuples():
+        level = float(row.State)
+        if level <= CN_FINE_BAND_TOP or level in already:
+            continue
+        inside = (win_st >= int(row.Startpos)) & (win_st < int(row.Endpos))
+        if inside.sum() < min_windows:
+            continue
+        denom = mu * offsets[inside].sum()
+        if denom <= 0:
+            continue
+        mle = counts[inside].sum() / denom
+        if abs(mle - level) > refine_step(level, resolution) / 2.0:
+            coarse.add(level)
+
+    return tuple(sorted(coarse))
+
+
 def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
-            n_states=5, changeprob=None,
+            changeprob=None,
             max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100, bias="all",
             change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
             genome_id=None,
             interior_change_rate=DEFAULT_INTERIOR_CHANGE_RATE,
-            fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY):
+            fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY,
+            polymorphism=False, cn_resolution=DEFAULT_CN_RESOLUTION, refine=True):
     """
     Viterbi copy-number calling.
 
@@ -5169,11 +5604,12 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     # fallback below is a live and correct path.
     if len(new_exp) == 0 or counts_all.max(initial=0.0) <= 0:
         new_exp = new_exp.reset_index(drop=True)
-        new_exp.loc[:, "prob_copy_number"] = np.zeros(len(new_exp), dtype=int)
+        new_exp["prob_copy_number"] = np.zeros(
+            len(new_exp), dtype=float if polymorphism else int)
         if write:
             empty_breaks = pd.DataFrame(
                 {"Startpos": pd.Series(dtype=int),
-                 "State": pd.Series(dtype=int),
+                 "State": pd.Series(dtype=float if polymorphism else int),
                  "Segment_Size": pd.Series(dtype=int)}
             )
             # Three columns, header row, no data. breseq asserts the column
@@ -5232,12 +5668,6 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         counts, offsets, mu, min_states=5, max_states=int(max_copy_number)
     )
 
-    this_log_emission = log_emission_with_offsets(
-        counts, offsets, mu=mu, size=size,
-        n_states=n_states,
-        deletion_coverage_fraction=deletion_coverage_fraction,
-        offset_tau=offset_tau(new_exp, bias=bias)[called],
-    )
     step_bp, window_bp = window_geometry(new_exp)
 
     if changeprob is not None:
@@ -5253,41 +5683,121 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     # allowed to disagree there rather than growing a second override.)
     interior_change_prob = 1.0 - remain_prob_for_step(interior_change_rate, step_bp)
 
-    this_transition = setup_transition_matrix(
-        n_states, remain_prob=remain_prob,
-        interior_change_prob=interior_change_prob,
-        fold_change_penalty=fold_change_penalty,
-    )
-
     # Every observed transition is charged one step, whatever gap the censored
     # windows left. Pricing a wide repeat gap as a proportionally cheaper
     # crossing would make a censored repeat a cheap place to break a segment --
     # exactly what censoring them was meant to prevent.
     emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
 
-    # HMM_copy_number indexes win_st/win_end positionally, so the
-    # censored subset can be passed straight through. chr_length stays
-    # the genome end over ALL windows -- the last segment must reach it
-    # even if the final window is censored.
-    copy_numbers = HMM_copy_number(
-        counts,
-        this_transition,
-        None,
-        obs_exp["win_st"],
-        obs_exp["win_end"],
-        new_exp["win_end"].max(),
-        log_emission_obs=this_log_emission,
-        emission_weight=emission_weight,
-    )
+    window_tau = offset_tau(new_exp, bias=bias)[called]
+
+    # ---- The grid, and (in polymorphism mode) the refinement loop -----------
+    # Nothing above this point depends on the grid: the censored negative
+    # binomial, the offsets, the window geometry and the transition rates are
+    # all fitted once, and only emission -> transition -> decode re-runs.
+    #
+    # In consensus mode `levels` is the integer grid and the loop runs once,
+    # taking exactly the path it always took.
+    levels = (polymorphism_levels(n_states, cn_resolution) if polymorphism
+              else consensus_levels(n_states))
+    # Refinement rounds plus baseline re-anchoring rounds. Both are bounded and
+    # both are no-ops once converged, so the cap is a backstop, not a schedule.
+    rounds = 1
+    if polymorphism:
+        rounds = CN_ANCHOR_MAX_ROUNDS + 1
+        if refine:
+            rounds += CN_REFINE_MAX_ROUNDS
+    refined_around = ()
+
+    for round_no in range(rounds):
+        this_log_emission = log_emission_with_offsets(
+            counts, offsets, mu=mu, size=size,
+            levels=levels,
+            deletion_coverage_fraction=deletion_coverage_fraction,
+            offset_tau=window_tau,
+        )
+        this_transition = setup_transition_matrix(
+            remain_prob=remain_prob,
+            interior_change_prob=interior_change_prob,
+            fold_change_penalty=fold_change_penalty,
+            levels=levels,
+        )
+
+        # HMM_copy_number indexes win_st/win_end positionally, so the
+        # censored subset can be passed straight through. chr_length stays
+        # the genome end over ALL windows -- the last segment must reach it
+        # even if the final window is censored.
+        copy_numbers = HMM_copy_number(
+            counts,
+            this_transition,
+            None,
+            obs_exp["win_st"],
+            obs_exp["win_end"],
+            new_exp["win_end"].max(),
+            log_emission_obs=this_log_emission,
+            emission_weight=emission_weight,
+            # None in consensus mode, so the path INDEX is written straight
+            # through and `State` stays an int64. The values are identical
+            # either way -- index == copy number on the integer grid -- but the
+            # dtype is part of the contract: breseq parses State into an AMP's
+            # new_copy_number, and eight goldens compare with no tolerance.
+            levels=levels if polymorphism else None,
+        )
+
+        if round_no == rounds - 1:
+            break
+
+        # ---- Re-anchor the baseline on the calls, before refining -----------
+        # fit_censored_negative_binomial() censors to [0.5, 1.5] x mode, which
+        # excludes an integer amplification but CANNOT exclude a subclonal one:
+        # a level of 1.1-1.5 lies inside that band by construction, so the very
+        # events this mode exists to find are the ones that bias its baseline.
+        # Measured on synthetic coverage with the truth known, a 20% block at
+        # 1.30 pulls the fitted mu 4.4% high and a 30% block at 1.10 pulls it
+        # 2.6% high, which on a fine grid shows up as the WHOLE genome being
+        # called off single copy (100% and 51% of windows respectively).
+        #
+        # The genome's modal level is single copy -- the same assumption
+        # _censor_bounds() already makes when it searches for a mode -- so
+        # folding that level into mu and decoding again is an alternating
+        # conditional fit, exactly like the pooled GC refit between the two
+        # pipeline passes. It is a no-op once the mode lands on 1.0, which is
+        # the loop's other exit.
+        if polymorphism:
+            anchored = _baseline_mu(
+                copy_numbers, obs_exp["win_st"].to_numpy(), counts, offsets)
+            if anchored is not None and anchored > 0 and mu > 0 and (
+                    abs(anchored / mu - 1.0) > CN_ANCHOR_TOL):
+                mu = anchored
+                continue
+
+        if not refine:
+            break
+        wanted = _levels_wanting_refinement(
+            copy_numbers, obs_exp["win_st"].to_numpy(), counts, offsets, mu,
+            levels, cn_resolution, refined_around,
+        )
+        if not wanted:
+            break
+        grown = refine_levels(levels, wanted, cn_resolution)
+        if grown is levels:
+            if write:
+                print(f"{samplename}: WARNING: copy-number grid refinement around "
+                      f"{', '.join(f'{c:g}' for c in wanted)} would exceed "
+                      f"{CN_MAX_LEVELS} levels and was declined; those segments "
+                      f"keep their integer call.")
+            break
+        levels = grown
+        refined_around = tuple(sorted(set(refined_around) | set(wanted)))
 
     # A call that lands exactly on the ceiling is not a measurement -- it is the
     # largest number the grid could express, and every consumer downstream
     # (breseq writes it straight into an AMP's new_copy_number) will read it as
     # one. Say so, rather than letting it pass as a number someone fitted.
-    if write and len(copy_numbers) and (n_states >= int(max_copy_number)):
-        called_max = int(copy_numbers["State"].max())
-        if called_max >= n_states:
-            print(f"{samplename}: WARNING: copy number {called_max} is the state "
+    if write and len(copy_numbers) and (levels[-1] >= int(max_copy_number)):
+        called_max = float(copy_numbers["State"].max())
+        if called_max >= levels[-1]:
+            print(f"{samplename}: WARNING: copy number {called_max:g} is the state "
                   f"grid's ceiling (--max-copy-number {int(max_copy_number)}), so the "
                   f"true copy number may be higher. Re-run with a larger value.")
 
@@ -5309,12 +5819,23 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
             (new_exp["win_st"] >= int(cnrow.Startpos))
             & (new_exp["win_st"] < int(cnrow.Endpos))
         )
-        CN_HMM[in_segment] = int(cnrow.State)
+        CN_HMM[in_segment] = (float(cnrow.State) if polymorphism
+                              else int(cnrow.State))
 
     # Windows on a segment boundary can fall outside every half-open
     # interval; carry the neighbouring call across rather than leaving a
     # hole.
-    new_exp.loc[:, "prob_copy_number"] = CN_HMM.ffill().bfill().astype(int)
+    # Integral in consensus mode -- eight goldens, breseq's Genome Diff and a
+    # dozen `== 1` assertions all read it as an int. In polymorphism mode the
+    # whole point is that it is not, so the cast is dropped rather than widened.
+    filled = CN_HMM.ffill().bfill()
+    # Plain __setitem__, not .loc[:, ...]. The incoming frame usually ALREADY
+    # carries prob_copy_number -- stage_pass1() snapshots it, so pass 2 is handed
+    # pass 1's column -- and .loc[:, col] takes pandas' in-place setitem path,
+    # which refuses to put a float level into an int64 column and raises
+    # LossySetitemError. __setitem__ replaces the column, dtype included, and
+    # keeps its position, so CNV.csv's column order is unchanged.
+    new_exp["prob_copy_number"] = filled if polymorphism else filled.astype(int)
 
     new_exp = new_exp.reset_index(drop=True)
 

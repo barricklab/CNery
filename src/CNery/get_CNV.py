@@ -11,6 +11,7 @@ from .core import (
     DEFAULT_FILE_ENDINGS,
     DEFAULT_FOLD_CHANGE_PENALTY,
     DEFAULT_INTERIOR_CHANGE_RATE,
+    DEFAULT_CN_RESOLUTION,
     DEFAULT_MAX_COPY_NUMBER,
     parse_region,
     process_multi_genome,
@@ -28,6 +29,7 @@ from .core import (
     pass1_summary,
     refit_gc_bias_pooled,
     select_frag_size,
+    snap_cn_resolution,
     stage_pass1,
     plot_otr_corr,
     predict_ori_ter_from_skew,
@@ -270,6 +272,40 @@ def main():
         ),
     )
     parser.add_argument(
+        "-p", "--polymorphism-mode",
+        action="store_true",
+        dest="polymorphism",
+        required=False,
+        help=(
+            "Call a CONTINUOUS copy number instead of an integer one. The HMM "
+            "decodes over a grid of coverage levels spaced by "
+            "--copy-number-resolution, finely between 0 and 2 and on the "
+            "integers above, refined where a segment's own data asks for it. A "
+            "level is a measured relative depth and asserts no mechanism: 1.3 "
+            "may be a subpopulation carrying a duplication, a mixed sample, or "
+            "aneuploidy, and this mode does not claim to tell them apart. "
+            "NOTE the copy number written to break_pts.csv is fractional in "
+            "this mode, which breseq cannot read; consensus mode is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--copy-number-resolution",
+        action="store",
+        dest="cn_resolution",
+        default=None,
+        required=False,
+        type=float,
+        help=(
+            "Spacing of the copy-number grid under -p, in copies: %g means the "
+            "finest level above single copy is 1%s. Rounded to one that divides "
+            "1.0 exactly, so single copy is always on the grid. The default is "
+            "about the finest step a 10 kb event supports at the default "
+            "windowing. Default: %g."
+            % (DEFAULT_CN_RESOLUTION, ("%g" % DEFAULT_CN_RESOLUTION).lstrip("0"),
+               DEFAULT_CN_RESOLUTION)
+        ),
+    )
+    parser.add_argument(
         "--bias",
         choices=["all", "none", "gc", "otr"],
         default="all",
@@ -282,6 +318,37 @@ def main():
 
     # Parse the command line arguments
     options = parser.parse_args()
+
+    # --copy-number-resolution only means anything under -p. Silently handing a
+    # user integer calls after they asked for a resolution would be the wrong
+    # kind of forgiving, so say so, the way a bad --region is rejected below.
+    if options.cn_resolution is not None and not options.polymorphism:
+        parser.error(
+            "--copy-number-resolution only applies with -p/--polymorphism-mode"
+        )
+    cn_resolution = (DEFAULT_CN_RESOLUTION if options.cn_resolution is None
+                     else options.cn_resolution)
+    if options.polymorphism:
+        try:
+            cn_resolution = snap_cn_resolution(cn_resolution)
+        except ValueError as exc:
+            parser.error(str(exc))
+        # The copy-number-0 emission sits at `-z` x baseline. If that lands on
+        # or above the first grid level the deletion state and a real level are
+        # competing to explain the same coverage, which is a modelling collision
+        # rather than a preference.
+        if options.deletion_coverage_fraction >= cn_resolution:
+            parser.error(
+                "-z/--deletion-coverage-fraction (%g) must be below "
+                "--copy-number-resolution (%g), or the copy-number-0 state "
+                "collides with the first grid level"
+                % (options.deletion_coverage_fraction, cn_resolution)
+            )
+        if cn_resolution != (options.cn_resolution
+                             if options.cn_resolution is not None
+                             else DEFAULT_CN_RESOLUTION):
+            print("Copy-number resolution rounded to %g so that single copy is "
+                  "on the grid." % cn_resolution)
 
     inputs = options.inputs if options.inputs else ["."]
 
@@ -548,6 +615,8 @@ def main():
                         interior_change_rate=options.interior_change_rate,
                         fold_change_penalty=options.fold_change_penalty,
                         write=True, genome_id=genome_id,
+                        polymorphism=options.polymorphism,
+                        cn_resolution=cn_resolution,
                     )
                     # Same figures the ordinary path emits, each saying why it
                     # is blank -- so "no plot" never has to be read as "the run
@@ -618,8 +687,12 @@ def main():
                 max_copy_number=options.max_copy_number,
                 interior_change_rate=options.interior_change_rate,
                 fold_change_penalty=options.fold_change_penalty, write=False,
+                polymorphism=options.polymorphism,
+                cn_resolution=cn_resolution,
             )
-            df_staged, cn_applied = stage_pass1(df_called)
+            df_staged, cn_applied = stage_pass1(
+                df_called, polymorphism=options.polymorphism,
+                resolution=cn_resolution)
             n_censored = int(df_staged["is_cn_variant"].sum())
             if quiet:
                 pass
@@ -709,6 +782,8 @@ def main():
             max_copy_number=options.max_copy_number,
             interior_change_rate=options.interior_change_rate,
             fold_change_penalty=options.fold_change_penalty,
+            polymorphism=options.polymorphism,
+            cn_resolution=cn_resolution,
         )
         if "prob_copy_number_pass1" in df_cnv.columns:
             moved = int((df_cnv["prob_copy_number"].to_numpy()

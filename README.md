@@ -126,7 +126,44 @@ CNery <inputs> -o <output folder> -w 500 -s 250 --bias gc
 
 # No bias correction before CN prediction
 CNery <inputs> -o <output folder> -w 500 -s 250 --bias none
+
+# Polymorphism mode: call a continuous copy number instead of an integer one
+CNery <inputs> -o <output folder> -p
+
+# ...at a finer grid (levels 1.02, 1.04, ... instead of 1.05, 1.10, ...)
+CNery <inputs> -o <output folder> -p --copy-number-resolution 0.02
 ```
+
+### Consensus and polymorphism modes
+
+By default CNery calls an **integer** copy number: a region is at one copy, or two, or thirty-four.
+That is the right answer for a clonal isolate, and it is the mode breseq consumes.
+
+`-p/--polymorphism-mode` instead calls a **continuous level**, so a region can come back at 1.30.
+Read that as a measurement of relative depth and nothing more — it does **not** say *why*. A level of
+1.30 is consistent with 30% of the population carrying a duplication, with a mixed sample, or with
+aneuploidy, and CNery does not claim to distinguish them; there is no cell-fraction parameter,
+deliberately. This is the same stance as the `"Relative copy number"` already reported per sequence
+in `OTR_corr/*_otr_results.json`, which is likewise non-integral on purpose.
+
+`--copy-number-resolution` sets how fine the grid is (default 0.05, so the smallest change above
+single copy that can be called is 1.05). It is rounded so that single copy always lands exactly on
+the grid. Finer is not automatically better: the default is roughly the smallest difference a 10 kb
+event can support at the default windowing, and a grid finer than the coverage's own scatter will
+simply cost sensitivity.
+
+Two practical notes:
+
+- **Consensus-mode output is completely unchanged by this feature**, bit for bit.
+- **`-p` output is not readable by breseq.** The `State` column of `CNV_csv/*_break_pts.csv` becomes
+  fractional, and breseq expects an integer copy number there. Use the default mode when the results
+  are destined for breseq.
+- **A level one step off single copy is usually residual bias, not biology.** On real data the GC and
+  replication corrections leave a slow wander of a few percent, and a fine grid resolves it into long
+  stretches at 0.95 or 1.05. Measured across the test corpus, rounding the continuous calls
+  reproduces the ordinary integer call on 99.6–100% of windows — the mode refines calls rather than
+  changing them — so treat a one-step departure as the resolution limit and look for events that
+  stand clear of it.
 
 When OTR correction is applied, the origin and terminus of replication are automatically inferred — no manual coordinates are required. CNery fits them from the coverage profile, falling back to the reference's own cumulative GC skew when the coverage carries no usable gradient. Either way the correction is applied only if it beats a bootstrap null, so a flat genome is left alone.
 
@@ -378,7 +415,9 @@ usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
              [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
              [--interior-change-rate INTERIOR_CHANGE_RATE]
              [--fold-change-penalty FOLD_CHANGE_PENALTY]
-             [--max-copy-number MAX_COPY_NUMBER] [--bias {all,none,gc,otr}]
+             [--max-copy-number MAX_COPY_NUMBER] [-p]
+             [--copy-number-resolution CN_RESOLUTION]
+             [--bias {all,none,gc,otr}]
              [INPUT ...]
 
 CNery is a Python package extension to breseq that analyzes the sequencing
@@ -478,6 +517,25 @@ options:
                         call that lands exactly on the ceiling is reported as
                         such, because it is a clipped value rather than a
                         measurement. Default: 500.
+  -p, --polymorphism-mode
+                        Call a CONTINUOUS copy number instead of an integer
+                        one. The HMM decodes over a grid of coverage levels
+                        spaced by --copy-number-resolution, finely between 0
+                        and 2 and on the integers above, refined where a
+                        segment's own data asks for it. A level is a measured
+                        relative depth and asserts no mechanism: 1.3 may be a
+                        subpopulation carrying a duplication, a mixed sample,
+                        or aneuploidy, and this mode does not claim to tell
+                        them apart. NOTE the copy number written to
+                        break_pts.csv is fractional in this mode, which breseq
+                        cannot read; consensus mode is unchanged.
+  --copy-number-resolution CN_RESOLUTION
+                        Spacing of the copy-number grid under -p, in copies:
+                        0.05 means the finest level above single copy is 1.05.
+                        Rounded to one that divides 1.0 exactly, so single copy
+                        is always on the grid. The default is about the finest
+                        step a 10 kb event supports at the default windowing.
+                        Default: 0.05.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'

@@ -151,7 +151,7 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `gc_corr_tau` | `apply_gc_correction` | relative sd of the GC curve at this window's GC |
 | `*_pass1` | `stage_pass1` | the first pass's value, before pass 2 overwrites it |
 | `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts (output/plots only — **not** the HMM's observation) |
-| `prob_copy_number` | `run_HMM` | Viterbi state |
+| `prob_copy_number` | `run_HMM` | Viterbi state — an integer copy number, or a continuous level under `-p` |
 
 Supporting columns other stages depend on: `gc_cor_med_fil` (median filter of `gc_corr_norm_cov`;
 seeds the ori/ter guess in `otr_fit`), `exclude_from_fit` / `censor_reason` (`is_deletion OR
@@ -287,6 +287,128 @@ stage — note `raw/G` is an intermediate, not a result:
 - **The gate re-runs in pass 2 and its p-values are the reported ones.** Pass 1's
   are kept beside them under `... (pass 1)` keys, so a verdict that changed under
   the censor is legible from the file alone.
+
+#### Polymorphism mode calls a continuous level, and asserts no mechanism
+
+`-p/--polymorphism-mode` decodes over a grid of coverage **levels** instead of the integers.
+`--copy-number-resolution` (default 0.05) sets the spacing. It is **strictly opt-in**: consensus
+mode is bit-identical, which `tests/test_hmm.py::TestConsensusPathIsUnchanged` pins directly and the
+eight `_break_pts.csv` goldens pin end to end.
+
+**A level is a measured relative depth and nothing more.** 1.3 may be a subpopulation carrying a
+duplication, a mixed sample, or aneuploidy; the mode does not claim to tell them apart. The absence
+of a mixture model is a **decision, not an omission** — there is no cell-fraction parameter to fit
+and none should be added without a reason to believe the mixture is identifiable from depth alone.
+This is the stance `relative_copy_numbers()` already takes with `"Relative copy number": 2.953`.
+
+**The grid.** `polymorphism_levels()` is `resolution`-spaced over `[0, 1]` *and* `[1, 2]` — a
+partial loss is as real a measurement as a partial gain — then the integers up to
+`robust_state_count`'s ceiling. Built with `linspace` per unit interval, so **1.0 and 2.0 are exact
+grid members by the endpoint contract rather than by luck of floating-point accumulation**;
+`snap_cn_resolution` rounds `r` to `1/round(1/r)` for the same reason and reports when it does. That
+matters because `_default_log_start()` reads the row of level 1.0 and `add_cn_censor` tests against
+it exactly — at `r = 0.03` an unsnapped grid runs `... 0.99, 1.02 ...` with **no single-copy state on
+it at all**, which is not a subtle failure but is a silent one.
+
+**The off-diagonal is weighted by level SPACING, not by state count**, and on the integer grid that
+is the historical `change_prob / (n_states - 1)` bit for bit — this is the old prior rewritten in
+units that survive a non-uniform grid, not a new one. `level_spacing()` uses a central difference
+with **full-step ends**; the natural-looking half-width Voronoi convention gives 0.5 at the
+boundaries and silently moves every probability in the matrix (measured: it breaks bit-identity at
+`n_states` 5, 8 and 39).
+
+Two things go wrong under count-weighting. The prior would depend on the resolution rather than on
+the data — widening the grid from 6 to 140 levels costs a segment 21.6 → 28.3 nats. And, worse, it
+would break refinement: `sum(w)` is the grid's **span**, not its count, so adding levels *inside*
+the existing range leaves every other transition's price untouched and refinement stays a local
+perturbation. Under count-weighting, refining one band re-prices every transition in the genome, and
+a segment megabases away could change call as a pure resolution artifact — indistinguishable, in the
+output, from data.
+
+**The fold-change kernel and the interior discount are unchanged, scope included**: both still apply
+only between two levels at or above 2.0. Extending the kernel down to baseline was measured and
+rejected. It is not needed — 46,000 windows of flat synthetic coverage on the `r = 0.05` grid come
+back **100% at level 1.0 in a single segment** either way — and at β = 2 it charges 28.4 nats for a
+1.00 → 1.05 step, roughly tripling the evidence a real subclonal segment must produce. Left alone, the
+prior already demands, on the shipped `r = 0.05` grid, **27.8 nats** to enter and leave a level near
+baseline — ~592 windows (59 kb at `-w 100`) for a 1.05 call, ~148 (15 kb) for 1.10 and ~16 (2 kb)
+for 1.30. That is the protection that keeps a flat genome whole, and it is why the kernel does not
+need to reach down to baseline as well.
+
+**The baseline is re-anchored on the calls, and this is not optional.**
+`fit_censored_negative_binomial` censors to `[0.5, 1.5] × mode`, which excludes an integer
+amplification but **cannot** exclude a subclonal one: a level of 1.1–1.5 lies inside that band by
+construction, so *the very events this mode exists to find are the ones that bias its baseline*.
+Measured with the truth known: a 20% block at 1.30 pulls the fitted `mu` **4.4%** high and a 30%
+block at 1.10 pulls it **2.6%** high, which on a fine grid reads as **100%** and **51%** of the
+genome called off single copy. So each round re-estimates `mu` from the windows on the modal level —
+single copy by definition, the same assumption `_censor_bounds()` already makes — using the
+**continuous MLE** `sum(counts)/sum(offsets)` over them. Anchoring on the *quantized* modal level
+instead overshoots, because the level is only accurate to half a step and the correction lands on the
+far side: measured, that left the 1.10 case with 51% of the genome still off baseline where the MLE
+converges in one round. This is alternating conditional fitting, exactly like the pooled GC refit
+between the two pipeline passes, and it is a no-op once the mode sits at 1.0.
+
+**Refinement above the fine band.** A coarse level is refined only when (1) its segment spans at
+least `CN_REFINE_MIN_WINDOWS = 3` windows — same argument as `robust_state_count(support=3)` — and
+(2) the segment's own pooled level MLE sits further than half a step from the call. Condition (2) is
+the termination *proof*, not a heuristic: if the MLE is within half a step, the current level is
+already the nearest point of the grid we would add, so refinement **provably cannot** move the call.
+That is what stops a clean CN-3 amplification buying 25 states to confirm it is 3. Fine levels are
+never re-refined, so the loop terminates by construction; the round caps are backstops.
+
+**Resolution is absolute in the fine band and relative above it** (`refine_step`), the two agreeing
+exactly at the edge. Relative above it because the prior is scale-free: at copy number 34 an absolute
+0.05 step is 0.15%, which the fold-change kernel prices at **943 nats** — an absolute grid there
+would spend ~38 states the decode is then forbidden to use, and a uniformly spaced grid under a
+log-spaced prior is a contradiction the decode resolves by ignoring most of the grid. Relative
+spacing degrades into the integers above copy number ~`2/resolution`, which is the correct limit. A
+refinement that would exceed `CN_MAX_LEVELS` is **declined and reported**, never silently coarsened —
+same principle as the copy-number ceiling warning.
+
+**The CN censor's band under `-p` is ONE GRID STEP** — `|cn - 1| > resolution` — which is neither
+`np.rint`'s half unit nor exact equality, and the reason is a corpus measurement.
+
+Exact equality was implemented first and is wrong. It censors 51–66% of the windows on four of the
+eight sequences and tips three of them past `CN_CENSOR_MIN_KEEP`, which silently reverts pass 2 to
+pass 1's censoring. The diagnosis is in *where* those windows sit: almost all of them are at exactly
+0.95 or 1.05, one step either side and roughly symmetric — cwbi's chromosome reads 2261 windows at
+1.00, 2045 at 1.05 and 1938 at 0.95 — and the two worst sequences (`p5_75k_exp`, `cwbi:chromosome`)
+are the two with the strongest residual replication ramp. **That is leftover GC/OTR bias being
+resolved at the grid's own limit, not copy number**, and censoring it strips the bias fits of exactly
+the windows that inform them. One step is the finest distinction the model claims to make, so a
+window one step off baseline is not a variant it can stand behind. The threshold is `resolution`
+itself, not a new constant.
+
+The cost is explicit: a genuine subclonal event at exactly 1 ± `resolution` stays in the pass-2 fits.
+It is by construction the smallest level the grid can express, and at that size it is not separable
+from residual bias anyway. With this band the censor applies on 7 of 8 sequences; the one that
+declines is CWBI's `plasmid_1`, which **already** declines in consensus mode because 52% of its
+windows are repeats — an unrelated and pre-existing reason.
+
+A side effect worth knowing: under `-p` the censor now catches subclonal events that consensus mode
+cannot see at all. On a synthetic 400 kb reference carrying a 1.35x block over 100 kb, pass 1
+censors exactly the 500 windows of that block from the pass-2 GC/OTR fits; in consensus mode the
+same block rounds to CN 1 and stays in them. So `-p` improves the bias fits as well as the calls.
+
+Measured with this band, on windows consensus mode calls CN 1, the fraction within one step of
+single copy is **0.940–1.000** across the corpus. And rounding the continuous calls reproduces the
+consensus call on **99.6–100%** of windows on all eight sequences: the mode refines calls, it does
+not move them. `TestPolymorphismOnRealCoverage` pins both.
+
+**`-p` output is not breseq-consumable, deliberately.** `_break_pts.csv` keeps its three columns, so
+breseq's fatal column assert still holds, but `State` is fractional and breseq parses that field into
+an AMP's `new_copy_number` as an integer. This is an accepted, opt-in-only break — breseq never
+passes `-p` — in the same spirit as the `"Termius"` spelling fix, and it is recorded here rather than
+left to be discovered. **In consensus mode `State` stays `int64`**, and that dtype is part of the
+contract: `run_HMM` passes `levels=None` into `HMM_copy_number` unless `-p` is set, precisely so the
+path index is written straight through. Passing the levels array in both modes writes identical
+*values* as float64 and fails all eight goldens on dtype alone — which is how that was caught.
+
+**Cost.** At CLI defaults the transition matrix is already non-flat (`r = 1e-8/1e-6 != 1`), so
+production runs already decode with the general O(K²) recursion and polymorphism mode is not a
+regression in kind. Measured decode of 46,000 windows: 0.13 s at K = 6, 0.25 s at K = 44, 0.54 s at
+K = 78, 0.92 s at K = 118 — against `preprocess`'s ~4 s, the extra rounds are free.
 
 #### The fragment size is chosen from the data unless `-f` is given
 
@@ -530,7 +652,10 @@ are rejected before `get_CNV.main` creates any output directory.
 - `apply_otr_correction` (`core.py:767`) applies the OTR factor everywhere except `is_deletion`
   windows, for the same reason.
 - The HMM stacks a geometric zero-state row on top of one negative-binomial emission row per copy
-  number, so **state index == copy number** and the matrices are `n_states + 1` square/rows. The
+  number, so on the default integer grid **state index == copy number** and the matrices are
+  `n_states + 1` square/rows. That identity is now a property of the *grid*, not an assumption in the
+  code: the emission and transition builders take an explicit `levels` vector (see "Polymorphism
+  mode" below), and passing `consensus_levels(n)` reproduces the integer behaviour bit for bit. The
   negative binomial (not Poisson) is intentional: coverage is overdispersed.
 - **The zero state's mean is a fraction of the local baseline**, `deletion_coverage_fraction * mu *
   offset` (`-z`, default 0.02), which makes it the `k = 0.02` case of the emission contract below
@@ -612,7 +737,9 @@ are rejected before `get_CNV.main` creates any output directory.
   - **Cost**: at non-neutral settings the matrix is not flat, so decoding is O(n_states²) per window
     — nothing at the usual `n_states=5`, and 41 s for the whole pipeline on a 4.6 Mb genome at
     `n_states≈139`.
-- **`DEFAULT_MAX_COPY_NUMBER` (500) is a ceiling on that grid, not the grid.** It is the default for
+- **`DEFAULT_MAX_COPY_NUMBER` (500) is a ceiling on the grid's top LEVEL, not the grid.** (`CN_MAX_LEVELS`
+  is the separate bound, on the level *count*, that polymorphism-mode refinement is checked against;
+  the two are different units and must not be conflated.) It is the default for
   *both* `robust_state_count(max_states=...)` and `run_HMM(max_copy_number=...)`, and must stay that
   way: the two used to carry independent literals of 100, and because `run_HMM` always passed its own
   value the signature that read as the authority was never consulted. That is how the ceiling stayed
@@ -977,6 +1104,12 @@ Synthetic tests construct windowed DataFrames staged to match the column
 contract at each pipeline point — reuse the `tests/conftest.py` fixtures (`windowed_flat`,
 `windowed_with_deletion`, `windowed_with_amplification`, `gc_corrected_flat`, `otr_corrected_flat`)
 rather than hand-rolling frames, so a change to the contract surfaces in one place.
+Note the conftest frames are **n = 80**, below `run_HMM`'s `min_called_windows = 100`, and far too
+short to exercise polymorphism mode: at the default rates a 1.05 call needs ~550 windows of evidence
+before it is worth its own entry and exit. Those tests build their own longer frames via
+`_poly_frame` in `tests/test_hmm.py`, following `_flat_frame_with_repeat_spike`'s precedent — adding
+a 2,000-window fixture to `conftest.py` would slow every unrelated test that touches these.
+
 These fixtures deliberately carry **no** `pct_redundant` / `is_redundant` column, so they exercise
 the uncensored path; `run_HMM` falls back to using every window when the column is absent or when
 censoring would leave fewer than `min_called_windows`. Add the column explicitly when a test is

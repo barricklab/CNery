@@ -30,6 +30,16 @@ from CNery.core import (
     DEFAULT_CHANGE_RATE,
     DEFAULT_INTERIOR_CHANGE_RATE,
     DEFAULT_FOLD_CHANGE_PENALTY,
+    consensus_levels,
+    polymorphism_levels,
+    level_spacing,
+    snap_cn_resolution,
+    refine_levels,
+    refine_step,
+    add_cn_censor,
+    DEFAULT_CN_RESOLUTION,
+    CN_FINE_BAND_TOP,
+    CN_MAX_LEVELS,
 )
 
 
@@ -1295,3 +1305,306 @@ class TestInteriorBoundaryPrior:
                       str(tmp_path), write=False)
         amplified = out.loc[out["prob_copy_number"] > 1, "prob_copy_number"]
         assert amplified.nunique() == 2
+
+
+def _poly_frame(n=2000, depth=100.0, relvar=0.0266, blocks=(), seed=0):
+    """A windowed frame staged to run_HMM's contract, long enough to matter.
+
+    conftest's fixtures are n=80, below run_HMM's min_called_windows=100, and
+    far too short to pay for a fine-grid segment: at the default rates a 1.05
+    call needs ~550 windows of evidence before it is worth its own entry and
+    exit. `blocks` is (start, stop, level) in COPY NUMBER, so the truth is known.
+
+    Relative variance is fixed at REL606's measured 0.0266 so that changing
+    `depth` changes only the depth, following _frame_with_partial_deletion().
+    """
+    size = 1.0 / max(relvar - 1.0 / depth, 1e-4)
+    lam = np.ones(n)
+    for start, stop, level in blocks:
+        lam[start:stop] = level
+    rng = np.random.default_rng(seed)
+    rc = rng.negative_binomial(
+        size * lam, size * lam / (size * lam + depth * lam)).astype(float)
+    win_st = np.arange(n) * 100
+    med = np.median(rc[rc > 0]) if np.any(rc > 0) else 1.0
+    return pd.DataFrame({
+        "genome_id": "chr1", "win_st": win_st, "win_end": win_st + 100,
+        "win_len": 100, "gc_percent": 0.5, "read_count_cov": rc,
+        "norm_raw_cov": rc / med, "gc_corr_norm_cov": rc / med,
+        "gc_corr_fact": np.ones(n), "otr_gc_corr_norm_cov": rc / med,
+        "otr_gc_corr_fact": np.ones(n), "window_num": np.arange(n),
+    })
+
+
+class TestConsensusPathIsUnchanged:
+    """Polymorphism mode is opt-in, and "opt-in" has to mean BIT for bit.
+
+    Eight authentic goldens, breseq's Genome Diff and a dozen `== 1` assertions
+    read prob_copy_number as an integer. These are the tests that license
+    rewriting the emission and the transition matrix around an explicit level
+    grid: on the integer grid the rewrite has to be a pure relabelling.
+    """
+
+    @pytest.mark.parametrize("with_tau", [False, True])
+    def test_the_integer_grid_rebuilds_the_emission_bit_for_bit(self, with_tau):
+        rng = np.random.default_rng(3)
+        counts = rng.poisson(100, 500).astype(float)
+        offsets = rng.uniform(0.8, 1.2, 500)
+        tau = rng.uniform(0.001, 0.02, 500) if with_tau else None
+        by_n = log_emission_with_offsets(
+            counts, offsets, mu=100.0, size=40.0, n_states=6,
+            deletion_coverage_fraction=0.02, offset_tau=tau)
+        by_levels = log_emission_with_offsets(
+            counts, offsets, mu=100.0, size=40.0, levels=consensus_levels(6),
+            deletion_coverage_fraction=0.02, offset_tau=tau)
+        np.testing.assert_array_equal(by_n, by_levels)
+
+    @pytest.mark.parametrize("n", [1, 2, 5, 8, 39, 139])
+    def test_the_integer_grid_rebuilds_the_transition_bit_for_bit(self, n):
+        """The density off-diagonal IS the old uniform one on the integer grid.
+
+        change_prob * w(l) / sum_{l != k} w(l) reduces to change_prob /
+        (n_states - 1) only because every level_spacing() width is exactly 1.0
+        there -- which is why the end convention is full-step rather than a
+        half-width Voronoi cell. Measured, the Voronoi convention breaks this.
+        """
+        remain = remain_prob_for_step(DEFAULT_CHANGE_RATE, 100)
+        interior = 1.0 - remain_prob_for_step(DEFAULT_INTERIOR_CHANGE_RATE, 100)
+        for kwargs in ({}, {"interior_change_prob": interior,
+                            "fold_change_penalty": DEFAULT_FOLD_CHANGE_PENALTY}):
+            by_n = setup_transition_matrix(n, remain_prob=remain, **kwargs)
+            by_levels = setup_transition_matrix(
+                remain_prob=remain, levels=consensus_levels(n), **kwargs)
+            assert np.array_equal(by_n, by_levels)
+
+    def test_the_neutral_integer_matrix_is_still_detected_as_flat(self):
+        """_flat_transition_params uses ==, so this guards the O(n) decode."""
+        remain = remain_prob_for_step(DEFAULT_CHANGE_RATE, 100)
+        flat = setup_transition_matrix(5, remain_prob=remain)
+        assert _flat_transition_params(np.log(flat)) is not None
+
+    def test_polymorphism_off_changes_no_call(self, tmp_path):
+        df = _poly_frame(blocks=((800, 1200, 3.0),), seed=5)
+        before = run_HMM(df.copy(), str(tmp_path / "a"), write=False)
+        after = run_HMM(df.copy(), str(tmp_path / "b"), write=False,
+                        polymorphism=False)
+        np.testing.assert_array_equal(before["prob_copy_number"].to_numpy(),
+                                      after["prob_copy_number"].to_numpy())
+        assert before["prob_copy_number"].dtype.kind == "i"
+
+
+class TestLevelGrid:
+    """The grid's shape, and the one property everything downstream keys on."""
+
+    def test_consensus_levels_are_the_integer_grid(self):
+        np.testing.assert_array_equal(consensus_levels(5), np.arange(6.0))
+
+    def test_the_spacing_of_the_integer_grid_is_all_ones(self):
+        """This is what makes the density off-diagonal reduce to the old one."""
+        assert np.all(level_spacing(consensus_levels(7)) == 1.0)
+
+    @pytest.mark.parametrize("resolution", [0.05, 0.1, 0.02, 0.25, 0.5])
+    def test_single_copy_is_always_exactly_on_the_grid(self, resolution):
+        """_default_log_start and add_cn_censor both test against 1.0 exactly."""
+        levels = polymorphism_levels(5, resolution)
+        assert np.count_nonzero(levels == 1.0) == 1
+        assert np.count_nonzero(levels == 2.0) == 1
+
+    def test_a_resolution_that_does_not_divide_one_is_snapped(self):
+        """0.03 would otherwise build ... 0.99, 1.02 ... with no single copy."""
+        assert snap_cn_resolution(0.03) == pytest.approx(1.0 / 33)
+        assert (polymorphism_levels(5, 0.03) == 1.0).any()
+
+    def test_the_grid_starts_at_zero_and_is_strictly_increasing(self):
+        levels = polymorphism_levels(5, 0.05)
+        assert levels[0] == 0.0
+        assert np.all(np.diff(levels) > 0)
+
+    def test_levels_below_single_copy_exist(self):
+        """A partial loss is as real a measurement as a partial gain."""
+        levels = polymorphism_levels(5, 0.05)
+        assert ((levels > 0.0) & (levels < 1.0)).sum() >= 10
+
+    def test_a_resolution_coarser_than_a_half_is_refused(self):
+        with pytest.raises(ValueError):
+            snap_cn_resolution(0.9)
+
+
+class TestRefinementGrid:
+    """Refinement is local, bounded, and declines rather than coarsening."""
+
+    def test_the_step_is_absolute_in_the_fine_band(self):
+        assert refine_step(1.0, 0.05) == pytest.approx(0.05)
+
+    def test_the_two_regimes_agree_at_the_band_edge(self):
+        assert refine_step(CN_FINE_BAND_TOP, 0.05) == pytest.approx(0.05)
+
+    def test_the_step_is_relative_above_the_band(self):
+        """An absolute 0.05 at copy number 34 is 0.15%, which the fold-change
+        kernel prices at ~943 nats -- states the decode is forbidden to use."""
+        assert refine_step(34.0, 0.05) > 0.5
+
+    def test_refining_around_a_high_level_degrades_to_the_integers(self):
+        before = polymorphism_levels(39, 0.05)
+        after = refine_levels(before, [34.0], 0.05)
+        assert after.size - before.size <= 2
+
+    def test_refining_a_low_level_adds_a_band(self):
+        before = polymorphism_levels(5, 0.05)
+        after = refine_levels(before, [3.0], 0.05)
+        assert after.size > before.size
+        assert ((after > 2.0) & (after < 4.0)).sum() > 5
+
+    def test_refinement_is_confined_to_the_band(self):
+        """Levels outside [c-1, c+1] are untouched, so the prior elsewhere is
+        unchanged -- which is what makes refinement a LOCAL perturbation."""
+        before = polymorphism_levels(8, 0.05)
+        after = refine_levels(before, [5.0], 0.05)
+        outside = after[(after < 4.0) | (after > 6.0)]
+        np.testing.assert_array_equal(outside, before[(before < 4.0) | (before > 6.0)])
+
+    def test_nothing_to_refine_returns_the_same_object(self):
+        levels = polymorphism_levels(5, 0.05)
+        assert refine_levels(levels, [], 0.05) is levels
+
+    def test_a_refinement_over_the_cap_is_declined_not_coarsened(self):
+        levels = polymorphism_levels(5, 0.05)
+        assert refine_levels(levels, [3.0], 0.05, max_levels=10) is levels
+
+
+class TestPolymorphismCalls:
+    """What the mode buys, and what it must not cost."""
+
+    @pytest.mark.parametrize("seed", range(3))
+    @pytest.mark.parametrize("resolution", [0.05, 0.1])
+    def test_a_flat_genome_stays_at_single_copy(self, seed, resolution, tmp_path):
+        """THE false-positive control.
+
+        A finer grid offers more ways to be wrong, so the question is whether
+        the transition prior still pays for them. Measured at genome scale
+        (46,000 windows) the answer is that a flat genome comes back 100% at
+        level 1.0 in a single segment; this is the same claim at test size.
+        """
+        df = _poly_frame(n=1500, seed=seed)
+        out = run_HMM(df, str(tmp_path), write=False, polymorphism=True,
+                      cn_resolution=resolution)
+        called = out["prob_copy_number"].to_numpy()
+        assert np.all(called == 1.0), sorted(set(called))
+
+    @pytest.mark.parametrize("level", [1.1, 1.3, 1.6])
+    def test_a_subclonal_level_is_recovered(self, level, tmp_path):
+        """...and consensus mode rounds the same block to 1, which is the point."""
+        df = _poly_frame(n=2000, blocks=((800, 1400, level),), seed=1)
+        poly = run_HMM(df.copy(), str(tmp_path / "p"), write=False,
+                       polymorphism=True)
+        inside = poly["prob_copy_number"].to_numpy()[800:1400]
+        modal = pd.Series(inside).mode()[0]
+        assert abs(modal - level) <= DEFAULT_CN_RESOLUTION + 1e-9, modal
+
+    def test_the_baseline_is_re_anchored_off_a_subclonal_block(self, tmp_path):
+        """fit_censored_negative_binomial censors to [0.5, 1.5] x mode, which
+        CANNOT exclude a subclonal level -- 1.1-1.5 is inside that band by
+        construction. Unfixed, a 30% block at 1.30 pulled the fitted mu 4.4%
+        high and the WHOLE genome came back off single copy."""
+        df = _poly_frame(n=2000, blocks=((800, 1400, 1.3),), seed=1)
+        out = run_HMM(df, str(tmp_path), write=False, polymorphism=True)
+        called = out["prob_copy_number"].to_numpy()
+        outside = np.r_[called[:800], called[1400:]]
+        assert (outside == 1.0).mean() > 0.95, sorted(set(outside))
+
+    def test_a_level_above_two_is_recovered_after_refinement(self, tmp_path):
+        df = _poly_frame(n=2000, blocks=((800, 1200, 3.4),), seed=1)
+        coarse = run_HMM(df.copy(), str(tmp_path / "c"), write=False,
+                         polymorphism=True, refine=False)
+        refined = run_HMM(df.copy(), str(tmp_path / "r"), write=False,
+                          polymorphism=True)
+        assert pd.Series(coarse["prob_copy_number"].to_numpy()[800:1200]).mode()[0] == 3.0
+        got = pd.Series(refined["prob_copy_number"].to_numpy()[800:1200]).mode()[0]
+        assert abs(got - 3.4) <= refine_step(3.0, DEFAULT_CN_RESOLUTION), got
+
+    def test_a_clean_integer_amplification_is_not_refined_away(self, tmp_path):
+        """The MLE predicate: when the call is already the nearest grid point,
+        refinement provably cannot move it, so it must not be spent."""
+        df = _poly_frame(n=2000, blocks=((800, 1200, 3.0),), seed=2)
+        out = run_HMM(df, str(tmp_path), write=False, polymorphism=True)
+        assert pd.Series(out["prob_copy_number"].to_numpy()[800:1200]).mode()[0] == 3.0
+
+    def test_a_deletion_is_still_called_zero(self, tmp_path):
+        """The zero state is a FRACTION of baseline, and a fine grid running
+        down to 0.05 must not steal a real deletion from it."""
+        df = _poly_frame(n=2000, blocks=((800, 1000, 0.02),), seed=1)
+        out = run_HMM(df, str(tmp_path), write=False, polymorphism=True)
+        assert np.all(out["prob_copy_number"].to_numpy()[810:990] == 0.0)
+
+    def test_the_calls_are_float_under_p_and_int_without_it(self, tmp_path):
+        df = _poly_frame(n=1200, seed=0)
+        poly = run_HMM(df.copy(), str(tmp_path / "p"), write=False, polymorphism=True)
+        cons = run_HMM(df.copy(), str(tmp_path / "c"), write=False)
+        assert poly["prob_copy_number"].dtype.kind == "f"
+        assert cons["prob_copy_number"].dtype.kind == "i"
+
+
+class TestPolymorphismCensor:
+    """The pass-2 censor has to see a subclonal window as a variant."""
+
+    def _frame(self, cn):
+        return pd.DataFrame({"prob_copy_number": np.asarray(cn, dtype=float)})
+
+    def test_a_subclonal_window_is_censored_under_p(self):
+        df, applied = add_cn_censor(
+            self._frame([1.0] * 90 + [1.1] * 10), polymorphism=True)
+        assert applied
+        assert df["is_cn_variant"].to_numpy()[-10:].all()
+
+    def test_consensus_mode_keeps_its_half_unit_band(self):
+        """np.rint(1.1) == 1, so the old predicate is unchanged where it applies."""
+        df, applied = add_cn_censor(self._frame([1.0] * 90 + [1.1] * 10))
+        assert applied
+        assert not df["is_cn_variant"].to_numpy().any()
+
+    def test_the_min_keep_floor_still_declines(self):
+        """A mostly-variant sequence falls back to pass 1's censoring, as before."""
+        df, applied = add_cn_censor(
+            self._frame([1.0] * 20 + [1.5] * 80), polymorphism=True)
+        assert not applied
+        assert not df["is_cn_variant"].to_numpy().any()
+
+
+class TestModeSwitchOnAStagedFrame:
+    """run_HMM must accept a frame that already carries a call from a prior pass.
+
+    stage_pass1() snapshots prob_copy_number, so pass 2 is always handed pass 1's
+    column. Writing a float level into that int64 column through .loc[:, col]
+    takes pandas' IN-PLACE setitem path and raises LossySetitemError -- so `-p`
+    crashed on any frame whose previous pass had been consensus. Nothing in the
+    synthetic tier caught it, because those frames start clean.
+    """
+
+    def test_polymorphism_over_an_existing_integer_call(self, tmp_path):
+        df = _poly_frame(n=1200, blocks=((500, 800, 3.0),), seed=4)
+        first = run_HMM(df, str(tmp_path / "a"), write=False)
+        assert first["prob_copy_number"].dtype.kind == "i"
+        second = run_HMM(first, str(tmp_path / "b"), write=False, polymorphism=True)
+        assert second["prob_copy_number"].dtype.kind == "f"
+
+    def test_consensus_over_an_existing_float_call(self, tmp_path):
+        df = _poly_frame(n=1200, seed=4)
+        first = run_HMM(df, str(tmp_path / "a"), write=False, polymorphism=True)
+        second = run_HMM(first, str(tmp_path / "b"), write=False)
+        assert second["prob_copy_number"].dtype.kind == "i"
+
+    def test_the_column_keeps_its_position(self, tmp_path):
+        """CNV.csv's column order is part of what users diff."""
+        df = _poly_frame(n=1200, seed=4)
+        first = run_HMM(df, str(tmp_path / "a"), write=False)
+        order = list(first.columns)
+        second = run_HMM(first, str(tmp_path / "b"), write=False, polymorphism=True)
+        assert list(second.columns) == order
+
+
+def test_a_refinement_that_adds_nothing_returns_the_same_grid():
+    """High up, refine_step() is coarser than the integers, so the band lands
+    entirely on levels already present. That must read as "nothing to do"
+    rather than as a grown grid, or run_HMM spends a decode discovering it."""
+    levels = polymorphism_levels(39, 0.05)
+    assert refine_levels(levels, [34.0], 0.05) is levels
