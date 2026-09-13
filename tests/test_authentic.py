@@ -320,6 +320,12 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
         )
         # Provisional calls: they exist only to build the CN censor for pass 2,
         # and main() writes none of them.
+        # BOTH run_HMM calls in this harness stay at their defaults, and that is
+        # load-bearing rather than incidental: the eight goldens below are what
+        # prove polymorphism mode left the consensus path alone, and they can
+        # only prove it while this harness asks for the consensus path. Do not
+        # thread -p (or any other HMM tuning flag) through here -- exercise it
+        # from the pass-2 frame instead, as TestPolymorphismOnRealCoverage does.
         df_staged, cn_applied = stage_pass1(run_HMM(df_otr, str(out), write=False))
         staged[seq_id] = df_staged
         frames[seq_id] = {"gc": df_gc, "skew": skew, "res1": res1,
@@ -1252,3 +1258,100 @@ class TestFragmentSizeScanAtCliDefaults:
         scan ran, and every golden in this suite was produced that way."""
         assert cli_default_pipelines["adp1_mgd06_lb"]["frames"]["ADP1-ISx"]["gc"][
             "gc_percent"].notna().all()
+
+
+@per_sequence
+class TestPolymorphismOnRealCoverage:
+    """-p against real coverage, from the same pass-2 frame the goldens use.
+
+    Deliberately NOT a new golden file. A golden for a mode whose whole output
+    is a continuous number is a float-exact golden, and this repo's own guidance
+    argues against those -- LOWESS and scipy.optimize results drift across
+    library versions. Structural claims are the house style here.
+
+    Reusing `seq["otr"]` rather than re-running the pipeline keeps this to one
+    extra decode per sequence instead of a second full authentic run.
+    """
+
+    def _call(self, seq, tmp_path):
+        from CNery.core import run_HMM, DEFAULT_CN_RESOLUTION  # noqa: F401
+        out = tmp_path / "poly"
+        (out / "CNV_csv").mkdir(parents=True, exist_ok=True)
+        return run_HMM(seq["otr"].copy(), str(out), write=False, polymorphism=True)
+
+    def test_the_calls_are_continuous_and_finite(self, seq, tmp_path):
+        called = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        assert np.all(np.isfinite(called))
+        assert called.dtype.kind == "f"
+
+    def test_rounding_reproduces_the_consensus_call(self, seq, tmp_path):
+        """THE claim this mode has to earn: it REFINES calls, it does not move
+        them. Measured on the corpus, rounding the continuous calls reproduces
+        the consensus call on 99.6-100% of windows across all eight sequences.
+
+        This is the test that would catch the continuous grid quietly
+        relabelling real biology, which no synthetic frame can rule out.
+        """
+        poly = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        assert (np.rint(poly) == consensus).mean() > 0.99
+
+    def test_a_healthy_sequence_stays_within_one_step_of_single_copy(
+            self, seq, tmp_path):
+        """The false-positive control, on real coverage with real bias residual.
+
+        NOT "every window reads exactly 1.0": measured, only 34-100% of windows
+        do, and the shortfall is diagnostic rather than alarming. The calls that
+        are not 1.0 sit at 0.95 and 1.05 -- one grid step either side, roughly
+        symmetric (cwbi's chromosome: 2261 windows at 1.00, 2045 at 1.05, 1938
+        at 0.95) -- and the two lowest sequences are the two with the strongest
+        residual replication ramp. That is leftover GC/OTR bias resolved at the
+        grid's own limit, which is a true statement about the coverage, not an
+        invented copy-number variant. What WOULD be alarming is a healthy
+        reference wandering further than one step, so that is what is asserted.
+
+        Skipped where the modal consensus call is not 1, and on sequences
+        carrying a real amplification, whose windows legitimately sit far away.
+        """
+        if seq["seq"].expected_cn != 1:
+            pytest.skip("not a single-copy reference")
+        called = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        single_copy = consensus == 1
+        if single_copy.sum() < 100:
+            pytest.skip("too few single-copy windows to measure")
+        from CNery.core import DEFAULT_CN_RESOLUTION
+        within = np.abs(called[single_copy] - 1.0) <= DEFAULT_CN_RESOLUTION + 1e-9
+        # Measured across the corpus, restricted to windows consensus mode calls
+        # CN 1: 0.940 - 1.000, the minimum on ltee_ara_m3_38k. The bar is set
+        # below that range rather than inside it, so this fails on a real
+        # regression and not on library drift.
+        assert within.mean() > 0.90, sorted(set(called[single_copy]))[:12]
+
+    def test_the_consensus_events_survive(self, seq, tmp_path):
+        """Every window consensus mode called CN 0 must still read near zero,
+        and the modal call must still agree with the consensus mode to within
+        one copy. A continuous grid may refine a call; it must not move it."""
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        poly = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        deleted = consensus == 0
+        if deleted.any():
+            assert (poly[deleted] < 0.5).mean() > 0.90
+        assert abs(pd.Series(poly).mode()[0]
+                   - pd.Series(consensus).mode()[0]) <= 1.0
+
+    def test_the_cn_censor_would_still_apply(self, seq, tmp_path):
+        """The exact `cn != 1.0` predicate must not make CN_CENSOR_MIN_KEEP fire
+        on a healthy sequence -- if it does, the grid is finer than this
+        sequence's dispersion supports and that is a finding, not a nuisance.
+
+        The two CWBI plasmids are excluded because they already decline the
+        censor in consensus mode, for an unrelated reason: 52% of plasmid_1's
+        windows are repeats.
+        """
+        from CNery.core import add_cn_censor
+        if seq["seq"].expected_cn != 1 or not seq["seq"].otr_detected:
+            pytest.skip("not a clean single-copy reference")
+        called = self._call(seq, tmp_path)
+        _df, applied = add_cn_censor(called, polymorphism=True)
+        assert applied

@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from CNery.get_CNV import main
@@ -266,7 +268,8 @@ class TestFlagSpellings:
         assert exit_info.value.code == 0
         rendered = capsys.readouterr().out
         for flag in ("--change-rate", "--interior-change-rate",
-                     "--fold-change-penalty", "--max-copy-number"):
+                     "--fold-change-penalty", "--max-copy-number",
+                     "--polymorphism-mode", "--copy-number-resolution"):
             assert flag in rendered
 
     @pytest.mark.parametrize("flag", [
@@ -274,6 +277,7 @@ class TestFlagSpellings:
         "-s", "--step-size", "-f", "--frag-size",
         "-z", "--deletion-coverage-fraction", "--bias",
         "--interior-change-rate", "--fold-change-penalty", "--max-copy-number",
+        "-p", "--polymorphism-mode", "--copy-number-resolution",
     ])
     def test_flag_is_accepted(self, flag, tmp_path, monkeypatch):
         parser_args = {
@@ -284,16 +288,28 @@ class TestFlagSpellings:
             # A fraction of baseline now, so the generic "100" would ask the
             # zero state to expect 100x the single-copy level.
             "-z": "0.05", "--deletion-coverage-fraction": "0.05",
+            # Under -p the grid must have single copy on it, and -z has to stay
+            # below the first level, so the generic "100" is doubly wrong here.
+            "--copy-number-resolution": "0.05",
         }
-        value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)
-        if value is None:
-            value = {"-o": str(tmp_path / "out"), "--output": str(tmp_path / "out")}.get(
-                flag, "100"
-            )
+        # -p is a store_true and takes NO value. Appending one anyway would make
+        # it be read as a positional input path, so the flag would "parse" while
+        # testing something else entirely -- and the run would then fail looking
+        # for a coverage table called "100".
+        takes_no_value = {"-p", "--polymorphism-mode"}
         table = _write_table(tmp_path / "chrA.coverage.tsv")
         out = str(tmp_path / "out")
+        argv = [str(table), flag]
+        if flag not in takes_no_value:
+            value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)
+            if value is None:
+                value = {"-o": str(tmp_path / "out"),
+                         "--output": str(tmp_path / "out")}.get(flag, "100")
+            argv.append(value)
+        if flag == "--copy-number-resolution":
+            argv.append("-p")          # the flag is rejected without it, by design
         # Only asserting the parser accepts it; a run is the cheapest way to be sure.
-        _run(monkeypatch, [str(table), flag, value, "-o", out, "-w", "100", "-s", "50"])
+        _run(monkeypatch, argv + ["-o", out, "-w", "100", "-s", "50"])
 
 
 class TestRegion:
@@ -577,3 +593,53 @@ class TestDegenerateCoverage:
         assert isinstance(data["Origin window"], int)
         assert isinstance(data["Terminus window"], int)
         assert "Origin-to-Terminus/Bias Ratio" in data
+
+
+class TestPolymorphismMode:
+    """-p changes the calls; it must not change the shape of the output.
+
+    The file contract is what breseq depends on, and it is unconditional: three
+    columns in break_pts.csv whatever mode produced them, because breseq asserts
+    the column count and that assert is fatal.
+    """
+
+    def _run_both(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        cons, poly = str(tmp_path / "cons"), str(tmp_path / "poly")
+        _run(monkeypatch, [str(table), "-o", cons, "-w", "100", "-s", "50"])
+        _run(monkeypatch, [str(table), "-p", "-o", poly, "-w", "100", "-s", "50"])
+        return cons, poly
+
+    def _breaks(self, out):
+        name = [f for f in os.listdir(os.path.join(out, "CNV_csv"))
+                if f.endswith("_break_pts.csv")][0]
+        return pd.read_csv(os.path.join(out, "CNV_csv", name))
+
+    def test_break_points_keep_their_three_columns(self, tmp_path, monkeypatch):
+        _cons, poly = self._run_both(tmp_path, monkeypatch)
+        assert list(self._breaks(poly).columns) == [
+            "Startpos", "State", "Segment_Size"]
+
+    def test_consensus_mode_still_calls_integers(self, tmp_path, monkeypatch):
+        cons, _poly = self._run_both(tmp_path, monkeypatch)
+        state = self._breaks(cons)["State"].to_numpy()
+        assert np.array_equal(state, np.rint(state))
+
+    def test_resolution_without_the_mode_is_rejected(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, [str(table), "--copy-number-resolution", "0.05",
+                               "-o", out, "-w", "100", "-s", "50"])
+        assert exit_info.value.code != 0
+
+    def test_a_deletion_fraction_above_the_resolution_is_rejected(
+            self, tmp_path, monkeypatch):
+        """-z at or above the first grid level collides with the CN-0 state."""
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, [str(table), "-p", "-z", "0.2",
+                               "--copy-number-resolution", "0.1",
+                               "-o", out, "-w", "100", "-s", "50"])
+        assert exit_info.value.code != 0
