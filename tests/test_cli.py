@@ -78,11 +78,11 @@ class TestPositionalInputs:
         # correction has two passes: the fit on raw coverage, and the refit after
         # OTR that removes the GC trend the position-dependent tent puts back.
         # Both are fitted once across every table in the run.
+        # The giveaway that they are pooled: TWO files for two references, not
+        # four. They are named generically for the same reason -- one of each per
+        # run, in a per-run directory, so the name identifies nothing.
         gc_files = sorted(os.listdir(os.path.join(out, "GC_bias")))
-        assert len(gc_files) == 2, gc_files
-        assert sum("GC_passes" in n for n in gc_files) == 1
-        # The giveaway that they are pooled: one file naming BOTH references.
-        assert all("chrA_and_chrB" in n for n in gc_files), gc_files
+        assert gc_files == ["GC_passes.pdf", "GC_vs_NormRds.pdf"], gc_files
 
     def test_directory_is_expanded(self, tmp_path, monkeypatch):
         cov = tmp_path / "coverage"

@@ -881,16 +881,21 @@ def _round(value, nd):
 
 
 def gc_cor_plots(df, output):
+    """The pooled GC-bias diagnostic: raw and corrected coverage against GC.
+
+    Named for what it is, not for the sequences in it. This file and
+    plot_gc_passes() are the only two pooled across the whole run, so exactly one
+    of each lands in a given GC_bias/ and the output directory is already the
+    discriminator -- which is why neither carries the `<sample><seq_id>` prefix
+    every per-sequence writer uses. It used to join every genome ID into the name,
+    and a 137-contig draft assembly then produced a 2,700-character basename and
+    died inside savefig() with "OSError: [Errno 63] File name too long", after the
+    per-sequence output had all been written.
+    """
     genome_ids = sorted(df["genome_id"].unique())
-    # Every table in the run was empty, so the pooled frame has no rows and no
-    # genome to name the file after. There is no diagnostic to draw either.
+    # Every table in the run was empty, so there is no diagnostic to draw.
     if not genome_ids:
         return
-    if len(genome_ids) > 1:
-        label = "_and_".join(str(g) for g in genome_ids)
-    else:
-        label = str(genome_ids[0])
-    samplename = f"{label}_GC_vs_NormRds"
     saveplt = str(output + "/GC_bias/")
 
     os.makedirs(saveplt, exist_ok=True)
@@ -943,13 +948,11 @@ def gc_cor_plots(df, output):
 
     plt.ylabel('Normalized read coverage')
     plt.xlabel('GC% per window')
-    plt.title(f'{samplename}_GCvsNormalizedReads')
+    plt.title('Normalized read coverage vs GC%%, pooled across %d sequence(s)'
+              % len(genome_ids))
     plt.legend(loc='upper right')
 
-    plt_full_path = os.path.join(
-        saveplt,
-        '%s_GC_vs_NormRds.pdf' % samplename.replace(' ', '_')
-    )
+    plt_full_path = os.path.join(saveplt, 'GC_vs_NormRds.pdf')
     plt.savefig(plt_full_path, format='pdf', bbox_inches='tight')
     plt.close()
 
@@ -1458,12 +1461,11 @@ def plot_gc_passes(per_genome, output):
     falls to 0.926, so G reaches only 1.073. The second pass is mostly removing
     correction the first pass over-applied to the replication ramp.
 
-    Pooled across sequences, so one file per run, like gc_cor_plots(). Makes its
-    own directory as that function does. Returns the path.
+    Pooled across sequences, so one file per run, like gc_cor_plots(), and named
+    generically for the same reason. Makes its own directory as that function
+    does. Returns the path.
     """
     pooled = pd.concat(per_genome.values(), ignore_index=True)
-    label = "_and_".join(sorted(str(g) for g in per_genome))
-    samplename = sample_prefix(output) + label
     savedir = os.path.join(output, "GC_bias")
     os.makedirs(savedir, exist_ok=True)
 
@@ -1500,12 +1502,13 @@ def plot_gc_passes(per_genome, output):
     plt.axvspan(hi, x.max(), color="0.9", zorder=0)
     plt.xlabel("GC fraction of the window's fragment-sized neighbourhood")
     plt.ylabel("correction divisor, normalised to its median")
-    plt.title(f"{samplename}_GC bias: both passes and their product\n"
-              f"grey bands are outside the 1st-99th GC percentile",
+    plt.title("GC bias: both passes and their product, pooled across "
+              f"{len(per_genome)} sequence(s)\n"
+              "grey bands are outside the 1st-99th GC percentile",
               fontsize=10)
     plt.legend(loc="best", fontsize=9)
 
-    path = os.path.join(savedir, "%s_GC_passes.pdf" % samplename.replace(" ", "_"))
+    path = os.path.join(savedir, "GC_passes.pdf")
     plt.savefig(path, format="pdf", bbox_inches="tight")
     plt.close()
     return path

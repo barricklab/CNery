@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import numpy as np
 import pandas as pd
@@ -7,7 +9,9 @@ from CNery.core import (
     FRAG_SCAN_MIN_CANDIDATES,
     frag_candidates,
     frag_scan_target,
+    gc_cor_plots,
     gc_percent_for_frag,
+    plot_gc_passes,
     preprocess,
     reference_gc_flags,
     select_frag_size,
@@ -475,3 +479,55 @@ class TestNothingToFit:
         out = apply_gc_correction(df, fit_gc_bias(df))
         np.testing.assert_allclose(out["gc_corr_fact"], 1.0)
         np.testing.assert_allclose(out["gc_corr_norm_cov"], out["norm_raw_cov"])
+
+
+class TestPooledFiguresAreNamedGenerically:
+    """The two pooled GC figures used to be named for every sequence in the run,
+    joined. A 137-contig draft assembly then produced a 2,700-character basename
+    and the run died inside savefig() with errno 63 -- after every per-sequence
+    output had already been written, so it read as a plotting bug rather than a
+    naming one. They are one-per-run files in a per-run directory, so the name
+    does not have to identify anything."""
+
+    POOLED = ["GC_passes.pdf", "GC_vs_NormRds.pdf"]
+
+    @staticmethod
+    def _pooled(genome_ids, n_per=6):
+        rng = np.random.default_rng(0)
+        frames = {}
+        for gid in genome_ids:
+            gc = np.linspace(0.3, 0.6, n_per)
+            frames[gid] = pd.DataFrame({
+                "genome_id": gid,
+                "gc_percent": gc,
+                "norm_raw_cov": 1.0 + 0.01 * rng.standard_normal(n_per),
+                "gc_corr_norm_cov": np.full(n_per, 1.0),
+                "gc_corr_fact": 1.0 + 0.05 * (gc - 0.45),
+                "gc_corr_fact_pass1": 1.0 + 0.04 * (gc - 0.45),
+                "gc_corr_fact_pass2": 1.0 + 0.01 * (gc - 0.45),
+                "is_deletion": False,
+                "is_redundant": False,
+            })
+        return frames
+
+    @pytest.mark.parametrize("n", [1, 2, 137])
+    def test_the_names_do_not_depend_on_the_sequences(self, tmp_path, n):
+        ids = [f"NZ_MJGT010{i:05d}" for i in range(1, n + 1)]
+        frames = self._pooled(ids)
+        out = str(tmp_path / "CNV_out")
+
+        gc_cor_plots(pd.concat(frames.values(), ignore_index=True), out)
+        assert plot_gc_passes(frames, out).endswith("/GC_passes.pdf")
+
+        assert sorted(os.listdir(os.path.join(out, "GC_bias"))) == self.POOLED
+
+    def test_the_name_does_not_depend_on_how_o_was_spelled(self, tmp_path):
+        # Every per-sequence writer prefixes sample_prefix(output) for this
+        # reason; these two need no discriminator at all, so they must not
+        # acquire one from the trailing slash either.
+        frames = self._pooled(["chrA", "chrB"])
+        pooled = pd.concat(frames.values(), ignore_index=True)
+        for spelling in (str(tmp_path / "CNV_out"), str(tmp_path / "CNV_out") + "/"):
+            gc_cor_plots(pooled, spelling)
+            plot_gc_passes(frames, spelling)
+        assert sorted(os.listdir(str(tmp_path / "CNV_out" / "GC_bias"))) == self.POOLED

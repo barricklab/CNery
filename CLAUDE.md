@@ -874,6 +874,16 @@ are rejected before `get_CNV.main` creates any output directory.
   `OTR_corr/chrA_otr_results.json` beside `CNV_csv/CNV_outchrA_CNV.csv` — the JSON silently losing
   the sample prefix. The name must not depend on how the caller spelled `-o`. **This renamed both
   JSONs under the default `-o`**, so breseq may need updating if it globs for the old spelling.
+- **The two pooled GC figures are named `GC_bias/GC_vs_NormRds.pdf` and
+  `GC_bias/GC_passes.pdf` — no sample prefix, no sequence IDs.** They are the only outputs pooled
+  across the whole run, so exactly one of each lands in a given output directory and that directory
+  is already the discriminator; everything else is per-sequence and needs `<sample><seq_id>` to tell
+  the files apart. They used to join *every* genome ID into the name, which grows without bound: a
+  137-contig draft assembly produced a 2,700-character basename and the run died inside `savefig()`
+  with `OSError: [Errno 63] File name too long` — *after* every per-sequence output had been
+  written, which made it read as a plotting bug. The count of sequences moved into the plot titles,
+  where it is legible without being a filename. **This renames both files**; breseq does not read
+  them, but a user script that globbed for the old spelling will need updating.
 - `predict_ori_ter_from_skew` (`core.py`) **does not censor** `is_deletion` / `is_redundant`
   windows, unlike every other fit stage. GC skew is a property of the *reference sequence*, and a
   deletion in the sample does not change the reference's base composition. Because `cum_gc_skew`
