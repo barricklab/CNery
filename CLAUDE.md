@@ -35,16 +35,18 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 729; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 396, offline, ~50s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 333, real coverage tables (32 skip per-sequence)
+conda run -p $PWD/env pytest                    # all 948; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 567, offline, ~90s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 381, real coverage tables (35 skip per-sequence)
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
 ```
 
-**pandas 2 and pandas 3 are both supported, and the suite is identical on each** — 697 passed, 32
-skipped on 2.3.3 and on 3.0.5, goldens included. The `pandas<3` cap is gone; what replaced it is two
+**pandas 2 and pandas 3 are both supported, and the suite is identical on each** — measured at
+697/32 on 2.3.3 and 3.0.5 when that was established, goldens included; the suite has grown since
+and currently reads **913 passed, 35 skipped** on 3.0.5 (2.3.3 not re-measured).
+The `pandas<3` cap is gone; what replaced it is two
 invariants that are not obvious from the code, both recorded in `dev-environment.yml`:
 
 1. **Every function in `core.py` that takes a DataFrame and writes to it calls `.copy()` first.**
@@ -626,6 +628,89 @@ sample**. Passing two samples' tables together cross-normalizes them against eac
 
 Note that `process_multi_genome` does no globbing: resolution is the caller's job, so that bad inputs
 are rejected before `get_CNV.main` creates any output directory.
+
+### Reference groups: several tables that are one molecule
+
+`--group-table` declares which coverage tables are contigs of ONE reference — breseq's `-c`. The
+unit of the background coverage distribution then becomes the **group**, not the sequence.
+
+**The bug it fixes.** `run_HMM` refits `mu` from whatever frame it is handed, so a contig is
+called CN 1 by construction whatever its real copy number. `cwbi_ssym_ht04` shows it on real
+data: its plasmids sit at 2.9531× and 1.8980× the chromosome, are published as
+`"Relative copy number"`, and are both called CN 1 (fitted mu 100.9 / 300.0 / 194.6). Grouped,
+they call 3 and 2 — `TestReferenceGroupOnRealCoverage` pins both directions.
+
+**A sequence in no group is a group of ONE.** `resolve_reference_groups` returns a mapping that is
+total over the inputs, so no consumer carries an `if grouped:` — the only predicate anywhere is
+`len(members[group_id]) > 1`. That is also what makes the invariant testable, and the invariant is
+the design: **a run with no `--group-table` and a run whose table groups nothing produce
+byte-identical output**, pinned end to end by
+`tests/test_cli.py::TestReferenceGroups::test_an_all_singleton_table_is_byte_identical_to_no_table`
+(PDFs by name only — matplotlib stamps a `CreationDate`; do not "fix" that by comparing bytes).
+
+**The table names FILES, exactly.** Columns `file` and `group`; any other column is ignored.
+Relative paths resolve against the table's own directory. There is deliberately **no stem matching
+and no ending inference**, unlike `genome_id_from_path`: a near-miss between breseq's sequence ID
+and the name CNery derives from a file is the failure this handoff invites, and matching it loosely
+would turn that into a silently *ungrouped* run — reproducing the very bug the table exists to fix.
+For the same reason the table must correspond to the run exactly in both directions; a row with no
+input, or an input with no row, is an error and not a warning. With no positional `INPUT`, the
+table also **supplies** the coverage tables to read, which is what keeps breseq's command line to
+one line on a 137-contig assembly.
+
+**`run_HMM` is `run_HMM_group` on one member**, literally — a wrapper, so the two cannot drift.
+Every pooled step is written so that pooling one member is the same numpy call on the same array
+(`np.concatenate([a])` is a copy of `a`, a max over one element is that element, a union of one set
+is that set). Eight goldens depend on it; if one moves, the refactor is wrong, not the golden.
+
+| shared across the group | why it must be |
+| --- | --- |
+| the read-count median behind `otr_gc_corr_rdcnt_cov` and `plot_copy`'s second axis | two contigs of one library would otherwise carry two read-count scales; `group_read_count_scale` is the single definition both use, because computing it twice is how that alignment was lost before (CN-1 line drawn 56% and 92% too high) |
+| the offset anchor | an offset is meaningful only up to a constant, trading off against `mu` — re-centred per member, one `mu` means a different depth on each and the shared fit is void |
+| `fit_censored_negative_binomial`, so `mu` and `size` | the point of the feature |
+| the `min_called_windows` verdict | per contig, a 20 kb contig reverts to observing repeat windows while its 3 Mb sibling censors them |
+| the level grid, refinement included | members on different grids produce `State` values that are not comparable and are priced differently |
+| `_baseline_mu` under `-p` | **correctness, not polish**: it takes the modal level OF THE FRAME IT IS GIVEN, so run per contig every contig's mode is 1.0 by construction and the shared baseline is undone in round 1 |
+| `add_cn_censor`'s `CN_CENSOR_MIN_KEEP` floor (`cn_censor_keep_fraction`) | the floor asks whether enough of *the thing with one baseline* survives, and the verdict must be uniform or one contig's pass-2 fits see the censor while its sibling's do not, both feeding the same pooled `g2` |
+
+| NOT shared | why |
+| --- | --- |
+| the decode | contig order is unknown, so **Viterbi never crosses a member boundary**: a segment spanning the join asserts an adjacency nobody has evidence for, and its `Startpos`/`Segment_Size` mean nothing in either contig's coordinates — in a file breseq parses into an AMP |
+| `window_geometry` | `np.diff` over a concatenation crosses that join |
+| `robust_state_count` | its 3-window median filter would smear a peak at the head of one contig against the tail of another. Sized per member against the shared `mu`; the group takes the largest |
+| the degenerate short-circuit, and every write | one contig with no reads must not take its siblings down, and it is kept out of the group's depth |
+
+**OTR and GC skew are declined for a group of ≥ 2**, and only for ≥ 2: the justification is that
+order and orientation are unknown, which is a property of a multi-contig assembly and not of the
+group abstraction. The OTR decline reuses the existing `--bias gc`/`none` branch in `correct_one`,
+which already aliases `otr_gc_corr_norm_cov` and leaves `otr_gc_corr_fact` unwritten — exactly what
+`bias_offsets` needs. The bias mode is checked **first**, so `--bias gc` on a grouped run still says
+so. Both files are still written: the skew gets `no_skew_prediction(reason=...)` (the 1000-surrogate
+bootstrap and the PDF skipped, ~0.15 s a sequence for a coordinate that means nothing), and the OTR
+record gains `"Reference group"`, present and `null` when ungrouped so a reader never tells "not in
+a group" from "this CNery predates the key". `Windows` stays 0 in that skew record even for a
+healthy contig — it is what `_otr_skew_candidate` checks the positional indices against, and those
+ARE 0.
+
+**`relative_copy_numbers` measures the group**, pooling every member's censored windows into ONE
+median rather than averaging per-member medians (on a draft assembly those are estimates of wildly
+different precision, and pooling weights each contig by its window count). The anchor is the
+longest GROUP by summed length, so a finished chromosome beside a longer draft assembly no longer
+reads exactly 1.0. Correct, and surprising; it is in `README.md`.
+
+**`frag_scan_target` stays PER SEQUENCE and must not be made per-group.** Its normalisation
+(`core.py`) exists to stop GC acting as a *replicon label*, and contigs are the worst case for that
+confound — hundreds of short sequences, each with near-constant GC at large `frag`, each at its own
+level, is a stronger label than CWBI's two plasmids ever supplied. Under grouping a multi-copy
+contig is called CN 3 anyway, so every one of its windows becomes `is_cn_variant` and it leaves the
+scan entirely. Leaving it alone also keeps a real invariant: the chosen fragment size is a property
+of the library and does not move when references are regrouped.
+
+**Both passes are group-major** in `get_CNV.main` and in `tests/test_authentic.py::_run_pipeline`:
+per-member corrections, then one `run_HMM_group`, then per-member staging and plots. With every
+group a singleton that reproduces the old interleaving *and the old stdout*, which is what makes
+the byte-identity test meaningful. The harness mirroring `main()` has cost real debugging twice
+already, and this is where they would drift next.
 
 ### Deliberate behavior that reads like a bug
 

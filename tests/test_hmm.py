@@ -1,3 +1,4 @@
+import os
 from itertools import product
 
 import pytest
@@ -8,6 +9,7 @@ from scipy.stats import nbinom
 from CNery.core import (
     offset_tau,
     run_HMM,
+    run_HMM_group,
     setup_transition_matrix,
     setup_emission_matrix,
     make_viterbi_mat,
@@ -1608,3 +1610,214 @@ def test_a_refinement_that_adds_nothing_returns_the_same_grid():
     rather than as a grown grid, or run_HMM spends a decode discovering it."""
     levels = polymorphism_levels(39, 0.05)
     assert refine_levels(levels, [34.0], 0.05) is levels
+
+
+# ---------------------------------------------------------------------------
+# Reference groups: several sequences that are really one molecule.
+# ---------------------------------------------------------------------------
+def _member_frame(genome_id, n=600, depth=100.0, level=1.0, relvar=0.0266, seed=0):
+    """One contig of a draft assembly, at a known multiple of the group baseline.
+
+    `_poly_frame`'s generator, but the level is a property of the whole frame --
+    that is what a contig sitting at 3x the assembly's baseline looks like -- and
+    `norm_raw_cov` is normalised against the GROUP, as process_multi_genome's
+    pooled median does, rather than against this frame's own median.
+    """
+    size = 1.0 / max(relvar - 1.0 / depth, 1e-4)
+    rng = np.random.default_rng(seed)
+    lam = level
+    rc = rng.negative_binomial(
+        size * lam, size * lam / (size * lam + depth * lam), size=n).astype(float)
+    win_st = np.arange(n) * 100
+    return pd.DataFrame({
+        "genome_id": genome_id, "win_st": win_st, "win_end": win_st + 100,
+        "win_len": 100, "gc_percent": 0.5, "read_count_cov": rc,
+        "norm_raw_cov": rc / depth, "gc_corr_norm_cov": rc / depth,
+        "gc_corr_fact": np.ones(n), "otr_gc_corr_norm_cov": rc / depth,
+        "otr_gc_corr_fact": np.ones(n), "window_num": np.arange(n),
+    })
+
+
+def _ensure_csv_dir(tmp_path):
+    os.makedirs(os.path.join(str(tmp_path), "CNV_csv"), exist_ok=True)
+    return str(tmp_path)
+
+
+class TestAGroupOfOneIsRunHMM:
+    """run_HMM IS run_HMM_group on one member, so the two cannot drift apart.
+
+    Everything the grouping pools is written so that pooling one member is the
+    same numpy call on the same array. Eight authentic goldens rest on it; this
+    is the same claim at unit scale, where a failure is diagnosable.
+    """
+
+    def test_the_frames_are_identical(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        df = _member_frame("chr1", n=600, seed=3)
+        alone = run_HMM(df, out, write=False)
+        grouped = run_HMM_group({"chr1": df}, out, write=False)["chr1"]
+        pd.testing.assert_frame_equal(alone, grouped)
+
+    def test_the_break_points_are_byte_identical(self, tmp_path):
+        a = _ensure_csv_dir(tmp_path / "a")
+        b = _ensure_csv_dir(tmp_path / "b")
+        df = _member_frame("chr1", n=600, seed=4)
+        run_HMM(df, a)
+        run_HMM_group({"chr1": df}, b)
+        assert (open(os.path.join(a, "CNV_csv", "achr1_break_pts.csv")).read()
+                == open(os.path.join(b, "CNV_csv", "bchr1_break_pts.csv")).read())
+
+    def test_a_degenerate_lone_member_still_writes_its_files(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        df = _member_frame("dead", n=200)
+        df["read_count_cov"] = 0.0
+        got = run_HMM_group({"dead": df}, out)["dead"]
+        assert (got["prob_copy_number"] == 0).all()
+        assert os.path.exists(
+            os.path.join(out, "CNV_csv", f"{os.path.basename(out)}dead_break_pts.csv"))
+
+
+class TestSharedBaseline:
+    """The headline behaviour: a contig at 3x the assembly is called CN 3."""
+
+    def test_ungrouped_every_contig_is_called_single_copy(self, tmp_path):
+        # The bug this feature exists to fix. Each contig refits its own mu, so
+        # its own level becomes 1.0 whatever it really is.
+        out = _ensure_csv_dir(tmp_path)
+        for level in (1.0, 2.0, 3.0):
+            df = _member_frame("c", n=600, level=level, seed=int(level))
+            called = run_HMM(df, out, write=False)
+            assert called["prob_copy_number"].mode()[0] == 1
+
+    @pytest.mark.parametrize("level,expected", [(2.0, 2), (3.0, 3)])
+    def test_grouped_the_contig_is_called_at_its_real_level(
+            self, tmp_path, level, expected):
+        out = _ensure_csv_dir(tmp_path)
+        frames = {
+            "c1": _member_frame("c1", n=900, level=1.0, seed=1),
+            "c2": _member_frame("c2", n=600, level=level, seed=2),
+        }
+        got = run_HMM_group(frames, out, write=False, group_id="asm")
+        assert (got["c1"]["prob_copy_number"] == 1).all()
+        assert (got["c2"]["prob_copy_number"] == expected).all()
+
+    def test_the_answer_does_not_depend_on_member_order(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        a = _member_frame("c1", n=900, level=1.0, seed=1)
+        b = _member_frame("c2", n=600, level=3.0, seed=2)
+        forward = run_HMM_group({"c1": a, "c2": b}, out, write=False, group_id="asm")
+        reverse = run_HMM_group({"c2": b, "c1": a}, out, write=False, group_id="asm")
+        for gid in ("c1", "c2"):
+            np.testing.assert_array_equal(
+                forward[gid]["prob_copy_number"].to_numpy(),
+                reverse[gid]["prob_copy_number"].to_numpy(),
+            )
+
+    def test_one_read_count_scale_for_the_whole_group(self, tmp_path):
+        # otr_gc_corr_rdcnt_cov is corrected coverage times the baseline depth.
+        # Per contig, two members of one assembly would carry two different
+        # read-count axes for the same library, and the CN-1 line on the plot
+        # would stop passing through the data it labels.
+        out = _ensure_csv_dir(tmp_path)
+        frames = {
+            "c1": _member_frame("c1", n=900, level=1.0, seed=1),
+            "c2": _member_frame("c2", n=600, level=3.0, seed=2),
+        }
+        got = run_HMM_group(frames, out, write=False, group_id="asm")
+        ratio = (got["c2"]["otr_gc_corr_rdcnt_cov"].median()
+                 / got["c1"]["otr_gc_corr_rdcnt_cov"].median())
+        assert ratio == pytest.approx(3.0, rel=0.05)
+
+    def test_a_dead_contig_does_not_take_the_group_down(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        dead = _member_frame("dead", n=200, seed=9)
+        dead["read_count_cov"] = 0.0
+        dead["otr_gc_corr_norm_cov"] = 0.0
+        frames = {
+            "c1": _member_frame("c1", n=900, level=1.0, seed=1),
+            "dead": dead,
+            "c2": _member_frame("c2", n=600, level=3.0, seed=2),
+        }
+        got = run_HMM_group(frames, out, write=False, group_id="asm")
+        assert (got["dead"]["prob_copy_number"] == 0).all()
+        assert (got["c2"]["prob_copy_number"] == 3).all()
+        # And its zeros are kept out of the group's depth, or they would drag
+        # the baseline down and push every other contig's call up.
+        assert (got["c1"]["prob_copy_number"] == 1).all()
+
+
+class TestTheDecodeNeverCrossesAContig:
+    """Contig order is unknown, so an adjacency across the join is invented."""
+
+    def test_no_segment_spans_two_members(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        # Both members entirely at 3x: a naive concatenation would merge them
+        # into one segment running off the end of the first contig.
+        frames = {
+            "c1": _member_frame("c1", n=700, level=1.0, seed=1),
+            "c2": _member_frame("c2", n=400, level=3.0, seed=2),
+            "c3": _member_frame("c3", n=400, level=3.0, seed=3),
+        }
+        run_HMM_group(frames, out, group_id="asm")
+        prefix = os.path.basename(out)
+        for gid, df in frames.items():
+            breaks = pd.read_csv(
+                os.path.join(out, "CNV_csv", f"{prefix}{gid}_break_pts.csv"))
+            end = int(df["win_end"].max())
+            assert breaks["Startpos"].min() >= int(df["win_st"].min())
+            assert (breaks["Startpos"] + breaks["Segment_Size"]).max() <= end
+
+
+class TestTheObservationMaskIsAGroupVerdict:
+    def test_short_contigs_censor_repeats_when_the_group_is_long_enough(
+            self, tmp_path):
+        # min_called_windows is a floor on the OBSERVATION mask. Decided per
+        # contig, two 60-window contigs each revert to observing their repeat
+        # windows; pooled they clear 100 and both censor, as one 120-window
+        # sequence would.
+        out = _ensure_csv_dir(tmp_path)
+        frames = {}
+        for gid, seed in (("c1", 1), ("c2", 2)):
+            df = _member_frame(gid, n=60, seed=seed)
+            df["is_redundant"] = False
+            df.loc[df.index[:5], "is_redundant"] = True
+            df.loc[df.index[:5], "read_count_cov"] *= 8.0
+            frames[gid] = df
+        grouped = run_HMM_group(frames, out, write=False, group_id="asm")
+        alone = {gid: run_HMM(df, out, write=False) for gid, df in frames.items()}
+        # The repeat pile-up invents its own high-CN segment when it is observed.
+        assert max(int(d["prob_copy_number"].max()) for d in grouped.values()) \
+            <= max(int(d["prob_copy_number"].max()) for d in alone.values())
+        assert (grouped["c1"]["prob_copy_number"] == 1).all()
+
+
+class TestPolymorphismUnderAGroup:
+    def test_a_member_entirely_off_baseline_keeps_its_level(self, tmp_path):
+        # _baseline_mu takes the modal level of the frame it is given. Run per
+        # contig, c2's own mode is 1.0 by construction and the shared baseline is
+        # undone in the first round -- this is the test that fails without the
+        # pooled re-anchoring.
+        out = _ensure_csv_dir(tmp_path)
+        frames = {
+            "c1": _member_frame("c1", n=2400, level=1.0, depth=400.0, seed=1),
+            "c2": _member_frame("c2", n=800, level=1.30, depth=400.0, seed=2),
+        }
+        got = run_HMM_group(frames, out, write=False, group_id="asm",
+                            polymorphism=True, cn_resolution=0.05)
+        assert float(got["c1"]["prob_copy_number"].mode()[0]) == pytest.approx(1.0)
+        assert float(got["c2"]["prob_copy_number"].mode()[0]) == pytest.approx(
+            1.30, abs=0.06)
+
+    def test_the_grid_is_shared(self, tmp_path):
+        out = _ensure_csv_dir(tmp_path)
+        frames = {
+            "c1": _member_frame("c1", n=2400, level=1.0, depth=400.0, seed=1),
+            "c2": _member_frame("c2", n=800, level=1.30, depth=400.0, seed=2),
+        }
+        got = run_HMM_group(frames, out, write=False, group_id="asm",
+                            polymorphism=True, cn_resolution=0.05)
+        # Every call, on either member, is a point of one resolution-spaced grid.
+        for df in got.values():
+            levels = df["prob_copy_number"].to_numpy(dtype=float)
+            np.testing.assert_allclose(
+                levels, np.round(levels / 0.05) * 0.05, atol=1e-9)

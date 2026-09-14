@@ -67,7 +67,50 @@ CNery coverage/ --file-ending cov.txt
 CNery coverage/ --file-ending cov.txt --file-ending coverage.csv
 ```
 
-Naming a folder is also how to keep the command line short on a draft assembly. breseq's
+### Reference groups — contigs of one draft assembly
+
+A draft genome arrives as hundreds of contigs, and CNery calls copy number per reference: each
+contig refits its own baseline, so **every one of them comes out at copy number 1** however
+amplified it really is. `--group-table` says which coverage tables are contigs of one molecule
+(breseq's `-c`) so that they share a single background coverage distribution.
+
+```bash
+CNery --group-table 08_mutation_identification/reference_groups.tsv -o CNV_out
+```
+
+The table has two columns, `file` and `group`; any other column is ignored, so it can carry
+provenance. `file` names a coverage table **exactly** — no stem matching — resolved relative to
+the table's own folder. A blank `group` means the sequence stands alone.
+
+```
+file	group	length	source
+REL606.coverage.tsv		4629812	REL606.gbk
+pKAN.coverage.tsv		5988	pKAN.gbk
+NZ_MJGT01000001.coverage.tsv	pine3-8-t1	412887	pine3-8-t1.fasta
+NZ_MJGT01000002.coverage.tsv	pine3-8-t1	98014	pine3-8-t1.fasta
+```
+
+For a group of two or more sequences:
+
+- they share one baseline depth, one dispersion and one copy-number grid, so a contig at three
+  times the assembly's level is called copy number 3;
+- **origin-to-terminus correction is declined** and **GC skew is not measured** — contig order and
+  orientation are unknown, so there is no coordinate for a replication ramp or an origin to sit
+  along. Both still write their JSON, saying so;
+- `"Relative copy number"` is measured across the whole group, and the longest group anchors the
+  run at 1.0. A finished chromosome beside a longer draft assembly will therefore no longer read
+  exactly 1.0 — it reads its level relative to the assembly.
+
+A sequence in no group, and every sequence when `--group-table` is not given, behaves exactly as
+before. A table in which nothing is grouped is a no-op, which is what lets a caller pass the flag
+unconditionally.
+
+**The table can also supply the inputs.** With `--group-table` and no `INPUT` argument, the
+coverage tables read are the ones the table names — which is how breseq keeps its command line to
+one line on a draft assembly rather than repeating hundreds of paths. Given both, they must agree
+exactly: every input named by a row, every row naming an input.
+
+Naming a folder is another way to keep the command line short. breseq's
 `08_mutation_identification/` holds one `*.coverage.tsv` per contig — hundreds of them on a
 draft genome — beside its own `*.coverage.tab` files, which share a default ending but not the
 schema and would be rejected by name. Restricting the ending picks out exactly the tables CNery

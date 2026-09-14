@@ -211,6 +211,174 @@ class TestFileEndingFlag:
         assert any("chrA" in n for n in _csv_names(out))
 
 
+class TestGroupTableSuppliesTheInputs:
+    """--group-table with no INPUT: the table names the coverage tables to read.
+
+    This is the shape breseq will use. Its command line carried 137 absolute
+    paths, which is what the table already holds.
+    """
+
+    def _two(self, tmp_path):
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "chrA.coverage.tsv")
+        _write_table(cov / "chrB.coverage.tsv")
+        return cov
+
+    def test_the_run_reads_what_the_table_names(self, tmp_path, monkeypatch):
+        cov = self._two(tmp_path)
+        groups = cov / "groups.tsv"
+        groups.write_text(
+            "file\tgroup\nchrA.coverage.tsv\tasm\nchrB.coverage.tsv\tasm\n"
+        )
+        out = str(tmp_path / "out")
+        _run(monkeypatch, ["--group-table", str(groups), "-o", out,
+                           "-w", "100", "-s", "50"])
+
+        names = _csv_names(out)
+        assert any("chrA" in n for n in names)
+        assert any("chrB" in n for n in names)
+
+    def test_a_table_naming_a_missing_file_creates_no_output(
+            self, tmp_path, monkeypatch):
+        cov = self._two(tmp_path)
+        groups = cov / "groups.tsv"
+        groups.write_text("file\tgroup\nghost.coverage.tsv\t\n")
+        out = tmp_path / "out"
+        with pytest.raises(FileNotFoundError) as excinfo:
+            _run(monkeypatch, ["--group-table", str(groups), "-o", str(out)])
+        assert "ghost.coverage.tsv" in str(excinfo.value)
+        assert not out.exists()
+
+
+class TestReferenceGroups:
+    """Contigs of one draft assembly, called against one baseline."""
+
+    @staticmethod
+    def _pair(tmp_path, amp_cov=75):
+        """A long baseline contig at 25x and a shorter one at `amp_cov`."""
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "contig_1.coverage.tsv", seq=SEQ * 2, cov=25)
+        _write_table(cov / "contig_2.coverage.tsv", seq=SEQ, cov=amp_cov)
+        return cov
+
+    @staticmethod
+    def _groups(cov, label="asm"):
+        path = cov / "groups.tsv"
+        path.write_text(
+            "file\tgroup\n"
+            f"contig_1.coverage.tsv\t{label}\n"
+            f"contig_2.coverage.tsv\t{label}\n"
+        )
+        return path
+
+    @staticmethod
+    def _states(out, seq_id):
+        breaks = pd.read_csv(os.path.join(
+            out, "CNV_csv", f"{os.path.basename(out)}{seq_id}_break_pts.csv"))
+        return breaks
+
+    def test_ungrouped_the_amplified_contig_reads_single_copy(
+            self, tmp_path, monkeypatch):
+        # The bug: each contig refits its own baseline, so 75x reads as CN 1.
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "-o", out, "-w", "100", "-s", "50"])
+        assert set(self._states(out, "contig_2")["State"]) == {1}
+
+    @pytest.mark.parametrize("amp_cov,expected", [(75, 3), (50, 2)])
+    def test_grouped_it_reads_its_real_copy_number(
+            self, tmp_path, monkeypatch, amp_cov, expected):
+        cov = self._pair(tmp_path, amp_cov=amp_cov)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        assert set(self._states(out, "contig_1")["State"]) == {1}
+        amplified = self._states(out, "contig_2")
+        assert set(amplified["State"]) == {expected}
+        # The file breseq parses: three columns, and State an integer.
+        assert list(amplified.columns) == ["Startpos", "State", "Segment_Size"]
+        assert amplified["State"].dtype == "int64"
+
+    def test_otr_is_declined_and_says_which_group(self, tmp_path, monkeypatch):
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        for seq_id in ("contig_1", "contig_2"):
+            record = _otr_json(out, seq_id)          # strict JSON or it raises
+            assert record["Reference group"] == "asm"
+            assert "asm" in record["Correction type"]
+            assert record["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+            # breseq does not type-check these, so a null costs it the file.
+            assert isinstance(record["Origin window"], int)
+            assert isinstance(record["Terminus window"], int)
+
+    def test_gc_skew_is_not_measured_but_is_still_reported(
+            self, tmp_path, monkeypatch):
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        prefix = os.path.basename(out)
+        for seq_id in ("contig_1", "contig_2"):
+            path = os.path.join(
+                out, "GC_skew", f"{prefix}{seq_id}_gc_skew_results.json")
+            with open(path) as fh:
+                record = json.loads(fh.read(), parse_constant=_reject)
+            assert record["Prediction confident"] is False
+            assert "asm" in record["No prediction reason"]
+            # The curve's figure is not drawn -- there is no coordinate to draw
+            # it along -- following --bias gc, which writes its declined OTR
+            # record and no figure either.
+            assert not os.path.exists(
+                os.path.join(out, "GC_skew", f"{prefix}{seq_id}_GC_skew.pdf"))
+
+    def test_an_all_singleton_table_is_byte_identical_to_no_table(
+            self, tmp_path, monkeypatch):
+        """The invariant the whole feature rests on.
+
+        Passing --group-table with nothing grouped has to be indistinguishable
+        from not passing it -- that is what lets breseq write the table and pass
+        the flag unconditionally, instead of deciding per run whether any
+        reference is a draft assembly.
+        """
+        cov = self._pair(tmp_path)
+        groups = cov / "singletons.tsv"
+        groups.write_text(
+            "file\tgroup\n"
+            "contig_1.coverage.tsv\t\n"
+            "contig_2.coverage.tsv\t\n"
+        )
+        bare = str(tmp_path / "bare")
+        with_table = str(tmp_path / "with_table")
+        _run(monkeypatch, [str(cov), "-o", bare, "-w", "100", "-s", "50"])
+        _run(monkeypatch, [str(cov), "--group-table", str(groups),
+                           "-o", with_table, "-w", "100", "-s", "50"])
+
+        def tree(root):
+            return sorted(
+                os.path.relpath(os.path.join(dirpath, name), root)
+                for dirpath, _dirs, names in os.walk(root) for name in names
+            )
+
+        # The output prefix is the directory name, so every file is named for
+        # its own run; compare the trees by that relative path.
+        assert tree(bare) == [n.replace("with_table", "bare") for n in tree(with_table)]
+        for name in tree(bare):
+            other = name.replace("bare", "with_table")
+            a = os.path.join(bare, name)
+            b = os.path.join(with_table, other)
+            if name.endswith(".pdf"):
+                # matplotlib stamps a CreationDate into every PDF, so two runs
+                # never match byte for byte. Existence and name are the claim
+                # here; the numbers live in the CSVs and JSONs below. Do not
+                # "fix" this by comparing the bytes.
+                continue
+            assert open(a, "rb").read() == open(b, "rb").read(), name
+
+
 class TestBadInvocations:
     def test_missing_path_creates_no_output(self, tmp_path, monkeypatch):
         out = tmp_path / "out"
@@ -224,6 +392,28 @@ class TestBadInvocations:
         out = tmp_path / "out"
         with pytest.raises(FileNotFoundError):
             _run(monkeypatch, [str(empty), "-o", str(out)])
+        assert not out.exists()
+
+    def test_missing_group_table_creates_no_output(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = tmp_path / "out"
+        with pytest.raises(FileNotFoundError):
+            _run(monkeypatch, [str(table), "--group-table",
+                               str(tmp_path / "nope.tsv"), "-o", str(out)])
+        assert not out.exists()
+
+    def test_group_table_disagreeing_with_the_inputs_creates_no_output(
+            self, tmp_path, monkeypatch):
+        # The table has to name exactly the files the run reads. A drifted table
+        # would otherwise produce an ungrouped run that looks perfectly healthy.
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        groups = tmp_path / "groups.tsv"
+        groups.write_text("file\tgroup\nchrB.coverage.tsv\tasm\n")
+        out = tmp_path / "out"
+        with pytest.raises(ValueError) as excinfo:
+            _run(monkeypatch, [str(table), "--group-table", str(groups),
+                               "-o", str(out)])
+        assert "chrA.coverage.tsv" in str(excinfo.value)
         assert not out.exists()
 
     def test_duplicate_ids_create_no_output(self, tmp_path, monkeypatch):
@@ -269,7 +459,8 @@ class TestFlagSpellings:
         rendered = capsys.readouterr().out
         for flag in ("--change-rate", "--interior-change-rate",
                      "--fold-change-penalty", "--max-copy-number",
-                     "--polymorphism-mode", "--copy-number-resolution"):
+                     "--polymorphism-mode", "--copy-number-resolution",
+                     "--group-table"):
             assert flag in rendered
 
     @pytest.mark.parametrize("flag", [
@@ -278,6 +469,7 @@ class TestFlagSpellings:
         "-z", "--deletion-coverage-fraction", "--bias",
         "--interior-change-rate", "--fold-change-penalty", "--max-copy-number",
         "-p", "--polymorphism-mode", "--copy-number-resolution",
+        "--group-table",
     ])
     def test_flag_is_accepted(self, flag, tmp_path, monkeypatch):
         parser_args = {
@@ -299,6 +491,12 @@ class TestFlagSpellings:
         takes_no_value = {"-p", "--polymorphism-mode"}
         table = _write_table(tmp_path / "chrA.coverage.tsv")
         out = str(tmp_path / "out")
+        # --group-table needs a table naming exactly the one input written here;
+        # a generic value would be a path that does not exist.
+        if flag == "--group-table":
+            groups = tmp_path / "groups.tsv"
+            groups.write_text("file\tgroup\nchrA.coverage.tsv\t\n")
+            parser_args["--group-table"] = str(groups)
         argv = [str(table), flag]
         if flag not in takes_no_value:
             value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)

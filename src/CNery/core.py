@@ -342,6 +342,202 @@ def read_coverage_table(path):
     return normalize_coverage_columns(_read_coverage_table(path), path=path)
 
 
+# The two columns a reference group table must carry. Every other column is ignored,
+# so breseq can add provenance (length, source reference, accession) without breaking
+# a reader -- the same "adding is safe" rule the OTR results JSON lives under.
+REFERENCE_GROUP_COLUMNS = ("file", "group")
+
+# Cells that mean "this sequence is in no group". A blank is what breseq will write
+# for an ordinary reference; the others are what a person writes by hand.
+UNGROUPED_VALUES = ("", "na", "n/a", "none", "null", "-", ".", "nan")
+
+
+def read_group_table(path):
+    """Read a reference group table into an ordered [(abs path, group or None)].
+
+    The table declares which coverage tables are contigs of ONE reference -- breseq's
+    -c -- so that they can share a background coverage distribution. It names FILES,
+    exactly: a row is matched to an input by resolved path and nothing else. There is
+    deliberately no stem matching and no file-ending inference here, unlike
+    genome_id_from_path(), because a near-miss between breseq's sequence ID and the
+    name CNery derives from a file is precisely the failure this handoff invites, and
+    a fuzzy match would turn it into an ungrouped run -- silently reproducing the bug
+    the table exists to fix.
+
+    A relative path resolves against the TABLE'S OWN directory, not the working
+    directory, so breseq can write plain basenames beside the tables it just wrote and
+    the file stays valid wherever it is read from.
+
+    Format is detected, not declared, exactly as for a coverage table: the delimiter
+    comes from the header row and a `#` line is a comment anywhere in the file.
+    """
+    if os.path.isdir(path):
+        raise FileNotFoundError(
+            f"--group-table: {path} is a directory. Give the reference group table "
+            "itself; CNery does not search for it by name."
+        )
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--group-table: no such file: {path}")
+
+    df = pd.read_csv(path, sep=_detect_delimiter(path), header=0, comment="#")
+
+    missing = [c for c in REFERENCE_GROUP_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{path}: not a usable reference group table. Missing "
+            + ", ".join(missing)
+            + ". Expected a table carrying "
+            + ", ".join(REFERENCE_GROUP_COLUMNS)
+            + ", one row per reference sequence, where `file` is the coverage "
+            "table's file name. Found: "
+            + (", ".join(map(str, df.columns)) if len(df.columns) else "(no columns)")
+            + "."
+        )
+
+    base = os.path.dirname(os.path.abspath(path))
+    rows = []
+    for raw_file, raw_group in zip(df["file"], df["group"]):
+        name = "" if pd.isna(raw_file) else str(raw_file).strip()
+        if not name:
+            raise ValueError(
+                f"{path}: a row has an empty `file`. Every row names one coverage "
+                "table; leave `group` blank instead to say a sequence is in no group."
+            )
+        group = "" if pd.isna(raw_group) else str(raw_group).strip()
+        if group.lower() in UNGROUPED_VALUES:
+            group = None
+        rows.append((os.path.join(base, name), group))
+    return rows
+
+
+def resolve_reference_groups(coverage_inputs, rows=None, table_path=None):
+    """Map this run's sequences onto reference groups.
+
+    Returns (groups, members):
+      groups  -- {genome_id: group_id}, TOTAL over coverage_inputs
+      members -- {group_id: [genome_id, ...]}, in input order
+
+    A sequence with no group is a group of ONE, keyed by its own genome_id. That is
+    what keeps every consumer free of an `if grouped:` branch: the only question any
+    of them asks is whether len(members[group_id]) is more than one. It is also what
+    makes the invariant testable -- a table in which every sequence is its own group
+    has to be indistinguishable from no table at all.
+
+    The table must correspond to the run exactly, in both directions. A row naming a
+    file this run did not read, or a file read without a row, is an error rather than
+    a warning: either one means the table and the coverage tables have drifted apart,
+    and the failure it would otherwise produce is an ungrouped run that looks healthy.
+    """
+    groups = {}
+    if rows:
+        by_path = {}
+        seen_twice = []
+        for abs_path, group in rows:
+            key = os.path.realpath(abs_path)
+            if key in by_path:
+                seen_twice.append(abs_path)
+            by_path[key] = group
+
+        input_keys = {
+            os.path.realpath(path): genome_id
+            for genome_id, path in coverage_inputs.items()
+        }
+
+        missing_rows = [
+            path for genome_id, path in coverage_inputs.items()
+            if os.path.realpath(path) not in by_path
+        ]
+        extra_rows = [
+            abs_path for abs_path, _ in rows
+            if os.path.realpath(abs_path) not in input_keys
+        ]
+
+        problems = []
+        if seen_twice:
+            problems.append(
+                "named on more than one row: " + ", ".join(sorted(set(seen_twice)))
+            )
+        if extra_rows:
+            problems.append(
+                "named in the table but not read by this run: "
+                + ", ".join(sorted(set(extra_rows)))
+            )
+        if missing_rows:
+            problems.append(
+                "read by this run but absent from the table: "
+                + ", ".join(sorted(missing_rows))
+            )
+        if problems:
+            raise ValueError(
+                f"{table_path or 'reference group table'}: the table must name "
+                "exactly the coverage tables this run reads. Files "
+                + "; ".join(problems)
+                + "."
+            )
+
+        for genome_id, path in coverage_inputs.items():
+            groups[genome_id] = by_path[os.path.realpath(path)]
+
+    # Fill in the ungrouped, and check that no group label collides with a sequence
+    # ID. Groups are keyed by string and a singleton's key IS its genome_id, so a
+    # group called "REL606" beside a sequence called "REL606" would silently swallow
+    # it -- one loud rule beats carrying a parallel index around.
+    collisions = sorted(
+        {g for g in groups.values() if g is not None and g in coverage_inputs}
+    )
+    if collisions:
+        raise ValueError(
+            f"{table_path or 'reference group table'}: reference group(s) "
+            + ", ".join(collisions)
+            + " share a name with a sequence in this run. Group labels must not "
+            "collide with sequence IDs."
+        )
+
+    members = {}
+    for genome_id in coverage_inputs:
+        group_id = groups.get(genome_id) or genome_id
+        groups[genome_id] = group_id
+        members.setdefault(group_id, []).append(genome_id)
+    return groups, members
+
+
+def coverage_inputs_from_group_table(rows, file_endings=None, table_path=None):
+    """The {genome_id: path} mapping a group table implies, when it supplies the inputs.
+
+    Passing --group-table with no positional arguments is how breseq keeps its command
+    line to one line on a draft assembly: the table already names every coverage file,
+    so repeating all 137 of them as arguments says nothing new.
+
+    Sequence IDs still come from the file names, by the same rule as everywhere else,
+    so the duplicate-ID error is the same error resolve_coverage_inputs() raises.
+    """
+    missing = [p for p, _ in rows if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"{table_path or 'reference group table'}: no such coverage table(s): "
+            + ", ".join(sorted(missing))
+            + ". Paths are resolved against the group table's own directory."
+        )
+
+    resolved = {}
+    for path, _ in rows:
+        genome_id = genome_id_from_path(path, file_endings)
+        if genome_id in resolved:
+            raise ValueError(
+                f"Duplicate sequence ID {genome_id!r} from two inputs:\n"
+                f"  {resolved[genome_id]}\n"
+                f"  {path}\n"
+                "Sequence IDs come from the file name, so two tables cannot share "
+                "one. Rename a file or run them separately."
+            )
+        resolved[genome_id] = path
+    if not resolved:
+        raise FileNotFoundError(
+            f"{table_path or 'reference group table'}: names no coverage tables."
+        )
+    return resolved
+
+
 def preprocess(df, win=100, step=100, frag=400):
 
     if (step > win):
@@ -1106,7 +1302,7 @@ CN_CENSOR_MIN_KEEP = 0.5
 
 
 def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP,
-                  polymorphism=False, resolution=None):
+                  polymorphism=False, resolution=None, keep_fraction=None):
     """Flag windows a previous pass's HMM did not call CN = 1, for the next pass.
 
     Writes `is_cn_variant` and folds it into `exclude_from_fit`, which is the
@@ -1125,6 +1321,16 @@ def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP,
     Returns (df, applied). `applied` is False when the censor would leave under
     `min_keep` of the windows, in which case nothing is added and the second pass
     censors exactly as the first did.
+
+    `keep_fraction` overrides the surviving fraction the floor is tested against,
+    so a reference GROUP decides once for all its members. The floor's argument --
+    "a genuinely duplicated replicon is every window at CN=2, and censoring it
+    entirely is an empty fit" -- is about the thing that has one baseline, which
+    for a draft assembly is the assembly and not one contig. The verdict also has
+    to be uniform across members, or one contig's pass-2 fits would see the censor
+    while its sibling's did not, with both feeding the same pooled g2. Left None
+    it is computed from this frame alone, which is what a lone sequence has always
+    done.
     """
     df = df.copy()
     n = len(df)
@@ -1164,7 +1370,8 @@ def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP,
         if column in df.columns:
             base |= df[column].to_numpy(dtype=bool)
 
-    keep = (~(base | is_variant)).mean()
+    keep = (~(base | is_variant)).mean() if keep_fraction is None \
+        else float(keep_fraction)
     if keep < min_keep:
         df["is_cn_variant"] = np.zeros(n, dtype=bool)
         return df, False
@@ -1177,8 +1384,41 @@ def add_cn_censor(df, cn_col="prob_copy_number", min_keep=CN_CENSOR_MIN_KEEP,
     return df, True
 
 
+def cn_censor_keep_fraction(frames, cn_col="prob_copy_number",
+                            polymorphism=False, resolution=None):
+    """The fraction of a reference group's windows the CN censor would leave.
+
+    Computed over every member at once so add_cn_censor() reaches one verdict for
+    the whole group; see its `keep_fraction`. `frames` is an iterable of the
+    group's called frames, and the arithmetic is add_cn_censor()'s own, so a
+    single-member group gives exactly what that function computes for itself.
+    """
+    kept = 0
+    total = 0
+    for df in frames:
+        n = len(df)
+        if n == 0:
+            continue
+        total += n
+        if cn_col not in df.columns:
+            kept += n
+            continue
+        cn = df[cn_col].to_numpy(dtype=float)
+        if polymorphism:
+            band = DEFAULT_CN_RESOLUTION if resolution is None else float(resolution)
+            is_variant = np.isfinite(cn) & (np.abs(cn - 1.0) > band + 1e-9)
+        else:
+            is_variant = np.isfinite(cn) & (np.rint(cn) != 1)
+        base = np.zeros(n, dtype=bool)
+        for column in ("is_deletion", "is_redundant"):
+            if column in df.columns:
+                base |= df[column].to_numpy(dtype=bool)
+        kept += int((~(base | is_variant)).sum())
+    return kept / total if total else 0.0
+
+
 def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP, polymorphism=False,
-                resolution=None):
+                resolution=None, keep_fraction=None):
     """Snapshot the first pass's results and build the censor for the second.
 
     Every column the first pass produced is copied to a `*_pass1` name before the
@@ -1201,7 +1441,7 @@ def stage_pass1(df, min_keep=CN_CENSOR_MIN_KEEP, polymorphism=False,
         if column in df.columns:
             df[f"{column}_pass1"] = df[column].to_numpy()
     return add_cn_censor(df, min_keep=min_keep, polymorphism=polymorphism,
-                         resolution=resolution)
+                         resolution=resolution, keep_fraction=keep_fraction)
 
 
 #: Bootstrap replicates for the GC curve's pointwise uncertainty. This is a
@@ -3037,6 +3277,19 @@ def censored_median_coverage(df):
     present. On CWBI's plasmid_1 the censoring moves the estimate from 2.824 to
     2.946 -- 121 of its 232 windows carry redundant coverage.
     """
+    values = _censored_coverage_values(df)
+    return float(np.median(values)) if values.size else float("nan")
+
+
+def _censored_coverage_values(df):
+    """The values censored_median_coverage() takes a median of.
+
+    Split out so a reference GROUP can pool its members' values and take ONE
+    median of the lot, rather than a median of per-member medians -- on a draft
+    assembly those are estimates of wildly different precision, and pooling
+    weights each contig by its window count, which is what "one background
+    distribution" means.
+    """
     values = df["gc_corr_norm_cov"].to_numpy(dtype=float)
 
     keep = np.ones(len(df), dtype=bool)
@@ -3046,11 +3299,10 @@ def censored_median_coverage(df):
     if not keep.any():
         keep = np.ones(len(df), dtype=bool)
 
-    values = values[keep & np.isfinite(values)]
-    return float(np.median(values)) if values.size else float("nan")
+    return values[keep & np.isfinite(values)]
 
 
-def relative_copy_numbers(per_genome):
+def relative_copy_numbers(per_genome, groups=None):
     """{genome_id: copies relative to the LONGEST sequence}, which reads exactly 1.0.
 
     process_multi_genome() normalises every sequence against one pooled median, so
@@ -3065,29 +3317,60 @@ def relative_copy_numbers(per_genome):
     Sequences are ranked by `win_end.max()`. The frame does not carry the true
     sequence length and preprocess() drops the trailing partial window, so that is
     3,354,501 against a real 3,354,690 -- only the ordering matters.
+
+    With `groups` ({genome_id: group_id}) the unit is the reference GROUP, not the
+    sequence: a group's coverage is one median pooled over every member's windows,
+    its length is the sum of its members', and every member publishes the same
+    number. A draft assembly is one reference, so the contig that happens to be
+    longest must not anchor the run on its own behalf. An all-singleton mapping --
+    which is what `groups=None` means -- reproduces the per-sequence numbers
+    exactly, because a group's pooled array is then that one member's array.
     """
     if not per_genome:
         return {}
 
-    medians = {gid: censored_median_coverage(df) for gid, df in per_genome.items()}
+    if groups is None:
+        groups = {gid: gid for gid in per_genome}
 
-    # Rank only sequences that HAVE windows. A zero-window frame gives
+    members = {}
+    for gid in per_genome:
+        members.setdefault(groups[gid], []).append(gid)
+
+    medians = {
+        group_id: _pooled_censored_median(per_genome, gids)
+        for group_id, gids in members.items()
+    }
+
+    # Rank only groups with a member that HAS windows. A zero-window frame gives
     # win_end.max() == NaN, and max() with a NaN key silently returns the first
     # key it was given rather than raising -- so a single empty table sorting
     # first would anchor the whole run on a NaN median and write
     # "Relative copy number": null into every OTHER sequence's JSON, including
     # perfectly healthy ones.
-    ranked = [gid for gid in per_genome
-              if len(per_genome[gid]) and np.isfinite(per_genome[gid]["win_end"].max())]
-    if not ranked:
+    lengths = {}
+    for group_id, gids in members.items():
+        ends = [float(per_genome[gid]["win_end"].max())
+                for gid in gids
+                if len(per_genome[gid])
+                and np.isfinite(per_genome[gid]["win_end"].max())]
+        if ends:
+            lengths[group_id] = sum(ends)
+    if not lengths:
         return {gid: float("nan") for gid in per_genome}
 
-    longest = max(ranked, key=lambda gid: float(per_genome[gid]["win_end"].max()))
+    longest = max(lengths, key=lambda group_id: lengths[group_id])
     anchor = medians[longest]
 
     if not np.isfinite(anchor) or anchor <= 0:
         return {gid: float("nan") for gid in per_genome}
-    return {gid: medians[gid] / anchor for gid in per_genome}
+    return {gid: medians[groups[gid]] / anchor for gid in per_genome}
+
+
+def _pooled_censored_median(per_genome, genome_ids):
+    """One median over every window of every member, in the order given."""
+    values = [_censored_coverage_values(per_genome[gid]) for gid in genome_ids]
+    values = np.concatenate(values) if len(values) > 1 else values[0]
+    return float(np.median(values)) if values.size else float("nan")
 
 
 def write_otr_results(results, output, genome_id):
@@ -3118,7 +3401,8 @@ def write_otr_results(results, output, genome_id):
 
 
 def declined_otr_results(df, correction_type, reason=None,
-                         relative_copy_number=float("nan")):
+                         relative_copy_number=float("nan"),
+                         reference_group=None):
     """The OTR record for a sequence no tent was fitted to.
 
     Covers the cases apply_otr_correction() never sees: --bias gc and --bias
@@ -3151,6 +3435,7 @@ def declined_otr_results(df, correction_type, reason=None,
     # Added, never substituted: CLAUDE.md records that adding keys is the only
     # change that is safe for breseq's reader.
     results["No usable coverage reason"] = reason
+    results["Reference group"] = reference_group
     return results
 
 
@@ -3174,7 +3459,7 @@ def _json_safe(value):
 
 
 def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
-                         relative_copy_number=1.0, extra_results=None):
+                         relative_copy_number=1.0, extra_results=None, reference_group=None):
     """
     Apply stage: evaluate the fitted OTR curve at every window, write
     plots/results JSON, and return (df, ori_win, ter_win) -- SAME
@@ -3266,6 +3551,9 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     # declines it, run_HMM() calls it CN 0 -- so nothing upstream would otherwise
     # have said so in the file.
     results["No usable coverage reason"] = no_coverage
+    # Present on every record too, and null for a lone sequence, so a reader
+    # never tells "not in a group" from "this CNery predates the key".
+    results["Reference group"] = reference_group
 
     if extra_results:
         results.update(extra_results)
@@ -3537,8 +3825,8 @@ def plot_no_data(output, subdir, filename, title, message):
     return path
 
 
-def no_skew_prediction():
-    """The GC-skew record for a reference with no windows to measure skew over.
+def no_skew_prediction(reason=None):
+    """The GC-skew record for a reference whose skew was not measured.
 
     predict_ori_ter_from_skew() raises on an empty frame, deliberately -- a
     caller reaching it with no windows has a bug. A coverage table with no
@@ -3546,9 +3834,19 @@ def no_skew_prediction():
     and the file still has to exist, because a reader that finds one sequence's
     GC_skew JSON missing cannot tell "no data" from "the run died here".
 
-    Every value is finite: write_gc_skew_results() dumps with allow_nan=False,
-    and plot_gc_skew() formats the separation as a percentage and the p-value
-    with :.3g, neither of which tolerates None.
+    Also used for a contig of a reference group, where skew is not measured at
+    all: cumulative GC skew locates an origin along a coordinate, and a draft
+    assembly has none. `reason` says which case this is, in the same shape as
+    declined_otr_results()' own.
+
+    `Windows` stays 0 even when the reference has plenty. It is what
+    _otr_skew_candidate() checks the positional indices against, and those ARE 0
+    here -- a real count beside index 0 would pass that check and then hand
+    otr_fit() coordinates that mean nothing.
+
+    Every other value is finite: write_gc_skew_results() dumps with
+    allow_nan=False, and plot_gc_skew() formats the separation as a percentage
+    and the p-value with :.3g, neither of which tolerates None.
     """
     return {
         "Origin (bp)": 0,
@@ -3563,6 +3861,7 @@ def no_skew_prediction():
         "Bootstrap surrogates": 0,
         "Prediction confident": False,
         "Prediction method": GC_SKEW_METHOD,
+        "No prediction reason": reason,
     }
 
 
@@ -4058,7 +4357,7 @@ def _cnv_axis_ticks(candidate_cn_ticks, lo1, hi1, lo2, hi2):
     return cn, [lo2 + (t - lo1) * scale for t in cn]
 
 
-def _cnv_axis_limits(df_cnv, drawn, delta):
+def _cnv_axis_limits(df_cnv, drawn, delta, scale=None):
     """Limits for plot_copy's twinned axes: ((CN lo, hi), (read count lo, hi)).
 
     ONE SCALE, TWO LABELS. The read-count axis is the copy-number axis multiplied
@@ -4076,9 +4375,14 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
     labelling.
 
     `scale` comes from EVERY window rather than the drawn ones, because that is
-    the median run_HMM used when it built otr_gc_corr_rdcnt_cov.
+    the median run_HMM used when it built otr_gc_corr_rdcnt_cov. A caller may pass
+    it in for the same reason: under a reference group that median is the GROUP'S,
+    so recomputing it here from one contig would put the CN-1 line back off the
+    data it labels -- the exact regression the paragraph above records.
     """
-    scale = float(df_cnv["read_count_cov"].median())
+    if scale is None:
+        scale = float(df_cnv["read_count_cov"].median())
+    scale = float(scale)
     if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
 
@@ -4106,7 +4410,7 @@ def _cnv_axis_limits(df_cnv, drawn, delta):
     return (lo2 / scale, hi2 / scale), (lo2, hi2)
 
 
-def plot_copy(df_cnv, pltstart, pltend, output):
+def plot_copy(df_cnv, pltstart, pltend, output, scale=None):
     
     genome_id = str(df_cnv["genome_id"].iloc[0])
     # No separator, like every other writer in this file -- run_HMM names this
@@ -4220,7 +4524,7 @@ def plot_copy(df_cnv, pltstart, pltend, output):
 
     delta = int(drawn["read_count_cov"].median() * 0.5)
     
-    (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df_cnv, drawn, delta)
+    (lo1, hi1), (lo2, hi2) = _cnv_axis_limits(df_cnv, drawn, delta, scale=scale)
     ax1.set_ylim(lo1, hi1)
     ax2.set_ylim(lo2, hi2)
 
@@ -5437,7 +5741,19 @@ def _baseline_mu(segments, win_st, counts, offsets):
 
     Returns None when there is nothing to anchor on.
     """
-    called = _called_levels_per_window(segments, win_st)
+    return _baseline_mu_from_levels(
+        _called_levels_per_window(segments, win_st), counts, offsets)
+
+
+def _baseline_mu_from_levels(called, counts, offsets):
+    """_baseline_mu's arithmetic, once the per-window levels are in hand.
+
+    Split out so a reference GROUP can pool its members' called levels, counts
+    and offsets and take ONE modal level. Run per member instead, every member's
+    own modal level is 1.0 by construction -- which is exactly the shared
+    baseline being undone.
+    """
+    called = np.asarray(called, dtype=float)
     finite = np.isfinite(called) & (called > 0)
     if not finite.any():
         return None
@@ -5497,6 +5813,473 @@ def _levels_wanting_refinement(segments, win_st, counts, offsets, mu, levels,
     return tuple(sorted(coarse))
 
 
+def _hmm_prepare(df, output, genome_id, bias):
+    """Everything about ONE sequence that a group's shared fit does not decide.
+
+    Split out of run_HMM so run_HMM_group() can do this per member, pool what has
+    to be pooled, and then decode each member separately. Nothing here depends on
+    the baseline, so a member can be prepared before the group has one.
+    """
+    genome_id = str(genome_id)
+    new_exp = df.copy()
+    new_exp.loc[:, "otr_gc_corr_norm_cov"] = np.nan_to_num(
+        new_exp["otr_gc_corr_norm_cov"].to_numpy())
+
+    # Raw counts and their bias offsets, over every window.
+    counts_all = np.rint(
+        np.nan_to_num(new_exp["read_count_cov"].to_numpy(dtype=float))
+    ).clip(min=0)
+    offsets_all = bias_offsets(new_exp, bias=bias)
+
+    if "is_redundant" in new_exp.columns:
+        not_redundant = ~new_exp["is_redundant"].to_numpy(dtype=bool)
+    else:
+        not_redundant = np.ones(len(new_exp), dtype=bool)
+
+    return {
+        "genome_id": genome_id,
+        "samplename": sample_prefix(output) + genome_id,
+        "new_exp": new_exp,
+        "counts_all": counts_all,
+        "offsets_all": offsets_all,
+        "not_redundant": not_redundant,
+    }
+
+
+def _hmm_emit_no_coverage(prep, saveloc, polymorphism, write):
+    """NOTHING TO CALL. Either the sequence has no windows, or every window is at
+    zero coverage. Both used to reach solve_pr(0.0, 0.0) and raise
+    ZeroDivisionError -- the moment fallback's guard is written `if mean > 0`,
+    so it steps over exactly the case that needs it. Every window is CN 0,
+    which is what "no reads mapped here" means, and the files are still
+    written: a caller that gets no CSV cannot tell this from a crash.
+
+    Stays per MEMBER inside a reference group: one contig that got no reads must
+    not take its siblings down, and it carries no evidence about their baseline.
+    """
+    new_exp = prep["new_exp"].reset_index(drop=True)
+    samplename = prep["samplename"]
+    new_exp["prob_copy_number"] = np.zeros(
+        len(new_exp), dtype=float if polymorphism else int)
+    if write:
+        empty_breaks = pd.DataFrame(
+            {"Startpos": pd.Series(dtype=int),
+             "State": pd.Series(dtype=float if polymorphism else int),
+             "Segment_Size": pd.Series(dtype=int)}
+        )
+        # Three columns, header row, no data. breseq asserts the column
+        # count and the assert is fatal, so an empty file is not an option.
+        empty_breaks.to_csv(
+            os.path.join(saveloc, f"{samplename}_break_pts.csv"), index=False
+        )
+        new_exp.to_csv(
+            os.path.join(saveloc, f"{samplename}_CNV.csv"), index=False
+        )
+        print(f"{samplename}: no coverage to call; "
+              "copy number 0 across the sequence. .csv files saved.")
+    return new_exp
+
+
+def _hmm_emit(prep, copy_numbers, saveloc, polymorphism, write):
+    """Write one member's break points and CNV table, and broadcast its calls."""
+    new_exp = prep["new_exp"]
+    samplename = prep["samplename"]
+
+    if write:
+        brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
+        cn_brk = copy_numbers.loc[:, ["Startpos", "Endpos", "State"]].copy()
+        cn_brk.loc[:, "Segment_Size"] = cn_brk["Endpos"] - cn_brk["Startpos"]
+        cn_brk = cn_brk.drop(columns="Endpos")
+        cn_brk.to_csv(brk_full_path, index=False)
+
+    # Assign by window index rather than by appending to a flat list:
+    # once censored windows are absent from the observation sequence a
+    # segment can span windows that never voted for it, so the old
+    # len(CN_HMM) == len(new_exp) invariant no longer holds.
+    CN_HMM = pd.Series(np.nan, index=new_exp.index, dtype=float)
+
+    for cnrow in copy_numbers.itertuples():
+        in_segment = (
+            (new_exp["win_st"] >= int(cnrow.Startpos))
+            & (new_exp["win_st"] < int(cnrow.Endpos))
+        )
+        CN_HMM[in_segment] = (float(cnrow.State) if polymorphism
+                              else int(cnrow.State))
+
+    # Windows on a segment boundary can fall outside every half-open
+    # interval; carry the neighbouring call across rather than leaving a
+    # hole.
+    # Integral in consensus mode -- eight goldens, breseq's Genome Diff and a
+    # dozen `== 1` assertions all read it as an int. In polymorphism mode the
+    # whole point is that it is not, so the cast is dropped rather than widened.
+    filled = CN_HMM.ffill().bfill()
+    # Plain __setitem__, not .loc[:, ...]. The incoming frame usually ALREADY
+    # carries prob_copy_number -- stage_pass1() snapshots it, so pass 2 is handed
+    # pass 1's column -- and .loc[:, col] takes pandas' in-place setitem path,
+    # which refuses to put a float level into an int64 column and raises
+    # LossySetitemError. __setitem__ replaces the column, dtype included, and
+    # keeps its position, so CNV.csv's column order is unchanged.
+    new_exp["prob_copy_number"] = filled if polymorphism else filled.astype(int)
+
+    new_exp = new_exp.reset_index(drop=True)
+
+    if write:
+        csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
+        new_exp.to_csv(csv_full_path, index=False)
+        print(f"{samplename}: Copy number prediction complete. .csv files saved.")
+
+    return new_exp
+
+
+def group_read_count_scale(frames):
+    """The read depth a reference group's back-converted counts are formed with.
+
+    run_HMM_group() builds `otr_gc_corr_rdcnt_cov` as corrected coverage times
+    this, and plot_copy's second axis is the copy-number axis times it -- which is
+    what makes a copy number of k land on the coverage a copy number of k actually
+    produces. Defined once, here, because the two computing it separately is
+    exactly how that alignment was lost before: measured, the CN-1 line was drawn
+    56% too high on one dataset and 92% on another.
+
+    Measured over the members that HAVE coverage: a contig with no reads is not
+    evidence about the group's depth. For a lone sequence this is its own median
+    either way.
+    """
+    frames = list(frames)
+    live = []
+    for df in frames:
+        if len(df) == 0:
+            continue
+        rc = np.rint(
+            np.nan_to_num(df["read_count_cov"].to_numpy(dtype=float))
+        ).clip(min=0)
+        if rc.max(initial=0.0) > 0:
+            live.append(df)
+
+    use = live if live else frames
+    if not use:
+        return 0.0
+    med = pd.concat([df["read_count_cov"] for df in use], ignore_index=True).median()
+    # No windows at all: the median is NaN and int(NaN) raises. Zero is the
+    # honest baseline for a sequence with no coverage, and it keeps the
+    # back-converted read-count column below well-defined.
+    return 0.0 if not np.isfinite(med) else float(med)
+
+
+def run_HMM_group(frames, output,
+                  deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
+                  changeprob=None,
+                  max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100,
+                  bias="all",
+                  change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
+                  interior_change_rate=DEFAULT_INTERIOR_CHANGE_RATE,
+                  fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY,
+                  polymorphism=False, cn_resolution=DEFAULT_CN_RESOLUTION, refine=True,
+                  group_id=None):
+    """Viterbi copy-number calling for one REFERENCE GROUP.
+
+    `frames` is an ordered {genome_id: df} of sequences that are one molecule --
+    contigs of a draft assembly, as declared by --group-table. They share one
+    background coverage distribution, so a contig sitting at three times the
+    assembly's baseline is called copy number 3 rather than 1. Returns
+    {genome_id: df} in the same order.
+
+    A lone sequence is a group of one and run_HMM() is exactly that call, which
+    is why every pooled step below is written so that pooling ONE member is the
+    same numpy call on the same array: np.concatenate([a]) is a copy of a, a
+    median of it is bit-identical, a max over one element is that element, and a
+    union of one set is that set. Eight goldens depend on it.
+
+    WHAT IS SHARED, and why each has to be:
+
+    - The read-count median behind `otr_gc_corr_rdcnt_cov` and the CN plot's
+      second axis. Per contig, two members of one assembly would carry two
+      different read-count scales for the same library.
+    - The offset anchor. An offset is only meaningful up to a constant, trading
+      off exactly against mu, so if each member re-centred its own then one mu
+      would mean a different depth on each and the shared fit would be void.
+    - The censored negative binomial itself, and so mu and size.
+    - The `min_called_windows` verdict. Decided per contig, a 20 kb contig
+      reverts to observing repeat windows while its 3 Mb sibling censors them.
+    - The level grid, including anything refinement adds to it: members decoding
+      on different grids produce State values that are not comparable and are
+      priced differently by the transition prior.
+    - Under -p, the baseline re-anchoring. This one is not an improvement but a
+      correctness requirement: _baseline_mu takes the modal level OF THE FRAME IT
+      IS GIVEN, so run per contig every contig's own mode becomes 1.0 by
+      construction and the shared baseline is undone in the first round.
+
+    WHAT IS NOT, and why:
+
+    - The decode. Contig order and orientation are unknown, so Viterbi never runs
+      across a member boundary: a segment spanning the join would assert an
+      adjacency nobody has evidence for, and its Startpos/Segment_Size would mean
+      nothing in either contig's coordinates -- in a file breseq parses into an
+      AMP.
+    - `window_geometry`, because np.diff over a concatenation crosses that join.
+    - `robust_state_count`, because its 3-window median filter would smear a peak
+      at the head of one contig against the tail of another. Sized per member
+      against the shared mu, and the group takes the largest.
+    - The degenerate short-circuit, and every write.
+    """
+    saveloc = os.path.join(output, "CNV_csv")
+    if not frames:
+        return {}
+
+    members = list(frames)
+    group_label = sample_prefix(output) + str(
+        members[0] if group_id is None else group_id)
+
+    preps = {gid: _hmm_prepare(frames[gid], output, gid, bias) for gid in members}
+
+    # The predicate is deliberately the DATA being empty, not `fit_result is
+    # None` -- that also fires on healthy-but-small frames, where the moment
+    # fallback below is a live and correct path.
+    live = [gid for gid in members
+            if len(preps[gid]["new_exp"])
+            and preps[gid]["counts_all"].max(initial=0.0) > 0]
+
+    med = group_read_count_scale(preps[gid]["new_exp"] for gid in members)
+    rc_cap = int(max(1.0, max_copy_number) * med)
+
+    # Back-converted read counts are computed for EVERY window -- the
+    # column is part of the pipeline contract and feeds the diagnostic
+    # plots.
+    for gid in members:
+        new_exp = preps[gid]["new_exp"]
+        new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = (
+            (new_exp["otr_gc_corr_norm_cov"] * med)
+            .round()
+            .astype(int)
+            .clip(upper=rc_cap)
+        )
+
+    out = {}
+    for gid in members:
+        if gid not in live:
+            out[gid] = _hmm_emit_no_coverage(
+                preps[gid], saveloc, polymorphism, write)
+    if not live:
+        return {gid: out[gid] for gid in members}
+
+    # An offset is only meaningful up to a constant -- it trades off exactly
+    # against mu -- so anchor it once, on the windows the fit will see, and use
+    # that same scale for the emissions. Otherwise mu would be estimated on one
+    # normalisation and applied on another. Anchored over the whole GROUP, for
+    # the same reason at one level up.
+    anchor = np.median(np.concatenate(
+        [preps[gid]["offsets_all"][preps[gid]["not_redundant"]] for gid in live]))
+    if np.isfinite(anchor) and anchor > 0:
+        for gid in live:
+            preps[gid]["offsets_all"] = preps[gid]["offsets_all"] / anchor
+
+    # The fit sees only clean windows, always. `min_called_windows` softens the
+    # OBSERVATION mask below, never this one.
+    fit_result = fit_censored_negative_binomial(
+        np.concatenate([preps[gid]["counts_all"][preps[gid]["not_redundant"]]
+                        for gid in live]),
+        np.concatenate([preps[gid]["offsets_all"][preps[gid]["not_redundant"]]
+                        for gid in live]),
+    )
+
+    clean_windows = sum(int(preps[gid]["not_redundant"].sum()) for gid in live)
+    observe_all_windows = clean_windows < min_called_windows
+
+    for gid in live:
+        prep = preps[gid]
+        called = (np.ones(len(prep["new_exp"]), dtype=bool) if observe_all_windows
+                  else prep["not_redundant"].copy())
+        prep["called"] = called
+        prep["obs_exp"] = prep["new_exp"].loc[called]
+        prep["counts"] = prep["counts_all"][called]
+        prep["offsets"] = prep["offsets_all"][called]
+
+    counts_pooled = np.concatenate([preps[gid]["counts"] for gid in live])
+
+    if fit_result is not None:
+        mu, size = fit_result
+    else:
+        # Degenerate input -- a flat or under-dispersed frame, where a negative
+        # binomial has no finite `size`. Fall back to the historical moment
+        # estimate and its guard so such frames behave exactly as before.
+        mean = float(np.mean(counts_pooled))
+        var = float(np.var(counts_pooled))
+        if mean > 0 and var <= mean:
+            var = mean * (1.0 + 1e-3)
+        p, size = solve_pr(mean, var)
+        mu = mean
+
+    n_states = max(
+        robust_state_count(preps[gid]["counts"], preps[gid]["offsets"], mu,
+                           min_states=5, max_states=int(max_copy_number))
+        for gid in live
+    )
+
+    step_bp, window_bp = window_geometry(preps[live[0]]["new_exp"])
+
+    if changeprob is not None:
+        remain_prob = 1.0 - float(changeprob)
+    else:
+        remain_prob = remain_prob_for_step(change_rate, step_bp)
+
+    # An interior boundary is priced as a rate per base, like every other
+    # boundary, so that -w/-s stays a resolution knob rather than a statement
+    # about the biology. (`changeprob` bypasses the step conversion for the
+    # ordinary rate; the interior rate still goes through it. That path has no
+    # production caller -- it is an in-process escape hatch -- so the two are
+    # allowed to disagree there rather than growing a second override.)
+    interior_change_prob = 1.0 - remain_prob_for_step(interior_change_rate, step_bp)
+
+    # Every observed transition is charged one step, whatever gap the censored
+    # windows left. Pricing a wide repeat gap as a proportionally cheaper
+    # crossing would make a censored repeat a cheap place to break a segment --
+    # exactly what censoring them was meant to prevent.
+    emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
+
+    for gid in live:
+        preps[gid]["window_tau"] = offset_tau(
+            preps[gid]["new_exp"], bias=bias)[preps[gid]["called"]]
+
+    # ---- The grid, and (in polymorphism mode) the refinement loop -----------
+    # Nothing above this point depends on the grid: the censored negative
+    # binomial, the offsets, the window geometry and the transition rates are
+    # all fitted once, and only emission -> transition -> decode re-runs.
+    #
+    # In consensus mode `levels` is the integer grid and the loop runs once,
+    # taking exactly the path it always took.
+    levels = (polymorphism_levels(n_states, cn_resolution) if polymorphism
+              else consensus_levels(n_states))
+    # Refinement rounds plus baseline re-anchoring rounds. Both are bounded and
+    # both are no-ops once converged, so the cap is a backstop, not a schedule.
+    rounds = 1
+    if polymorphism:
+        rounds = CN_ANCHOR_MAX_ROUNDS + 1
+        if refine:
+            rounds += CN_REFINE_MAX_ROUNDS
+    refined_around = ()
+
+    for round_no in range(rounds):
+        this_transition = setup_transition_matrix(
+            remain_prob=remain_prob,
+            interior_change_prob=interior_change_prob,
+            fold_change_penalty=fold_change_penalty,
+            levels=levels,
+        )
+
+        decoded = {}
+        for gid in live:
+            prep = preps[gid]
+            this_log_emission = log_emission_with_offsets(
+                prep["counts"], prep["offsets"], mu=mu, size=size,
+                levels=levels,
+                deletion_coverage_fraction=deletion_coverage_fraction,
+                offset_tau=prep["window_tau"],
+            )
+
+            # HMM_copy_number indexes win_st/win_end positionally, so the
+            # censored subset can be passed straight through. chr_length stays
+            # the genome end over ALL windows -- the last segment must reach it
+            # even if the final window is censored. It is THIS MEMBER'S end: the
+            # decode never crosses a contig boundary.
+            decoded[gid] = HMM_copy_number(
+                prep["counts"],
+                this_transition,
+                None,
+                prep["obs_exp"]["win_st"],
+                prep["obs_exp"]["win_end"],
+                prep["new_exp"]["win_end"].max(),
+                log_emission_obs=this_log_emission,
+                emission_weight=emission_weight,
+                # None in consensus mode, so the path INDEX is written straight
+                # through and `State` stays an int64. The values are identical
+                # either way -- index == copy number on the integer grid -- but the
+                # dtype is part of the contract: breseq parses State into an AMP's
+                # new_copy_number, and eight goldens compare with no tolerance.
+                levels=levels if polymorphism else None,
+            )
+
+        if round_no == rounds - 1:
+            break
+
+        # ---- Re-anchor the baseline on the calls, before refining -----------
+        # fit_censored_negative_binomial() censors to [0.5, 1.5] x mode, which
+        # excludes an integer amplification but CANNOT exclude a subclonal one:
+        # a level of 1.1-1.5 lies inside that band by construction, so the very
+        # events this mode exists to find are the ones that bias its baseline.
+        # Measured on synthetic coverage with the truth known, a 20% block at
+        # 1.30 pulls the fitted mu 4.4% high and a 30% block at 1.10 pulls it
+        # 2.6% high, which on a fine grid shows up as the WHOLE genome being
+        # called off single copy (100% and 51% of windows respectively).
+        #
+        # The genome's modal level is single copy -- the same assumption
+        # _censor_bounds() already makes when it searches for a mode -- so
+        # folding that level into mu and decoding again is an alternating
+        # conditional fit, exactly like the pooled GC refit between the two
+        # pipeline passes. It is a no-op once the mode lands on 1.0, which is
+        # the loop's other exit.
+        #
+        # Pooled across the group: the modal level of ONE contig is 1.0 by
+        # construction whatever that contig's real copy number, so anchoring per
+        # member would undo the shared baseline in this very round.
+        if polymorphism:
+            anchored = _baseline_mu_from_levels(
+                np.concatenate([
+                    _called_levels_per_window(
+                        decoded[gid], preps[gid]["obs_exp"]["win_st"].to_numpy())
+                    for gid in live]),
+                counts_pooled,
+                np.concatenate([preps[gid]["offsets"] for gid in live]),
+            )
+            if anchored is not None and anchored > 0 and mu > 0 and (
+                    abs(anchored / mu - 1.0) > CN_ANCHOR_TOL):
+                mu = anchored
+                continue
+
+        if not refine:
+            break
+        # A level any member wants refined is refined for the whole group: the
+        # grid is shared, so this cannot be decided one member at a time.
+        wanted = set()
+        for gid in live:
+            prep = preps[gid]
+            wanted.update(_levels_wanting_refinement(
+                decoded[gid], prep["obs_exp"]["win_st"].to_numpy(),
+                prep["counts"], prep["offsets"], mu,
+                levels, cn_resolution, refined_around,
+            ))
+        wanted = tuple(sorted(wanted))
+        if not wanted:
+            break
+        grown = refine_levels(levels, wanted, cn_resolution)
+        if grown is levels:
+            if write:
+                print(f"{group_label}: WARNING: copy-number grid refinement around "
+                      f"{', '.join(f'{c:g}' for c in wanted)} would exceed "
+                      f"{CN_MAX_LEVELS} levels and was declined; those segments "
+                      f"keep their integer call.")
+            break
+        levels = grown
+        refined_around = tuple(sorted(set(refined_around) | set(wanted)))
+
+    for gid in live:
+        copy_numbers = decoded[gid]
+        # A call that lands exactly on the ceiling is not a measurement -- it is the
+        # largest number the grid could express, and every consumer downstream
+        # (breseq writes it straight into an AMP's new_copy_number) will read it as
+        # one. Say so, rather than letting it pass as a number someone fitted.
+        if write and len(copy_numbers) and (levels[-1] >= int(max_copy_number)):
+            called_max = float(copy_numbers["State"].max())
+            if called_max >= levels[-1]:
+                print(f"{preps[gid]['samplename']}: WARNING: copy number "
+                      f"{called_max:g} is the state grid's ceiling "
+                      f"(--max-copy-number {int(max_copy_number)}), so the true "
+                      "copy number may be higher. Re-run with a larger value.")
+
+        out[gid] = _hmm_emit(preps[gid], copy_numbers, saveloc, polymorphism, write)
+
+    return {gid: out[gid] for gid in members}
+
+
 def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
             changeprob=None,
             max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100, bias="all",
@@ -5506,7 +6289,12 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
             fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY,
             polymorphism=False, cn_resolution=DEFAULT_CN_RESOLUTION, refine=True):
     """
-    Viterbi copy-number calling.
+    Viterbi copy-number calling for ONE sequence.
+
+    A group of one, in run_HMM_group()'s terms, and implemented as exactly that
+    call so the two cannot drift apart. Everything below is unchanged by the
+    grouping: a sequence in no reference group fits its own baseline, as it
+    always has.
 
     `write=False` runs the identical numeric path but emits no files and prints
     nothing. That is what the FIRST of the two fitting passes uses: its calls
@@ -5557,294 +6345,26 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
     fit's censoring window, where it would inflate the dispersion precisely
     where sharpness matters most.
     """
-
-    saveloc = os.path.join(output, "CNV_csv")
     # `genome_id` is normally read off the frame, but a sequence with no
     # coverage has no row to read it from, and its CSVs still have to be named.
     if genome_id is None:
         genome_id = str(df["genome_id"].iloc[0])
     genome_id = str(genome_id)
-    samplename = sample_prefix(output) + genome_id
 
-    new_exp = df.copy()
-
-    new_exp.loc[:, "otr_gc_corr_norm_cov"] = np.nan_to_num(new_exp["otr_gc_corr_norm_cov"].to_numpy())
-
-    med = new_exp["read_count_cov"].median()
-    # No windows at all: the median is NaN and int(NaN) raises. Zero is the
-    # honest baseline for a sequence with no coverage, and it keeps the
-    # back-converted read-count column below well-defined.
-    if not np.isfinite(med):
-        med = 0.0
-
-    rc_cap = int(max(1.0, max_copy_number) * med)
-
-    # Back-converted read counts are computed for EVERY window -- the
-    # column is part of the pipeline contract and feeds the diagnostic
-    # plots.
-    new_exp.loc[:, "otr_gc_corr_rdcnt_cov"] = (
-        (new_exp["otr_gc_corr_norm_cov"] * med)
-        .round()
-        .astype(int)
-        .clip(upper=rc_cap)
-    )
-
-    # Raw counts and their bias offsets, over every window.
-    counts_all = np.rint(
-        np.nan_to_num(new_exp["read_count_cov"].to_numpy(dtype=float))
-    ).clip(min=0)
-    offsets_all = bias_offsets(new_exp, bias=bias)
-
-    # NOTHING TO CALL. Either the sequence has no windows, or every window is at
-    # zero coverage. Both used to reach solve_pr(0.0, 0.0) and raise
-    # ZeroDivisionError -- the moment fallback's guard is written `if mean > 0`,
-    # so it steps over exactly the case that needs it. Every window is CN 0,
-    # which is what "no reads mapped here" means, and the files are still
-    # written: a caller that gets no CSV cannot tell this from a crash.
-    #
-    # The predicate is deliberately the DATA being empty, not `fit_result is
-    # None` -- that also fires on healthy-but-small frames, where the moment
-    # fallback below is a live and correct path.
-    if len(new_exp) == 0 or counts_all.max(initial=0.0) <= 0:
-        new_exp = new_exp.reset_index(drop=True)
-        new_exp["prob_copy_number"] = np.zeros(
-            len(new_exp), dtype=float if polymorphism else int)
-        if write:
-            empty_breaks = pd.DataFrame(
-                {"Startpos": pd.Series(dtype=int),
-                 "State": pd.Series(dtype=float if polymorphism else int),
-                 "Segment_Size": pd.Series(dtype=int)}
-            )
-            # Three columns, header row, no data. breseq asserts the column
-            # count and the assert is fatal, so an empty file is not an option.
-            empty_breaks.to_csv(
-                os.path.join(saveloc, f"{samplename}_break_pts.csv"), index=False
-            )
-            new_exp.to_csv(
-                os.path.join(saveloc, f"{samplename}_CNV.csv"), index=False
-            )
-            print(f"{samplename}: no coverage to call; "
-                  "copy number 0 across the sequence. .csv files saved.")
-        return new_exp
-
-    if "is_redundant" in new_exp.columns:
-        not_redundant = ~new_exp["is_redundant"].to_numpy(dtype=bool)
-    else:
-        not_redundant = np.ones(len(new_exp), dtype=bool)
-
-    # An offset is only meaningful up to a constant -- it trades off exactly
-    # against mu -- so anchor it once, on the windows the fit will see, and use
-    # that same scale for the emissions. Otherwise mu would be estimated on one
-    # normalisation and applied on another.
-    anchor = np.median(offsets_all[not_redundant])
-    if np.isfinite(anchor) and anchor > 0:
-        offsets_all = offsets_all / anchor
-
-    # The fit sees only clean windows, always. `min_called_windows` softens the
-    # OBSERVATION mask below, never this one.
-    fit_result = fit_censored_negative_binomial(
-        counts_all[not_redundant], offsets_all[not_redundant]
-    )
-
-    called = not_redundant.copy()
-    if called.sum() < min_called_windows:
-        called = np.ones(len(new_exp), dtype=bool)
-
-    obs_exp = new_exp.loc[called]
-    counts = counts_all[called]
-    offsets = offsets_all[called]
-
-    if fit_result is not None:
-        mu, size = fit_result
-    else:
-        # Degenerate input -- a flat or under-dispersed frame, where a negative
-        # binomial has no finite `size`. Fall back to the historical moment
-        # estimate and its guard so such frames behave exactly as before.
-        mean = float(np.mean(counts))
-        var = float(np.var(counts))
-        if mean > 0 and var <= mean:
-            var = mean * (1.0 + 1e-3)
-        p, size = solve_pr(mean, var)
-        mu = mean
-
-    n_states = robust_state_count(
-        counts, offsets, mu, min_states=5, max_states=int(max_copy_number)
-    )
-
-    step_bp, window_bp = window_geometry(new_exp)
-
-    if changeprob is not None:
-        remain_prob = 1.0 - float(changeprob)
-    else:
-        remain_prob = remain_prob_for_step(change_rate, step_bp)
-
-    # An interior boundary is priced as a rate per base, like every other
-    # boundary, so that -w/-s stays a resolution knob rather than a statement
-    # about the biology. (`changeprob` bypasses the step conversion for the
-    # ordinary rate; the interior rate still goes through it. That path has no
-    # production caller -- it is an in-process escape hatch -- so the two are
-    # allowed to disagree there rather than growing a second override.)
-    interior_change_prob = 1.0 - remain_prob_for_step(interior_change_rate, step_bp)
-
-    # Every observed transition is charged one step, whatever gap the censored
-    # windows left. Pricing a wide repeat gap as a proportionally cheaper
-    # crossing would make a censored repeat a cheap place to break a segment --
-    # exactly what censoring them was meant to prevent.
-    emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
-
-    window_tau = offset_tau(new_exp, bias=bias)[called]
-
-    # ---- The grid, and (in polymorphism mode) the refinement loop -----------
-    # Nothing above this point depends on the grid: the censored negative
-    # binomial, the offsets, the window geometry and the transition rates are
-    # all fitted once, and only emission -> transition -> decode re-runs.
-    #
-    # In consensus mode `levels` is the integer grid and the loop runs once,
-    # taking exactly the path it always took.
-    levels = (polymorphism_levels(n_states, cn_resolution) if polymorphism
-              else consensus_levels(n_states))
-    # Refinement rounds plus baseline re-anchoring rounds. Both are bounded and
-    # both are no-ops once converged, so the cap is a backstop, not a schedule.
-    rounds = 1
-    if polymorphism:
-        rounds = CN_ANCHOR_MAX_ROUNDS + 1
-        if refine:
-            rounds += CN_REFINE_MAX_ROUNDS
-    refined_around = ()
-
-    for round_no in range(rounds):
-        this_log_emission = log_emission_with_offsets(
-            counts, offsets, mu=mu, size=size,
-            levels=levels,
-            deletion_coverage_fraction=deletion_coverage_fraction,
-            offset_tau=window_tau,
-        )
-        this_transition = setup_transition_matrix(
-            remain_prob=remain_prob,
-            interior_change_prob=interior_change_prob,
-            fold_change_penalty=fold_change_penalty,
-            levels=levels,
-        )
-
-        # HMM_copy_number indexes win_st/win_end positionally, so the
-        # censored subset can be passed straight through. chr_length stays
-        # the genome end over ALL windows -- the last segment must reach it
-        # even if the final window is censored.
-        copy_numbers = HMM_copy_number(
-            counts,
-            this_transition,
-            None,
-            obs_exp["win_st"],
-            obs_exp["win_end"],
-            new_exp["win_end"].max(),
-            log_emission_obs=this_log_emission,
-            emission_weight=emission_weight,
-            # None in consensus mode, so the path INDEX is written straight
-            # through and `State` stays an int64. The values are identical
-            # either way -- index == copy number on the integer grid -- but the
-            # dtype is part of the contract: breseq parses State into an AMP's
-            # new_copy_number, and eight goldens compare with no tolerance.
-            levels=levels if polymorphism else None,
-        )
-
-        if round_no == rounds - 1:
-            break
-
-        # ---- Re-anchor the baseline on the calls, before refining -----------
-        # fit_censored_negative_binomial() censors to [0.5, 1.5] x mode, which
-        # excludes an integer amplification but CANNOT exclude a subclonal one:
-        # a level of 1.1-1.5 lies inside that band by construction, so the very
-        # events this mode exists to find are the ones that bias its baseline.
-        # Measured on synthetic coverage with the truth known, a 20% block at
-        # 1.30 pulls the fitted mu 4.4% high and a 30% block at 1.10 pulls it
-        # 2.6% high, which on a fine grid shows up as the WHOLE genome being
-        # called off single copy (100% and 51% of windows respectively).
-        #
-        # The genome's modal level is single copy -- the same assumption
-        # _censor_bounds() already makes when it searches for a mode -- so
-        # folding that level into mu and decoding again is an alternating
-        # conditional fit, exactly like the pooled GC refit between the two
-        # pipeline passes. It is a no-op once the mode lands on 1.0, which is
-        # the loop's other exit.
-        if polymorphism:
-            anchored = _baseline_mu(
-                copy_numbers, obs_exp["win_st"].to_numpy(), counts, offsets)
-            if anchored is not None and anchored > 0 and mu > 0 and (
-                    abs(anchored / mu - 1.0) > CN_ANCHOR_TOL):
-                mu = anchored
-                continue
-
-        if not refine:
-            break
-        wanted = _levels_wanting_refinement(
-            copy_numbers, obs_exp["win_st"].to_numpy(), counts, offsets, mu,
-            levels, cn_resolution, refined_around,
-        )
-        if not wanted:
-            break
-        grown = refine_levels(levels, wanted, cn_resolution)
-        if grown is levels:
-            if write:
-                print(f"{samplename}: WARNING: copy-number grid refinement around "
-                      f"{', '.join(f'{c:g}' for c in wanted)} would exceed "
-                      f"{CN_MAX_LEVELS} levels and was declined; those segments "
-                      f"keep their integer call.")
-            break
-        levels = grown
-        refined_around = tuple(sorted(set(refined_around) | set(wanted)))
-
-    # A call that lands exactly on the ceiling is not a measurement -- it is the
-    # largest number the grid could express, and every consumer downstream
-    # (breseq writes it straight into an AMP's new_copy_number) will read it as
-    # one. Say so, rather than letting it pass as a number someone fitted.
-    if write and len(copy_numbers) and (levels[-1] >= int(max_copy_number)):
-        called_max = float(copy_numbers["State"].max())
-        if called_max >= levels[-1]:
-            print(f"{samplename}: WARNING: copy number {called_max:g} is the state "
-                  f"grid's ceiling (--max-copy-number {int(max_copy_number)}), so the "
-                  f"true copy number may be higher. Re-run with a larger value.")
-
-    if write:
-        brk_full_path = os.path.join(saveloc, f"{samplename}_break_pts.csv")
-        cn_brk = copy_numbers.loc[:, ["Startpos", "Endpos", "State"]].copy()
-        cn_brk.loc[:, "Segment_Size"] = cn_brk["Endpos"] - cn_brk["Startpos"]
-        cn_brk = cn_brk.drop(columns="Endpos")
-        cn_brk.to_csv(brk_full_path, index=False)
-
-    # Assign by window index rather than by appending to a flat list:
-    # once censored windows are absent from the observation sequence a
-    # segment can span windows that never voted for it, so the old
-    # len(CN_HMM) == len(new_exp) invariant no longer holds.
-    CN_HMM = pd.Series(np.nan, index=new_exp.index, dtype=float)
-
-    for cnrow in copy_numbers.itertuples():
-        in_segment = (
-            (new_exp["win_st"] >= int(cnrow.Startpos))
-            & (new_exp["win_st"] < int(cnrow.Endpos))
-        )
-        CN_HMM[in_segment] = (float(cnrow.State) if polymorphism
-                              else int(cnrow.State))
-
-    # Windows on a segment boundary can fall outside every half-open
-    # interval; carry the neighbouring call across rather than leaving a
-    # hole.
-    # Integral in consensus mode -- eight goldens, breseq's Genome Diff and a
-    # dozen `== 1` assertions all read it as an int. In polymorphism mode the
-    # whole point is that it is not, so the cast is dropped rather than widened.
-    filled = CN_HMM.ffill().bfill()
-    # Plain __setitem__, not .loc[:, ...]. The incoming frame usually ALREADY
-    # carries prob_copy_number -- stage_pass1() snapshots it, so pass 2 is handed
-    # pass 1's column -- and .loc[:, col] takes pandas' in-place setitem path,
-    # which refuses to put a float level into an int64 column and raises
-    # LossySetitemError. __setitem__ replaces the column, dtype included, and
-    # keeps its position, so CNV.csv's column order is unchanged.
-    new_exp["prob_copy_number"] = filled if polymorphism else filled.astype(int)
-
-    new_exp = new_exp.reset_index(drop=True)
-
-    if write:
-        csv_full_path = os.path.join(saveloc, f"{samplename}_CNV.csv")
-        new_exp.to_csv(csv_full_path, index=False)
-        print(f"{samplename}: Copy number prediction complete. .csv files saved.")
-
-    return new_exp
+    return run_HMM_group(
+        {genome_id: df}, output,
+        deletion_coverage_fraction=deletion_coverage_fraction,
+        changeprob=changeprob,
+        max_copy_number=max_copy_number,
+        min_called_windows=min_called_windows,
+        bias=bias,
+        change_rate=change_rate,
+        overlap_weighting=overlap_weighting,
+        write=write,
+        interior_change_rate=interior_change_rate,
+        fold_change_penalty=fold_change_penalty,
+        polymorphism=polymorphism,
+        cn_resolution=cn_resolution,
+        refine=refine,
+        group_id=genome_id,
+    )[genome_id]
