@@ -67,6 +67,59 @@ CNery coverage/ --file-ending cov.txt
 CNery coverage/ --file-ending cov.txt --file-ending coverage.csv
 ```
 
+### Reference groups — contigs of one draft assembly
+
+A draft genome arrives as hundreds of contigs, and CNery calls copy number per reference: each
+contig refits its own baseline, so **every one of them comes out at copy number 1** however
+amplified it really is. `--group-table` says which coverage tables are contigs of one molecule
+(breseq's `-c`) so that they share a single background coverage distribution.
+
+```bash
+CNery --group-table 08_mutation_identification/reference_groups.tsv -o CNV_out
+```
+
+The table has two columns, `file` and `group`; any other column is ignored, so it can carry
+provenance. `file` names a coverage table **exactly** — no stem matching — resolved relative to
+the table's own folder. A blank `group` means the sequence stands alone.
+
+```
+file	group	length	source
+REL606.coverage.tsv		4629812	REL606.gbk
+pKAN.coverage.tsv		5988	pKAN.gbk
+NZ_MJGT01000001.coverage.tsv	pine3-8-t1	412887	pine3-8-t1.fasta
+NZ_MJGT01000002.coverage.tsv	pine3-8-t1	98014	pine3-8-t1.fasta
+```
+
+For a group of two or more sequences:
+
+- they share one baseline depth, one dispersion and one copy-number grid, so a contig at three
+  times the assembly's level is called copy number 3;
+- **origin-to-terminus correction is declined** and **GC skew is not measured** — contig order and
+  orientation are unknown, so there is no coordinate for a replication ramp or an origin to sit
+  along. Both still write their JSON, saying so;
+- `"Relative copy number"` is measured across the whole group, and the longest group anchors the
+  run at 1.0. A finished chromosome beside a longer draft assembly will therefore no longer read
+  exactly 1.0 — it reads its level relative to the assembly.
+
+A sequence in no group, and every sequence when `--group-table` is not given, behaves exactly as
+before. A table in which nothing is grouped is a no-op, which is what lets a caller pass the flag
+unconditionally.
+
+**The table can also supply the inputs.** With `--group-table` and no `INPUT` argument, the
+coverage tables read are the ones the table names — which is how breseq keeps its command line to
+one line on a draft assembly rather than repeating hundreds of paths. Given both, they must agree
+exactly: every input named by a row, every row naming an input.
+
+Naming a folder is another way to keep the command line short. breseq's
+`08_mutation_identification/` holds one `*.coverage.tsv` per contig — hundreds of them on a
+draft genome — beside its own `*.coverage.tab` files, which share a default ending but not the
+schema and would be rejected by name. Restricting the ending picks out exactly the tables CNery
+wants, in one argument instead of hundreds:
+
+```bash
+CNery 08_mutation_identification/ --file-ending coverage.tsv -o 09_copy_number_variation/cnery_out
+```
+
 A table's sequence ID comes from its file name, with the matched ending and the `.` in front of it
 removed — `REL606.coverage.csv` becomes `REL606`, and `NC_012967.1.coverage.tsv` becomes
 `NC_012967.1`. That ID names every output file, and no two inputs may share one.
@@ -340,8 +393,8 @@ skipped for that sequence and reported as such.
 - `CNV_out/CNV_plt/` — per-reference CNV prediction plots.
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
 - The GC correction is a fitted curve, not an exact quantity, so how well it is determined at each window's GC is measured (by resampling the fit) and carried into the copy-number model as extra variance. The effect grows with copy number, because a correction factor's error is multiplied by the number of copies — which is why a window at an extreme GC inside an amplification is no longer able to earn its own copy-number segment on the strength of the correction alone.
-- `CNV_out/GC_bias/` also holds `*_GC_passes.pdf` — the GC correction is fitted in two pooled passes, once on raw coverage and again after OTR correction (which reintroduces a GC trend, because the replication ramp varies with position and position correlates with GC). The second pass additionally excludes every window the first pass's copy-number calls did not put at CN=1. The plot shows both curves and their product, which is the total correction actually applied.
-- `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
+- `CNV_out/GC_bias/` also holds `GC_passes.pdf` — the GC correction is fitted in two pooled passes, once on raw coverage and again after OTR correction (which reintroduces a GC trend, because the replication ramp varies with position and position correlates with GC). The second pass additionally excludes every window the first pass's copy-number calls did not put at CN=1. The plot shows both curves and their product, which is the total correction actually applied.
+- `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot, `GC_vs_NormRds.pdf`. Both files here cover the whole run rather than one reference, which is why neither is named for a sequence.
 - `CNV_out/corr_plots/` — per-reference **before/after** diagnostic (`*_correction_stages.pdf`): one row for each correction step — GC and OTR, in each of the two passes — showing coverage before and after it, with the fitted curve overlaid, and directly beneath each row a strip of which windows that particular fit was allowed to see. Deletions are drawn as spans, repeats as a density track, and the second pass's strips additionally mark everything called CN≠1. One row does not continue from the one above it, and says so: the second OTR fit divides the first pass's ramp back out, because a ramp has to be fitted to coverage that still contains it. Each row is labelled with the fraction of windows within 20% of single copy before and after, reported both over all windows and over uncensored windows only — the two can differ a lot on a repeat-heavy replicon, and the strip below shows why. Produced in every `--bias` mode.
 
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.

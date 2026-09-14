@@ -71,6 +71,11 @@ from CNery.core import (
     resolve_coverage_inputs,
     plot_gc_passes,
     run_HMM,
+    run_HMM_group,
+    cn_censor_keep_fraction,
+    declined_otr_results,
+    write_otr_results,
+    no_skew_prediction,
     DEFAULT_FRAG_SIZE,
     frag_candidates,
     pass1_summary,
@@ -275,7 +280,7 @@ def raw_tables(dataset_dir):
 _PIPELINES = {}
 
 
-def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
+def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG, groups=None):
     """The full two-pass pipeline for one dataset, mirroring get_CNV.main().
 
     Mirroring it is load-bearing and has bitten this file twice: once when the GC
@@ -283,6 +288,12 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
     once when the pooled second GC pass was left out. The structure below is
     main()'s at --bias all: correct, call copy number, censor everything not
     called CN = 1, then run both fits again.
+
+    `groups` is {seq_id: group_id}, as --group-table produces. Its members share
+    one HMM baseline, decline the OTR fit and do not have their GC skew measured
+    -- so the loops below are GROUP-MAJOR, exactly as main() now is. With every
+    sequence its own group, which is what `groups=None` means, this is the
+    per-sequence pipeline it has always been.
     """
     for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
@@ -296,41 +307,83 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
         collect_gc_flags=True,
     )
 
-    # Mirrors get_CNV.main(): one number per sequence, computed across ALL of them
+    if groups is None:
+        groups = {seq_id: seq_id for seq_id in per_genome}
+    members = {}
+    for seq_id in per_genome:
+        members.setdefault(groups[seq_id], []).append(seq_id)
+
+    def grouped(seq_id):
+        return len(members[groups[seq_id]]) > 1
+
+    # Mirrors get_CNV.main(): one number per GROUP, computed across all of them
     # because apply_otr_correction() runs per sequence and cannot see the others.
-    relative_cn = relative_copy_numbers(per_genome)
+    relative_cn = relative_copy_numbers(per_genome, groups)
 
     # ---- Pass 1: correct, then call copy number without writing anything -----
     frames, staged = {}, {}
-    for seq_id, df_gc in per_genome.items():
-        # df_gc already carries is_deletion/is_redundant from the
-        # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
-        # so fit_otr_bias() reuses them.
-        # Ahead of the OTR fit, exactly as get_CNV.main() places it. This
-        # ORDERING IS LOAD-BEARING: it reads only ref_base, so it is available
-        # whatever the coverage does, and fit_otr_bias() takes it as the second
-        # breakpoint candidate.
-        skew = predict_ori_ter_from_skew(df_gc, win=win, step=step)
-        write_gc_skew_results(skew, str(out), seq_id)
-        plot_gc_skew(df_gc, str(out), skew)
+    for group_id, member_ids in members.items():
+        prepared = {}
+        for seq_id in member_ids:
+            df_gc = per_genome[seq_id]
+            # df_gc already carries is_deletion/is_redundant from the
+            # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
+            # so fit_otr_bias() reuses them.
+            # Ahead of the OTR fit, exactly as get_CNV.main() places it. This
+            # ORDERING IS LOAD-BEARING: it reads only ref_base, so it is available
+            # whatever the coverage does, and fit_otr_bias() takes it as the second
+            # breakpoint candidate.
+            # A contig of a draft assembly has no coordinate for an origin to sit
+            # on, so main() skips the measurement and writes the declined record.
+            if grouped(seq_id):
+                skew = no_skew_prediction(
+                    reason=f"member of reference group {group_id!r}")
+                write_gc_skew_results(skew, str(out), seq_id)
+                df_otr = df_gc.copy()
+                df_otr["otr_gc_corr_norm_cov"] = df_otr["gc_corr_norm_cov"]
+                write_otr_results(
+                    declined_otr_results(
+                        df_otr,
+                        correction_type=(f"No OTR correction (reference group "
+                                         f"{group_id!r})"),
+                        relative_copy_number=relative_cn[seq_id],
+                        reference_group=group_id,
+                    ),
+                    str(out), seq_id,
+                )
+                res1 = None
+            else:
+                skew = predict_ori_ter_from_skew(df_gc, win=win, step=step)
+                write_gc_skew_results(skew, str(out), seq_id)
+                plot_gc_skew(df_gc, str(out), skew)
 
-        res1 = fit_otr_bias(df_gc, str(out), skew_result=skew)
-        df_otr, _ori, _ter = apply_otr_correction(
-            res1, str(out), relative_copy_number=relative_cn[seq_id],
-        )
+                res1 = fit_otr_bias(df_gc, str(out), skew_result=skew)
+                df_otr, _ori, _ter = apply_otr_correction(
+                    res1, str(out), relative_copy_number=relative_cn[seq_id],
+                )
+            prepared[seq_id] = (df_otr, skew, res1)
+
         # Provisional calls: they exist only to build the CN censor for pass 2,
-        # and main() writes none of them.
+        # and main() writes none of them. Decoded per GROUP, which is what makes
+        # its members share one baseline.
         # BOTH run_HMM calls in this harness stay at their defaults, and that is
         # load-bearing rather than incidental: the eight goldens below are what
         # prove polymorphism mode left the consensus path alone, and they can
         # only prove it while this harness asks for the consensus path. Do not
         # thread -p (or any other HMM tuning flag) through here -- exercise it
         # from the pass-2 frame instead, as TestPolymorphismOnRealCoverage does.
-        df_staged, cn_applied = stage_pass1(run_HMM(df_otr, str(out), write=False))
-        staged[seq_id] = df_staged
-        frames[seq_id] = {"gc": df_gc, "skew": skew, "res1": res1,
-                          "cn_applied": cn_applied, "staged": df_staged,
-                          "pass1_keys": pass1_summary(res1, df_staged)}
+        called = run_HMM_group({s_: prepared[s_][0] for s_ in prepared}, str(out),
+                               write=False, group_id=group_id)
+        keep_fraction = cn_censor_keep_fraction(called.values())
+        for seq_id in member_ids:
+            df_otr, skew, res1 = prepared[seq_id]
+            df_staged, cn_applied = stage_pass1(called[seq_id],
+                                                keep_fraction=keep_fraction)
+            staged[seq_id] = df_staged
+            frames[seq_id] = {"gc": per_genome[seq_id], "skew": skew, "res1": res1,
+                              "cn_applied": cn_applied, "staged": df_staged,
+                              "pass1_keys": (pass1_summary(res1, df_staged)
+                                             if res1 is not None else None)}
 
     # ---- Pooled GC refit, between the passes ---------------------------------
     # Pooled, so like main() it cannot run inside the loop above: it needs every
@@ -338,23 +391,48 @@ def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG):
     corrected, _gc2 = refit_gc_bias_pooled(staged)
     plot_gc_passes(corrected, str(out))
     # gc_corr_norm_cov now means raw/G rather than raw/g1, and this reads it.
-    relative_cn = relative_copy_numbers(corrected)
+    relative_cn = relative_copy_numbers(corrected, groups)
 
     # ---- Pass 2: the same fits, on CN=1 windows ------------------------------
-    for seq_id, df_staged in corrected.items():
-        f = frames[seq_id]
-        # The median filter seeds the ori/ter guess, so it is recomputed from the
-        # coverage this pass fits rather than inherited from the last one.
-        df_fit = df_staged.drop(columns=["gc_cor_med_fil"], errors="ignore")
-        res = fit_otr_bias(df_fit, str(out), skew_result=f["skew"])
-        df_final, _ori, _ter = apply_otr_correction(
-            res, str(out), relative_copy_number=relative_cn[seq_id],
-            extra_results=f["pass1_keys"],
-        )
-        plot_correction_stages(df_final, str(out), res, bias="all")
-        f["res"] = res
-        f["otr"] = df_final
-        f["cnv"] = run_HMM(df_final, str(out))
+    # Group-major, like pass 1 and like main(): the published calls come from one
+    # baseline per group, so every member is corrected before any is called.
+    for group_id, member_ids in members.items():
+        final = {}
+        for seq_id in member_ids:
+            f = frames[seq_id]
+            df_staged = corrected[seq_id]
+            if grouped(seq_id):
+                df_final = df_staged.copy()
+                df_final["otr_gc_corr_norm_cov"] = df_final["gc_corr_norm_cov"]
+                write_otr_results(
+                    declined_otr_results(
+                        df_final,
+                        correction_type=(f"No OTR correction (reference group "
+                                         f"{group_id!r})"),
+                        relative_copy_number=relative_cn[seq_id],
+                        reference_group=group_id,
+                    ),
+                    str(out), seq_id,
+                )
+                res = None
+            else:
+                # The median filter seeds the ori/ter guess, so it is recomputed
+                # from the coverage this pass fits rather than inherited from the
+                # last one.
+                df_fit = df_staged.drop(columns=["gc_cor_med_fil"], errors="ignore")
+                res = fit_otr_bias(df_fit, str(out), skew_result=f["skew"])
+                df_final, _ori, _ter = apply_otr_correction(
+                    res, str(out), relative_copy_number=relative_cn[seq_id],
+                    extra_results=f["pass1_keys"],
+                )
+            plot_correction_stages(df_final, str(out), res, bias="all")
+            f["res"] = res
+            f["otr"] = df_final
+            final[seq_id] = df_final
+
+        called = run_HMM_group(final, str(out), group_id=group_id)
+        for seq_id in member_ids:
+            frames[seq_id]["cnv"] = called[seq_id]
 
     return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames,
             "gc_flags": gc_flags, "win": win}
@@ -1355,3 +1433,129 @@ class TestPolymorphismOnRealCoverage:
         called = self._call(seq, tmp_path)
         _df, applied = add_cn_censor(called, polymorphism=True)
         assert applied
+
+
+# ---------------------------------------------------------------------------
+# Reference groups on real coverage.
+# ---------------------------------------------------------------------------
+GROUPED_DATASET = "cwbi_ssym_ht04"
+GROUPED_LABEL = "one_assembly"
+
+
+def _otr_json_at(out, seq_id):
+    with open(_produced(out, seq_id, "OTR_corr", "_otr_results.json")) as fh:
+        return json.load(fh)
+
+
+@pytest.fixture(scope="session")
+def pipeline_cwbi(tmp_path_factory):
+    """The ordinary, ungrouped run of the same dataset, for the before/after."""
+    from conftest import _dataset_or_skip
+
+    path = _dataset_or_skip(GROUPED_DATASET)
+    if GROUPED_DATASET not in _PIPELINES:
+        _PIPELINES[GROUPED_DATASET] = _run_pipeline(
+            GROUPED_DATASET, path, tmp_path_factory.mktemp("out_cwbi"))
+    return _PIPELINES[GROUPED_DATASET]
+
+
+@pytest.fixture(scope="session")
+def grouped_pipeline(tmp_path_factory):
+    """cwbi_ssym_ht04 with its chromosome and both plasmids in ONE group.
+
+    Biologically wrong on purpose -- those are three separate replicons -- and
+    mechanically ideal, because the truth is already published. The chromosome
+    contributes 6,709 of the ~7,100 windows, so a pooled fit lands near its own
+    baseline, and the two plasmids' measured levels (2.9531 and 1.8980 relative,
+    from `"Relative copy number"`) say what a shared baseline must call them.
+
+    It is also the only multi-sequence dataset in the corpus, so it is the only
+    place the grouped path can be exercised on real coverage at all.
+    """
+    from conftest import _dataset_or_skip
+
+    path = _dataset_or_skip(GROUPED_DATASET)
+    groups = {seq.seq_id: GROUPED_LABEL
+              for seq in DATASETS[GROUPED_DATASET].sequences}
+    return _run_pipeline(
+        GROUPED_DATASET, path, tmp_path_factory.mktemp("grouped_cwbi"),
+        groups=groups,
+    )
+
+
+class TestReferenceGroupOnRealCoverage:
+    """One baseline across three sequences, against calls that are already known."""
+
+    @staticmethod
+    def _calls(pipeline, seq_id):
+        return pipeline["frames"][seq_id]["cnv"]["prob_copy_number"]
+
+    def test_ungrouped_the_plasmids_are_called_single_copy(self, pipeline_cwbi):
+        # The starting point, and the thing being fixed: run_HMM refits the
+        # single-copy level from whichever sequence it is handed (fitted mu
+        # 100.9 / 300.0 / 194.6), so a plasmid at 2.95x the chromosome is CN 1.
+        for seq_id in ("plasmid_1", "plasmid_2"):
+            assert int(self._calls(pipeline_cwbi, seq_id).mode()[0]) == 1
+
+    @pytest.mark.parametrize("seq_id,expected", [
+        ("plasmid_1", 3),      # measured relative copy number 2.9531
+        ("plasmid_2", 2),      # measured relative copy number 1.8980
+    ])
+    def test_grouped_each_plasmid_is_called_at_its_measured_level(
+            self, grouped_pipeline, seq_id, expected):
+        called = self._calls(grouped_pipeline, seq_id)
+        assert int(called.mode()[0]) == expected
+        # Not a stray window or two: the level is what most of the replicon reads.
+        assert (called == expected).mean() > 0.5
+
+    def test_the_chromosome_still_anchors_the_group(self, grouped_pipeline):
+        called = self._calls(grouped_pipeline, "chromosome")
+        assert int(called.mode()[0]) == 1
+
+    def test_the_chromosomes_big_amplification_survives(self, grouped_pipeline,
+                                                        pipeline_cwbi):
+        # The group's baseline comes overwhelmingly from the chromosome, so its
+        # own structure must not move: the CN-34 block is the loudest feature in
+        # the corpus and the most sensitive to a shifted mu.
+        for pipe in (grouped_pipeline, pipeline_cwbi):
+            df = pipe["frames"]["chromosome"]["cnv"]
+            block = df.loc[(df["win_st"] >= 59_501) & (df["win_st"] < 70_000)]
+            assert block["prob_copy_number"].max() > 20
+
+    def test_every_member_publishes_the_groups_relative_copy_number(
+            self, grouped_pipeline):
+        # One group, so it anchors itself and every member reads exactly 1.0 --
+        # the per-sequence 2.95 and 1.90 are now a statement about copy NUMBER,
+        # which is where they belong, rather than a number beside a call of 1.
+        out = grouped_pipeline["out"]
+        values = set()
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            record = _otr_json_at(out, seq.seq_id)
+            assert record["Reference group"] == GROUPED_LABEL
+            assert GROUPED_LABEL in record["Correction type"]
+            values.add(round(record["Relative copy number"], 6))
+        assert values == {1.0}
+
+    def test_the_declined_records_are_still_what_breseq_reads(
+            self, grouped_pipeline):
+        out = grouped_pipeline["out"]
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            record = _otr_json_at(out, seq.seq_id)
+            assert record["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+            # breseq does not type-check these two, so a null costs it the file.
+            assert isinstance(record["Origin window"], int)
+            assert isinstance(record["Terminus window"], int)
+
+            breaks = pd.read_csv(_produced(out, seq.seq_id, "CNV_csv",
+                                           "_break_pts.csv"))
+            assert list(breaks.columns) == ["Startpos", "State", "Segment_Size"]
+            assert breaks["State"].dtype == "int64"
+
+    def test_gc_skew_is_reported_as_not_measured(self, grouped_pipeline):
+        out = grouped_pipeline["out"]
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            with open(_produced(out, seq.seq_id, "GC_skew",
+                                "_gc_skew_results.json")) as fh:
+                record = json.load(fh)
+            assert record["Prediction confident"] is False
+            assert GROUPED_LABEL in record["No prediction reason"]
