@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from CNery.get_CNV import main
+from CNery.get_CNV import _installed_version, main
 
 COLUMNS = [
     "position", "ref_base",
@@ -377,6 +377,30 @@ class TestReferenceGroups:
                 # "fix" this by comparing the bytes.
                 continue
             assert open(a, "rb").read() == open(b, "rb").read(), name
+
+
+class TestVersion:
+    # breseq parses the "CNery <version>" line to report which CNery it found.
+    def test_prints_the_version_and_exits(self, capsys, monkeypatch):
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, ["--version"])
+        assert exit_info.value.code == 0
+        assert capsys.readouterr().out == f"CNery {_installed_version()}\n"
+
+    def test_reports_the_package_metadata_version(self, monkeypatch):
+        import importlib.metadata
+
+        monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.8.7")
+        assert _installed_version() == "9.8.7"
+
+    def test_an_uninstalled_source_tree_is_unknown(self, monkeypatch):
+        import importlib.metadata
+
+        def not_installed(name):
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", not_installed)
+        assert _installed_version() == "unknown"
 
 
 class TestBadInvocations:

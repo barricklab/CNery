@@ -48,6 +48,20 @@ from .core import (
 )
 
 
+def _installed_version():
+    """The version of the installed CNery package, as `CNery --version` reports it.
+
+    breseq parses this line ("CNery <version>") to print which CNery it found.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("CNery")
+    except PackageNotFoundError:
+        # Running from a source tree that was never installed.
+        return "unknown"
+
+
 def main():
     from argparse import RawTextHelpFormatter
     import textwrap
@@ -67,6 +81,12 @@ def main():
     )
 
     # Define the command line arguments
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"CNery {_installed_version()}",
+    )
+
     parser.add_argument(
         "inputs",
         nargs="*",

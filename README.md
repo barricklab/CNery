@@ -48,7 +48,8 @@ you do not have them yet. Point it at the folder holding them:
 CNery <folder> [-o <output folder>] [-w <window>] [-s <step size>] [-f <fragment length>]
 ```
 
-Run with no arguments at all and it reads the current folder. You can also name tables directly, or
+Run with no arguments at all and it reads the current folder (`CNery --version` prints the installed
+version). You can also name tables directly, or
 mix files and folders in one command:
 
 ```bash
