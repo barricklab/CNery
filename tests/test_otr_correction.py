@@ -466,36 +466,79 @@ class TestBreakpointArbitration:
         assert detail["Coverage vs skew likelihood-ratio p-value"] > OTR_LR_ALPHA
         assert detail["Breakpoint source"] == "GC skew"
 
-    def test_displaced_breakpoints_are_rejected(self):
-        """A terminus 10% of the genome away loses; that is the p1 case."""
+    def test_displaced_terminus_is_refined_not_replaced(self):
+        """A terminus 7% of the genome away loses; that is the p1 case.
+
+        What replaces it is the skew's ORIGIN with the terminus the coverage
+        prefers -- not the free two-breakpoint tent, which on real coverage
+        chases structure that is not replication (ADP1 IG0647: terminus 1.04 Mb
+        off a correct skew).
+        """
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
-        *_, bias, detail = otr_fit(
-            df, n_surrogates=200, skew_result=_skew(100, 340, n)
+        _, _, o_idx, t_idx, bias, detail = otr_fit(
+            df, n_surrogates=200, skew_result=_skew(100, 328, n)
         )
         assert bias is True
         assert detail["Coverage vs skew likelihood-ratio p-value"] <= OTR_LR_ALPHA
-        assert detail["Breakpoint source"] == "coverage fit"
+        assert detail["Breakpoint source"] == "GC skew, terminus refined by coverage"
+        assert o_idx == 100
+        assert abs(t_idx - 300) <= 8
+        assert detail["Terminus shift from GC skew (fraction)"] == pytest.approx(
+            -0.07, abs=0.02)
+
+    def test_refinement_never_moves_the_terminus_past_the_bound(self):
+        """Coverage whose real terminus is 25% away cannot drag it there.
+
+        The skew's terminus moves at most OTR_TER_SHIFT_MAX; the origin never.
+        And an optimum that lands ON the bound is declined outright -- it is a
+        trend being absorbed, not a terminus being located -- so the skew's own
+        coordinates are what get applied.
+        """
+        from CNery.core import OTR_TER_SHIFT_MAX
+        n = 400
+        df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.6))
+        _, _, o_idx, t_idx, bias, detail = otr_fit(
+            df, n_surrogates=200, skew_result=_skew(100, 200, n)
+        )
+        assert o_idx == 100
+        shift = ((t_idx - 200 + n / 2) % n) - n / 2
+        assert abs(shift) <= OTR_TER_SHIFT_MAX * n + 1
+        assert detail["Breakpoint source"] == "GC skew"
+        assert t_idx == 200
+
+    def test_terminus_grid_nests_the_skew_tent(self):
+        """d = 0 is exactly a row, so the refined model contains the skew's."""
+        from CNery.core import _otr_terminus_grid
+        m = 400
+        w = np.ones(m)
+        rows, bps = _otr_terminus_grid(m, w, 100.0, 300.0)
+        assert (100.0, 300.0) in bps
+        assert all(o == 100.0 for o, _ in bps)
+        skew_row = _otr_normalize_phases(_otr_phase(m, 100.0, 300.0), w)[0]
+        assert np.allclose(rows[bps.index((100.0, 300.0))], skew_row)
 
     def test_chi_square_would_reject_where_the_bootstrap_does_not(self):
         """The reason this machinery exists instead of a closed form.
 
-        With IID residuals the null of Lambda really is chi-square(2). Real
-        coverage residuals are spatially autocorrelated, which inflates
-        Lambda's upper tail by one to two orders of magnitude -- so
-        chi-square(2) rejects the GC skew for essentially every sequence,
+        The alternative is the skew's origin with a free terminus -- ONE extra
+        parameter -- so with IID residuals the null of Lambda would be
+        chi-square(1). Real coverage residuals are spatially autocorrelated,
+        which inflates Lambda's upper tail by one to two orders of magnitude --
+        so the closed form rejects the GC skew for essentially every sequence,
         including the one where both tents agree to 1.8% of the genome and the
         skew lands on REL606's oriC.
         """
         n = 400
         df = _prep(_make_tent_df(n=n, o=100, t=300, sd=0.03, rho=0.8))
-        # Terminus displaced by 1% of the genome -- the regime where the two
-        # estimates genuinely agree and the bootstrap should say so.
-        *_, detail = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 304, n))
+        # Terminus displaced by 2.5% of the genome -- inside the noise of this
+        # autocorrelated series, where the bootstrap should keep the skew.
+        *_, detail = otr_fit(df, n_surrogates=300, skew_result=_skew(100, 310, n))
         lam = detail["Coverage vs skew likelihood ratio"]
         p_boot = detail["Coverage vs skew likelihood-ratio p-value"]
-        assert chi2.sf(lam, 2) < 0.01
+        assert chi2.sf(lam, 1) < 0.01
         assert p_boot > OTR_LR_ALPHA
+        assert detail["Breakpoint source"] == "GC skew"
 
     def test_orientation_contradiction_rejects_the_skew_coordinates(self):
         """Rejected, never silently relabelled.

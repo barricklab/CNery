@@ -1821,3 +1821,92 @@ class TestPolymorphismUnderAGroup:
             levels = df["prob_copy_number"].to_numpy(dtype=float)
             np.testing.assert_allclose(
                 levels, np.round(levels / 0.05) * 0.05, atol=1e-9)
+
+
+class TestAutocorrelationWeighting:
+    """Correlated window noise must not be decoded as short copy-number events.
+
+    The emissions assume windows are independent given the state. Real depths
+    are not -- reads span windows, mates land a few windows apart, library bias
+    acts at the fragment scale -- and on four ADP1 samples that turned ordinary
+    0.4-1.5 kb, 1.6-2.3x excursions into CN = 2 calls. These frames reproduce the
+    mechanism with a smoothed multiplicative field over Poisson counts.
+    """
+
+    @staticmethod
+    def _frame(n=20000, depth=35.0, sd=0.2, width=6, seed=0, block=None, level=2.0):
+        rng = np.random.default_rng(seed)
+        z = rng.normal(0.0, 1.0, n + width)
+        field = np.convolve(z, np.ones(width) / np.sqrt(width), mode="valid")[:n] * sd
+        lam = depth * np.exp(field)
+        if block is not None:
+            lam[block] *= level
+        counts = rng.poisson(lam).astype(float)
+        norm = counts / np.median(counts)
+        win_st = np.arange(n) * 100
+        return pd.DataFrame({
+            "genome_id": "chr1",
+            "win_st": win_st + 1,
+            "win_end": win_st + 101,
+            "win_len": 100,
+            "gc_percent": 0.5,
+            "read_count_cov": counts,
+            "norm_raw_cov": norm,
+            "gc_corr_norm_cov": norm,
+            "otr_gc_corr_norm_cov": norm,
+            "pct_redundant": 0.0,
+            "is_redundant": False,
+            "is_deletion": False,
+        })
+
+    @staticmethod
+    def _calls(df, tmp_path, flag):
+        out = str(tmp_path / f"ac_{flag}")
+        os.makedirs(os.path.join(out, "CNV_csv"), exist_ok=True)
+        return run_HMM(df.copy(), out, write=False,
+                       autocorr_weighting=flag)["prob_copy_number"].to_numpy()
+
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_correlated_noise_alone_is_not_called(self, seed, tmp_path):
+        df = self._frame(seed=seed)
+        unweighted = self._calls(df, tmp_path, False)
+        weighted = self._calls(df, tmp_path, True)
+        # The mechanism is real: without the discount these frames ARE called.
+        assert (unweighted != 1).sum() > 0
+        assert (weighted != 1).sum() == 0
+
+    def test_a_real_4kb_duplication_is_still_called(self, tmp_path):
+        df = self._frame(seed=0, block=slice(10000, 10040))
+        cn = self._calls(df, tmp_path, True)
+        assert (cn[10000:10040] == 2).mean() >= 0.9
+        assert (np.delete(cn, np.s_[10000:10040]) != 1).sum() == 0
+
+    def test_independent_windows_are_not_discounted(self):
+        from CNery.core import emission_autocorrelation_inflation
+        rng = np.random.default_rng(3)
+        c = rng.poisson(35, 20000).astype(float)
+        vif, _, _ = emission_autocorrelation_inflation(
+            [(c, np.ones(c.size), np.ones(c.size, dtype=bool))], 35.0)
+        assert vif == pytest.approx(1.0, abs=0.08)
+
+    def test_copy_number_events_do_not_inflate_their_own_discount(self):
+        """Amplified and deleted windows are copy number, not noise.
+
+        They fall outside _censor_bounds()'s band and must not enter the
+        variance the discount is measured from.
+        """
+        from CNery.core import emission_autocorrelation_inflation
+        rng = np.random.default_rng(4)
+        c = rng.poisson(35, 20000).astype(float)
+        c[5000:5400] = rng.poisson(35 * 25, 400)      # a CN-25 element
+        c[12000:13000] = 0.0                          # a deletion
+        vif, _, _ = emission_autocorrelation_inflation(
+            [(c, np.ones(c.size), np.ones(c.size, dtype=bool))], 35.0)
+        assert vif == pytest.approx(1.0, abs=0.08)
+
+    def test_never_weaker_than_the_overlap_factor(self, tmp_path):
+        """The discount is a MIN with step/window: disabling it can only add evidence."""
+        df = self._frame(seed=2, sd=0.1)
+        a = self._calls(df, tmp_path, True)
+        b = self._calls(df, tmp_path, False)
+        assert (a != 1).sum() <= (b != 1).sum()

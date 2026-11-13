@@ -274,12 +274,21 @@ stage — note `raw/G` is an intermediate, not a result:
   r² 0.473 to 0.943. The coverage arm now stands on its own where it previously
   needed the GC skew to carry it, and `adp1` acquires a live likelihood-ratio test
   for the first time (p = 0.167, still deferring to the skew).
-- **Amplitudes barely move**: `adp1` 1.0673 → 1.0725, `cwbi:chromosome`
-  1.1690 → 1.1699, `p5_75k_exp` 2.0500 → 2.0791, `p1_shift` 1.3464 → 1.3400. The
-  earlier expectation that CWBI's ratio would fall toward 1.075 was wrong, and the
-  reason is worth knowing: its breakpoints come from the GC skew, so only the OLS
-  anchors could move, and the CN-34 amplification was never what those anchors
-  were fitting.
+- **The skew arm's anchors now honour the censor too, and amplitudes DO move.**
+  `_otr_skew_candidate` used to rebuild its own mask from `is_deletion |
+  is_redundant`, silently dropping `is_cn_variant`, so the anchors a skew-sourced
+  tent APPLIES were solved on contaminated data in both passes. That is why this
+  bullet once read "amplitudes barely move" (`adp1` 1.0673 → 1.0725,
+  `cwbi:chromosome` 1.1690 → 1.1699) and explained CWBI's ratio not falling toward
+  1.075 as the amplification "never being what those anchors were fitting" — that
+  explanation was wrong; the anchors simply never saw the censor. `otr_fit` now
+  passes its own `fit_mask`. Measured: `cwbi:chromosome` 1.1699 → **1.0784** (the
+  1.075 the excision experiment predicted; its CN-34 call becomes 35),
+  `adp1_mgd06_lb` 1.0725 → **1.1543**, `p5_75k_exp` 2.0791 → 2.0762, and
+  `ltee_ara_m3_38k` 1.0697 → **not corrected**: censoring its 187 CN ≠ 1 windows
+  (2.3%) turns the anchors to 0.979, so its old ramp was the citT amplification.
+  On ADP1 IG0622 the same bug let a 25–29× Himar1 element invert the anchors
+  (1.0243 vs 1.0274) and reject a correct skew in both passes.
 - **`CN_CENSOR_MIN_KEEP = 0.5`.** If the censor would leave under half a
   sequence's windows it is declined and pass 2 censors exactly as pass 1 did — a
   genuinely duplicated replicon is every window at CN=2, and censoring it entirely
@@ -567,6 +576,42 @@ cross-validation cannot separate it from any bandwidth in 0.05–0.50 (within
 also a sensible density-adaptive rule in disguise — measured at **0.26–0.44 × the
 GC standard deviation** across six references, median 0.32. Its one weakness is
 the tails, where the 30% neighbourhood spans 2.4–4.0 × the GC sd.
+
+#### Neighbouring windows are not independent, and the emissions are told so
+
+Viterbi scores each window as an independent draw given its state. Window depths
+are not independent: a 150-bp read spans two 100-bp windows, mates land a few
+windows apart, and library bias acts at the fragment scale. Measured on four ADP1
+samples (`-w 100 -s 100`, after the GC and OTR corrections, CN = 1 windows): lag-1
+ACF 0.55–0.63, a second bump at lags 3–5 (0.28–0.40), and a 10-window mean with
+**3.4–4.7×** the variance independence predicts. A 1-kb excursion therefore entered
+the decode as 3–5× the evidence it carries, and that is exactly what those samples
+were calling: 0.4–1.5 kb CN = 2 segments at 1.6–2.3× with no junction, no read-pair
+or duplicate anomaly, no `-M` pseudoread excess, and no step edge in the profile.
+`step/window` (`overlap_weighting`) only ever covered the share of this that
+overlapping windows create by construction, and at `-w 100 -s 100` it is 1.
+
+- **`emission_autocorrelation_inflation` measures the discount; nothing chooses
+  it.** τ is the first lag at which the residual ACF drops below 1/e
+  (`_otr_autocorr_length`), and the inflation is the batch-means variance ratio
+  over blocks of `OTR_BLOCK_AUTOCORR_MULTIPLE · τ` windows — the block length the
+  OTR bootstrap already established as the one that holds nominal size. The
+  emission weight becomes `min(step/window, 1/inflation)`: a MIN, never a product,
+  because overlap-induced correlation is part of what the ACF measures. Printed per
+  run ("window autocorrelation inflates per-window evidence 3.05x…").
+- **Copy number cannot inflate its own discount.** The residual is
+  `counts/(mu·offset) − 1` on windows that are not redundant, not `is_cn_variant`
+  (pass 2), and inside `_censor_bounds`' [0.5, 1.5] × mode band — so a CN-25 element
+  or a deletion contributes nothing. Independent counts measure 1.0 ± 0.08, with or
+  without such events, and `test_independent_windows_are_not_discounted` pins it.
+- **Measured effect.** ADP1: 12 short CN ≠ 1 calls → 4, the survivors being the
+  ones ≥ 2× raw (ACIAD1795 recurs in independent libraries), with the Himar1 element
+  (CN 9–25), a transposon-bounded 14-kb CN-3 and every large deletion kept. It also
+  removed IG0627's GC-tail call (0.24× raw depth at 19% GC, called CN = 2). The
+  cost: IG0647's one-window CN = 0 over ~200 bp of zero depth is no longer called
+  (breseq's own MC evidence still reports it). On the corpus at the goldens'
+  windowing exactly one segment moves — `m3_32k`'s 19.5-kb CN-4 block inside the
+  citT CN-3 amplification merges into CN-3 (21 → 20 segments).
 
 #### Why re-running the gate on censored data is safe HERE
 
@@ -1081,21 +1126,42 @@ already, and this is where they would drift next.
   sequences contradicts (`ltee_ara_m3_32k_2rg`, ratio 0.907) and its skew tent explains r² = 0.007,
   so what is rejected there is the sign of noise — on flat synthetic coverage the sign is a coin
   flip (49.3% over 300 trials).
-- **When both arms are live, a bootstrap likelihood ratio decides.** The models are nested — both fit
-  the anchors by OLS, the skew model additionally fixes the two breakpoint positions — so
-  `Λ = m·ln(RSS_skew/RSS_free)` with 2 degrees of freedom. `RSS_free` is the minimum over the *same
-  band-restricted grid*, never a fresh Nelder–Mead fit: fed the unrestricted optimum, adp1's
-  degenerate 1.1%-separation spike (r² 0.1175 against a band-restricted 0.0524) wins at p = 0.001
-  instead of losing at 0.181. Run the LRT only *after* both arms have been gated, never in place of
-  the gates.
-- **Λ's null is not χ²(2), and the reason is autocorrelation alone.** With *iid* residuals the null
+- **When both arms are live, a bootstrap likelihood ratio decides — but only whether the coverage may
+  REFINE the skew, never whether it may replace it.** The alternative to a credible skew tent is the
+  skew's own origin with the terminus free to move by up to `OTR_TER_SHIFT_MAX = 0.10` of the
+  sequence (`_otr_terminus_grid`, `OTR_TER_SHIFT_STEPS = 41`, the skew's own terminus an exact row so
+  the models nest). That is ONE extra parameter: `Λ = m·ln(RSS_skew/RSS_ter)`. A win is refined on
+  the full-resolution objective (`_otr_refine_terminus`) and reported as `"Breakpoint source": "GC
+  skew, terminus refined by coverage"` with `"Terminus shift from GC skew (fraction)"`. The free
+  two-breakpoint tent is reached **only when there is no credible skew** (absent, unconfident, or
+  orientation-rejected).
+  - **Why.** Rejecting the skew tent says it does not explain everything — not that the free tent's
+    *locations* are right, and on real coverage the free tent chases whatever genome-scale structure is
+    left anywhere in the band. Measured on four ADP1 samples with a correct skew (oriC 3,592,701;
+    every 100-kb coverage profile bottoms out at ~1.8 Mb): the old arbitration handed three of four
+    to the free fit, putting the origin 250–517 kb off and, on IG0647, the terminus at 798,001 —
+    **1.04 Mb (29%)** from the skew's 1,838,501. The origin is held because oriC is a sequence
+    feature and the tent's peak is its least identifiable part; the terminus may move because
+    replichore imbalance and a terminus region genuinely move where forks meet.
+  - **An optimum ON the ±10% bound is declined** and the skew's terminus kept — the same reading as a
+    free fit pinned at `OTR_SEP_LO`: no interior minimum, the parameter is absorbing a trend. IG0647
+    ran straight to −10% with a residual structure score of 4.25.
+  - On the corpus only `ltee_ara_p1_50k_shift` refines (−9.2%); its tent lands 12 kb from the old
+    free fit's terminus with the origin snapped 22 kb onto the skew's, and its structure score falls
+    from 2.5 to 1.44.
+  - Run the LRT only *after* both arms have been gated, never in place of the gates. (Its history:
+    `RSS_free` over the band grid, not a fresh Nelder–Mead fit, because adp1's degenerate
+    1.1%-separation spike otherwise won at p = 0.001.)
+- **Λ's null is not χ² — now χ²(1) for the terminus-refinement test, formerly χ²(2) for the
+  two-breakpoint one — and the reason is autocorrelation alone.** With *iid* residuals the null
   of Λ is χ²(2) to Monte-Carlo error on all eight sequences (q99 8.3–9.3 against 9.21), and stays so
   even with the separation band removed — neighbouring tents are near-collinear, so the max over
   change-point breakpoints costs essentially nothing. What breaks it is that real residuals stay
   spatially autocorrelated, inflating Λ's 99th percentile by 2.8×–128× (24×–51× on the *E. coli*
   chromosomes). χ²(2) would report p < 0.001 for **every** sequence, including `p5_75k_exp` where the
   two tents agree to 1.8% of the genome and the skew lands on REL606's *oriC* — bootstrap p is 0.80.
-  `test_chi_square_would_reject_where_the_bootstrap_does_not` pins this.
+  `test_chi_square_would_reject_where_the_bootstrap_does_not` pins this (now with χ²(1), at a 2.5%
+  terminus displacement where χ²(1) rejects at p ≈ 3e-6 and the bootstrap reads 0.09).
 - **The LRT resamples residuals; the detection gate resamples the raw series.** They disagree on
   purpose. A bootstrap for a composite null must simulate *from* the null model, and the LRT's null
   ("the skew tent is the truth") is fully specified. The detection gate's null has no fitted signal
@@ -1105,9 +1171,11 @@ already, and this is where they would drift next.
   At 0.01 the synthetic true-null rejection rate is 0/30 and power halves (33% vs 70% at a
   5%-of-genome displacement). On the corpus every verdict is identical for any α in 0.01–0.10.
 - **`OTR_SKEW_MAX_P = None` means the skew arm needs no coverage evidence of its own**, and the cost
-  is explicit: on `ltee_ara_m3_38k` and `adp1_mgd06_lb` the applied ramps (1.069, 1.067) sit inside
-  the flat-noise band and their own fixed-breakpoint p-values are 0.243 and 0.615. Those corrections
-  are applied because the reference says an origin is there and the coverage does not contradict it.
+  was explicit: on `ltee_ara_m3_38k` and `adp1_mgd06_lb` the applied ramps (1.069, 1.067) sat inside
+  the flat-noise band and their own fixed-breakpoint p-values were 0.243 and 0.615. Both numbers were
+  inflated by amplifications the skew arm's anchors failed to censor (see "The skew arm's anchors now
+  honour the censor"): honestly censored, m3_38k contradicts the orientation and is not corrected, and
+  adp1 reads 1.154.
   What bounds the damage is that the skew supplies only *where* — the amplitude is still solved by
   OLS against the observed coverage, so a flat sample yields a flat tent (300 synthetic flat series:
   ratio median 0.999, 95th pct 1.051, max 1.089). Setting it to 0.01 instead would rescue **zero**
@@ -1155,8 +1223,8 @@ already, and this is where they would drift next.
   `cwbi_ssym_ht04`'s chromosome inside its CN-34 one, and excising the amplification takes CWBI's
   applied ratio from 1.169 to 1.075 — roughly 40% of the ramp being divided out of that chromosome
   is copy number, not replication. The GC-skew arm can supply good *coordinates* in that situation;
-  what it cannot fix is the *amplitude*, because the anchors are still solved on contaminated data.
-  **Nothing in the pipeline corrects for this today**, and a fix must not be an iterative
+  the amplitude is now solved on the pass-2-censored windows (the pass-1 HMM's CN ≠ 1 calls), which
+  takes CWBI to 1.078. A further fix must not be an iterative
   fit-censor-refit loop: one was prototyped and measured, and on ramp-free real sequences — each
   authentic sequence with its own best-fit tent divided out, so there is no ramp by construction —
   it took the OTR false-positive rate from **0/8 to 4/8** at a nominal 1%, inventing a ratio of
@@ -1175,9 +1243,9 @@ already, and this is where they would drift next.
   the axis, and a **terminus-spanning** one is largely reparametrisable as a shifted terminus.
 - **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,
   not at a point, so a symmetric V must choose between matching the descent and matching the trough.
-  On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the coverage fit puts its
-  terminus 221 kb early and the skew 270 kb late — the truth is between them. The LRT still picks the
-  coverage fit there (p = 0.004), and 87% of that fit's advantage comes from *outside* the disputed
+  On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the old free coverage fit put
+  its terminus 221 kb early and the skew 270 kb late — the truth is between them. The LRT rejected
+  the skew tent there (p = 0.004), and 87% of that fit's advantage comes from *outside* the disputed
   stretch: the tent is a global two-line fit, so moving the terminus by 10.6% of the genome re-slopes
   both limbs everywhere. Note the skew is nonetheless the better *landmark* estimate on that sample
   (terminus 1.526 Mb against *dif* at ~1.55 Mb; the coverage fit is ~490 kb off). `otr_fit` optimises

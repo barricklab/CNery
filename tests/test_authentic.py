@@ -53,6 +53,7 @@ import pytest
 
 from CNery.core import (
     GC_SKEW_METHOD,
+    GC_SKEW_TER_REFINED_METHOD,
     STRAND_SPLIT_COLUMNS,
     TOTAL_ONLY_COLUMNS,
     _detect_delimiter,
@@ -151,22 +152,26 @@ DATASETS = {
     # The observed coverage trough is at neither, sitting between them -- a
     # single-kink tent cannot represent a terminus REGION.
     "ltee_ara_p1_50k_shift": Spec(
+        # Now the skew's ORIGIN with the terminus refined by the coverage: the
+        # free fit is no longer offered as the alternative to a credible skew.
+        # The refined tent lands 12 kb from where the free fit put its terminus,
+        # with the origin snapped 22 kb onto the skew's, and its residual
+        # structure score falls from 2.5 to 1.44.
         (Sequence("REL606_2314906bp_shift", REL606, otr_detected=True,
-                  otr_source="coverage fit"),), 0, 4, 9),
+                  otr_source="GC skew, terminus refined by coverage"),), 0, 4, 9),
     # Confident skew, but the coverage says the skew's ORIGIN is the low point
     # (anchor ratio 0.907), so the prediction is rejected rather than relabelled.
     "ltee_ara_m3_32k_2rg": Spec((Sequence("REL606", REL606),), 2, 10, 25),
     # Stationary phase, so there is no replication gradient in the coverage and
-    # the free fit cannot clear its own gate. The skew arm still fires, because
-    # the reference says an origin is there and the coverage does not contradict
-    # it -- and the applied ramp (1.069) is honestly indistinguishable from noise,
-    # with the coverage's own fixed-breakpoint p at 0.243. otr_tightens=False
-    # records what that buys: 85.6% -> 85.3%, a wash. This is the accepted cost of
-    # OTR_SKEW_MAX_P = None, and it is bounded by the amplitude being FITTED from
-    # the coverage rather than imported: a flat sample yields a flat tent.
+    # the free fit cannot clear its own gate. The skew arm used to fire with a
+    # ramp of 1.069 (fixed-breakpoint p 0.243) -- but that ramp was the citT
+    # amplification: its anchors were solved WITHOUT the pass-1 CN censor. With
+    # the 187 CN != 1 windows (2.3%) excluded, as every other fit excludes them,
+    # the same anchors read 0.979: the coverage contradicts the skew's
+    # orientation at noise level, so no tent is applied. That is the honest
+    # verdict for a sample with no gradient.
     "ltee_ara_m3_38k": Spec(
-        (Sequence("REL606", REL606, otr_detected=True, otr_tightens=False,
-                  otr_source="GC skew"),), 1, 7, 17),
+        (Sequence("REL606", REL606),), 1, 7, 17),
     # The strong case, and the one that validates the whole arbitration. Both arms
     # fire and agree to 1.8% of the genome, so the likelihood ratio cannot separate
     # them (p = 0.82) and defers to the skew -- whose origin lands on REL606's oriC
@@ -771,9 +776,9 @@ class TestOriginTerminus:
         the same thing -- REL606's oriC is at ~3.886 Mb, where the skew lands,
         and the coverage fit was 82 kb short of it.
 
-        ltee_ara_p1_50k_shift is the other end: both fire, but they place the
-        terminus 10.6% of the genome apart and the coverage fit explains
-        materially more (p = 0.004), so it keeps its own breakpoints.
+        ltee_ara_p1_50k_shift is the other end: both fire and the skew tent
+        loses the likelihood ratio, so the coverage refines the skew's terminus
+        -- holding the skew's origin -- rather than replacing both breakpoints.
         """
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
             data = json.load(fh)
@@ -782,6 +787,8 @@ class TestOriginTerminus:
         # "Correction type" is how a reader of the file alone tells them apart.
         if expected == "GC skew":
             assert data["Correction type"] == GC_SKEW_METHOD
+        elif expected == "GC skew, terminus refined by coverage":
+            assert data["Correction type"] == GC_SKEW_TER_REFINED_METHOD
         else:
             assert data["Correction type"] == "Ori-ter coordinates fit by coverage"
 
@@ -807,14 +814,13 @@ class TestOriginTerminus:
         """Reported only -- nothing gates on it, so this pins presence and shape.
 
         The score answers a question r-squared cannot: not how much variance the
-        tent explained, but whether what it FAILED to explain is structured. The
-        corpus separates cleanly -- five of the six corrected sequences read at or
-        below 1.03, and ltee_ara_p1_50k_shift reads 2.62 alone. That one is the
-        case CLAUDE.md already documents as the tent model's real limitation:
-        neither ori/ter estimate sits at the observed coverage trough, because a
-        single-kink tent cannot represent a terminus macrodomain. The diagnostic
-        rediscovers that independently and fires nowhere else, which is the
-        evidence it measures misspecification rather than noise.
+        tent explained, but whether what it FAILED to explain is structured.
+        ltee_ara_p1_50k_shift used to read 2.62 alone under the free
+        two-breakpoint fit -- the tent-model limitation CLAUDE.md documents for a
+        terminus macrodomain. With the skew's origin held and only the terminus
+        refined it reads 1.44, and on four ADP1 samples the score flagged exactly
+        the fits that were wrong (3.0-4.6 on the free fits, 4.25 on a refinement
+        pinned at its bound) -- the evidence it measures misspecification.
 
         Not compared against the golden as a float -- it rides on a bootstrap and
         on scipy, and CLAUDE.md asks for structural assertions on drifty summary
@@ -834,32 +840,39 @@ class TestOriginTerminus:
         # bootstrap has nothing left to destroy.
         assert tau_bp < 0.25 * seq["seq"].length
 
-    def test_only_p1_reads_as_structured(self, seq):
-        """The corpus-wide separation, as a per-sequence assertion.
+    def test_no_applied_tent_reads_as_structured(self, seq):
+        """The corpus-wide verdict, as a per-sequence assertion.
 
         Stated as a threshold rather than exact values because the score is a
-        bootstrap z: measured 2.62 on p1 against 1.03, 1.03, -0.27 and -0.78 on
-        the others, with a null sd near 0.9.
+        bootstrap z. p1 used to be the one exception at 2.62 under the free
+        two-breakpoint fit; with the skew's origin held and only the terminus
+        refined it reads 1.44, below the "structured" line with everything else.
         """
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
             score = json.load(fh)["Residual structure score"]
         if score is None:
             pytest.skip("no tent applied on this sequence")
-        if seq["name"] == "ltee_ara_p1_50k_shift":
-            assert score > 2.0, "p1's applied tent should read as structured"
-        else:
-            assert score < 2.0, f"unexpected residual structure: {score}"
+        assert score < 2.0, f"unexpected residual structure: {score}"
 
     def test_skew_sourced_coordinates_agree_with_the_skew_file(self, seq):
         """The two JSONs now share a coordinate and must not be able to disagree."""
-        if seq["seq"].otr_source != "GC skew":
+        source = seq["seq"].otr_source
+        if source not in ("GC skew", "GC skew, terminus refined by coverage"):
             pytest.skip("breakpoints did not come from the GC skew here")
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
             otr = json.load(fh)
         with open(_produced(seq["out"], seq["seq_id"], "GC_skew", "_gc_skew_results.json")) as fh:
             skew = json.load(fh)
+        # The origin is the skew's in both arms; only refinement may move the
+        # terminus, and never past OTR_TER_SHIFT_MAX of the sequence.
         assert otr["Origin window"] == skew["Origin (bp)"]
-        assert otr["Terminus window"] == skew["Terminus (bp)"]
+        if source == "GC skew":
+            assert otr["Terminus window"] == skew["Terminus (bp)"]
+        else:
+            from CNery.core import OTR_TER_SHIFT_MAX
+            length = seq["seq"].length
+            d = (otr["Terminus window"] - skew["Terminus (bp)"]) % length
+            assert min(d, length - d) <= OTR_TER_SHIFT_MAX * length + 2 * STEP
 
     def test_no_tent_is_applied_when_no_bias_is_found(self, seq):
         """No ramp detected must mean no TENT divided out.

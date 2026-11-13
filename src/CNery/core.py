@@ -11,7 +11,7 @@ from scipy import ndimage
 import matplotlib as mplt
 import matplotlib.patches as mpatches
 from scipy.stats import geom, nbinom
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -2225,6 +2225,38 @@ OTR_SKEW_MAX_P = None
 #: 0.01..0.10, so this number currently decides nothing.
 OTR_LR_ALPHA = 0.05
 
+#: When the GC skew supplies credible coordinates, the coverage may REFINE them
+#: but not replace them: the origin stays on the skew's oriC and only the
+#: terminus may move, by at most this fraction of the sequence either way.
+#:
+#: Why the origin is held. oriC is a sequence feature and does not move; the
+#: tent's peak is also the least identifiable part of a coverage fit, because
+#: the ramp is flattest in absolute terms where it is highest. Why the terminus
+#: may move: forks meet where they meet -- replichore imbalance after a large
+#: deletion shifts it by half the deletion, and a terminus REGION is better
+#: matched by a shifted kink (see ltee_ara_p1_50k_shift).
+#:
+#: Why it is bounded at all. The old arbitration offered the free two-breakpoint
+#: tent as the only alternative, and a likelihood ratio that rejects the skew
+#: tent says the skew tent does not explain everything -- NOT that the free
+#: tent's locations are right. On noisy real coverage the free tent then chases
+#: whatever genome-scale structure is left anywhere in the 35-65% band. Measured
+#: on four ADP1 samples whose skew is correct (oriC ~3,592,701; minimum of the
+#: 100-kb coverage profile at ~1.8 Mb in every one): the free fit won three of
+#: four arbitrations and put the origin 250-517 kb off, and on IG0647 the
+#: terminus at 798,001 -- 1.04 Mb, 29% of the genome, from the skew's 1,838,501.
+OTR_TER_SHIFT_MAX = 0.10
+
+#: Terminus positions scanned across +/- OTR_TER_SHIFT_MAX. Odd, so the skew's
+#: own terminus is a grid row and the refined model nests the skew model exactly.
+OTR_TER_SHIFT_STEPS = 41
+
+#: "Correction type" for a tent whose origin is the skew's and whose terminus the
+#: coverage refined. The skew-only and free-fit strings are unchanged.
+GC_SKEW_TER_REFINED_METHOD = (
+    "Origin from cumulative GC skew (Grigoriev 1998); terminus refined by coverage"
+)
+
 #: Surrogates for the residual-structure diagnostic. Deliberately NOT
 #: DEFAULT_OTR_SURROGATES: that number sizes a p-value whose floor of 1/(B+1) is
 #: load-bearing, while this one sizes a z-score whose only requirement is that
@@ -2336,6 +2368,37 @@ def _otr_phase_grid(m, weights, sep_lo=OTR_SEP_LO, sep_hi=OTR_SEP_HI,
             xt = (xo + frac * m) % m
             rows.append(_otr_phase(m, xo, xt))
             bps.append((float(xo), float(xt)))
+    return _otr_normalize_phases(rows, weights), bps
+
+
+def _otr_terminus_grid(m, weights, x_ori, x_ter, shift_max=OTR_TER_SHIFT_MAX,
+                       n_steps=OTR_TER_SHIFT_STEPS, sep_lo=OTR_SEP_LO,
+                       sep_hi=OTR_SEP_HI):
+    """(R, m) normalised phase rows with the origin FIXED and the terminus moving.
+
+    The alternative to the GC-skew tent when the skew is credible: terminus
+    positions x_ter + d for d in [-shift_max, +shift_max] * m, origin pinned at
+    x_ori, kept only where the signed separation stays inside the same 35-65%
+    band every other OTR search uses. d = 0 is always a row (n_steps is odd), so
+    this model nests the skew model and its likelihood ratio is >= 0 without the
+    clamp _otr_lr_statistic() needs for the full grid.
+
+    Returns (phases, breakpoints) like _otr_phase_grid(), breakpoints in cells.
+    """
+    m = int(m)
+    n_steps = int(n_steps) | 1          # odd, so d = 0 is on the grid
+    half = n_steps // 2
+    rows, bps = [], []
+    for i in range(n_steps):
+        # Integer-indexed so the centre row is EXACTLY the skew's terminus, not
+        # a linspace value that rounds to 1e-17 beside it.
+        d = 0.0 if i == half else (i - half) / max(half, 1) * float(shift_max)
+        xt = (float(x_ter) + d * m) % m
+        sep = ((xt - float(x_ori)) % m) / m
+        if i != half and not (sep_lo <= sep <= sep_hi):
+            continue
+        rows.append(_otr_phase(m, x_ori, xt))
+        bps.append((float(x_ori), float(xt)))
     return _otr_normalize_phases(rows, weights), bps
 
 
@@ -2791,7 +2854,8 @@ def _otr_lr_bootstrap_p(series, skew_phase, phases, weights, observed, block,
 # realistically noisy Poisson-sampled coverage.
 def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
                 lam=None, p_lr=None, surrogates=0, skew_result=None,
-                source="not corrected", structure=None, decorr_bp=None):
+                source="not corrected", structure=None, decorr_bp=None,
+                ter_shift=None):
     """The evidence behind the OTR verdict, ready for the results JSON.
 
     Written whatever the verdict, so a REJECTED fit stays diagnosable from the
@@ -2836,11 +2900,25 @@ def _otr_detail(s_free=None, p_free=None, s_skew=None, p_skew=None,
         "Residual decorrelation length (bp)": (
             None if decorr_bp is None else int(decorr_bp)
         ),
+        # Signed fraction of the sequence the coverage moved the skew's
+        # terminus; null unless the terminus-refinement arm won. Additive.
+        "Terminus shift from GC skew (fraction)": _r(ter_shift, 4),
     }
 
 
-def _otr_skew_candidate(skew_result, df, series, phases, weights, m):
+def _otr_skew_candidate(skew_result, df, series, phases, weights, m, keep=None):
     """The GC-skew coordinates as an OTR candidate, or None.
+
+    `keep` is the window mask the anchor values are solved on. otr_fit() passes
+    its own `fit_mask`, so the orientation check and the anchors that get
+    APPLIED see exactly the windows every other fit stage sees -- the pass-1 CN
+    censor included. It used to rebuild a mask from `is_deletion | is_redundant`
+    alone, which silently dropped `is_cn_variant`: on ADP1 IG0622 the 25-29x
+    Himar1 element at 2.152 Mb stayed in the OLS in BOTH passes and pulled the
+    anchors to y_ori 1.0243 against y_ter 1.0274, an "orientation
+    contradiction" manufactured by an amplification the pass-1 HMM had already
+    found. With the censor honoured the same pass reads 1.0408 against 0.9758.
+    None keeps the old two-column mask, for direct callers.
 
     Four ways to get None, and they say different things:
 
@@ -2890,10 +2968,13 @@ def _otr_skew_candidate(skew_result, df, series, phases, weights, m):
     # the decimated ones -- these are what get reported and applied.
     x = df.index.to_numpy().astype(float)
     y = df["gc_corr_norm_cov"].to_numpy(dtype=float)
-    keep = np.ones(n, dtype=bool)
-    for column in ("is_deletion", "is_redundant"):
-        if column in df.columns:
-            keep &= ~df[column].to_numpy(dtype=bool)
+    if keep is None:
+        keep = np.ones(n, dtype=bool)
+        for column in ("is_deletion", "is_redundant"):
+            if column in df.columns:
+                keep &= ~df[column].to_numpy(dtype=bool)
+    else:
+        keep = np.asarray(keep, dtype=bool).copy()
     if keep.sum() < 4:
         keep = np.ones(n, dtype=bool)
     _, y_ori, y_ter = _otr_concentrated_rss(
@@ -3109,7 +3190,8 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
 
     free_live = bool(p_free <= max_p)
 
-    skew = _otr_skew_candidate(skew_result, df, series, phases, cell_w, m)
+    skew = _otr_skew_candidate(skew_result, df, series, phases, cell_w, m,
+                               keep=fit_mask)
     p_skew, s_skew = None, None
     if skew is not None:
         s_skew = skew["r2"]
@@ -3122,14 +3204,27 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
 
     # The likelihood ratio only arbitrates between two candidates that have each
     # already earned their place -- it is not a substitute for the gates above.
+    #
+    # When the skew is credible the alternative it is tested against is NOT the
+    # free two-breakpoint tent any more, but the skew's own origin with the
+    # terminus free to move by up to OTR_TER_SHIFT_MAX (see there for the ADP1
+    # measurements behind this). Rejecting the skew tent only licenses the
+    # refinement it was tested against; the free tent is reached solely when
+    # there is no credible skew to refine.
     lam, p_lr = None, None
+    refine_ter, ter_phases, ter_shift = False, None, None
     if free_live and skew is not None:
-        lam, s_skew, s_free_cmp = _otr_lr_statistic(series, skew["phase"], phases, cell_w)
+        o_cell = skew["o_win"] * m / n
+        t_cell = skew["t_win"] * m / n
+        ter_phases, ter_bps = _otr_terminus_grid(m, cell_w, o_cell, t_cell)
+        lam, s_skew, _ = _otr_lr_statistic(series, skew["phase"], ter_phases, cell_w)
         block_lr = _otr_block_length(m, _otr_autocorr_length(skew["residual"]), block)
         p_lr, _ = _otr_lr_bootstrap_p(
-            series, skew["phase"][0], phases, cell_w, lam, block_lr, n_surrogates, seed
+            series, skew["phase"][0], ter_phases, cell_w, lam, block_lr,
+            n_surrogates, seed
         )
-        use_free = p_lr <= lr_alpha
+        refine_ter = p_lr <= lr_alpha
+        use_free = False
     elif free_live:
         use_free = True
     elif skew is not None:
@@ -3152,6 +3247,17 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         o_idx, t_idx = skew["o_win"], skew["t_win"]
         # No separation re-check: predict_ori_ter_from_skew() gates on the same
         # OTR_SEP_LO..OTR_SEP_HI band, so this candidate is in-band by construction.
+        if refine_ter:
+            refined = _otr_refine_terminus(
+                ter_phases, ter_bps, series, cell_w, m, n,
+                x_ori_opt, x_ter_opt, x_fit, y_fit_data,
+            )
+            if refined is not None:
+                x_ter_opt, y_ori_opt, y_ter_opt = refined
+                t_idx = int(round(x_ter_opt)) % n
+                source = "GC skew, terminus refined by coverage"
+                # Signed, in windows, wrapped to the shorter way round.
+                ter_shift = ((x_ter_opt - skew["t_win"] + n / 2) % n) - n / 2
 
     print(f"OTR bias detected, breakpoints from the {source}"
           + (f" (likelihood ratio p={p_lr:.4f})" if p_lr is not None else ""))
@@ -3169,7 +3275,14 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         struct_phase = _otr_normalize_phases(
             _otr_phase(m, x_ori_opt * m / genome_len, x_ter_opt * m / genome_len),
             cell_w)
-        struct_rows = phases if use_free else struct_phase
+        # The null re-selects over whatever set the applied breakpoints were
+        # selected from: the band grid, the terminus grid, or nothing.
+        if use_free:
+            struct_rows = phases
+        elif ter_shift is not None:
+            struct_rows = ter_phases
+        else:
+            struct_rows = struct_phase
         _, struct_resid, _ = _otr_tent_fit(series, struct_phase[0], cell_w)
         struct_tau = _otr_autocorr_length(struct_resid)
         structure, _ = _otr_residual_structure(
@@ -3194,7 +3307,58 @@ def otr_fit(df, n_seeds=8, skew_result=None, max_p=OTR_MAX_P,
         lam=lam, p_lr=p_lr, surrogates=surrogates,
         skew_result=skew_result, source=source,
         structure=structure, decorr_bp=decorr_bp,
+        ter_shift=None if ter_shift is None else ter_shift / genome_len,
     )
+
+
+def _otr_refine_terminus(ter_phases, ter_bps, series, weights, m, n,
+                         x_ori, x_ter_skew, x_fit, y_fit, shift_max=OTR_TER_SHIFT_MAX):
+    """Best terminus with the origin held at `x_ori`, or None.
+
+    The terminus grid's best row seeds a bounded one-dimensional search of the
+    FULL-resolution objective -- the same _otr_concentrated_rss() every other
+    tent is fitted on -- within one grid step of that row and never past
+    +/- shift_max of the skew's terminus. Returns (x_ter, y_ori, y_ter) in
+    windows, or None if the refined anchors come out inverted, in which case
+    the caller keeps the skew's own terminus rather than applying a tent whose
+    peak is the terminus.
+    """
+    proj = (ter_phases * weights) @ (series - float(weights @ series) / weights.sum())
+    _, t_cell = ter_bps[int(np.argmax(proj * proj))]
+    scale = n / m
+    seed_ter = t_cell * scale
+    step = 2.0 * shift_max * n / max(OTR_TER_SHIFT_STEPS - 1, 1)
+
+    # Work in "offset from the skew terminus" so the bound is a plain interval
+    # however the coordinates wrap.
+    seed_d = ((seed_ter - x_ter_skew + n / 2) % n) - n / 2
+    lo = max(seed_d - step, -shift_max * n)
+    hi = min(seed_d + step, shift_max * n)
+
+    def rss(d):
+        return _otr_concentrated_rss((x_ori, x_ter_skew + d), x_fit, y_fit, float(n))[0]
+
+    res = minimize_scalar(rss, bounds=(lo, hi), method="bounded",
+                          options={"xatol": 0.5})
+    d = float(res.x) if np.isfinite(res.fun) and res.fun <= rss(seed_d) else seed_d
+
+    # An optimum ON the bound is not a terminus estimate. It is the same signal
+    # as a free fit pinned at OTR_SEP_LO: there is no interior minimum, so the
+    # extra parameter is absorbing a monotone trend rather than locating where
+    # the forks meet. Measured on ADP1 IG0647 (correct skew, terminus 1,838,501):
+    # the refinement ran straight to -10% (1,479,201) with a residual structure
+    # score of 4.25, chasing a dip at 0.4-0.5 Mb that is not replication. Keep
+    # the skew's terminus rather than apply a coordinate the bound chose.
+    if abs(d) >= shift_max * n - 0.5 * step:
+        print(f"OTR: terminus refinement declined -- its optimum sits on the "
+              f"+/-{shift_max:.0%} bound, so the GC-skew terminus is kept")
+        return None
+
+    x_ter = (x_ter_skew + d) % n
+    _, y_ori, y_ter = _otr_concentrated_rss((x_ori, x_ter), x_fit, y_fit, float(n))
+    if not (np.isfinite(y_ori) and np.isfinite(y_ter)) or y_ter <= 0 or y_ori < y_ter:
+        return None
+    return float(x_ter), float(y_ori), float(y_ter)
 
 
 def find_nearest(array, value):
@@ -3523,6 +3687,8 @@ def apply_otr_correction(otr_fit_result, output, deletion_col="is_deletion",
     correction_type = "Ori-ter coordinates fit by coverage"
     if bias and detail.get("Breakpoint source") == "GC skew":
         correction_type = GC_SKEW_METHOD
+    elif bias and detail.get("Breakpoint source") == "GC skew, terminus refined by coverage":
+        correction_type = GC_SKEW_TER_REFINED_METHOD
     # An all-zero sequence declines every fit and reaches here on the ordinary
     # path, where the default string would claim coordinates were fitted by
     # coverage there was none of. Say what actually happened.
@@ -5966,12 +6132,96 @@ def group_read_count_scale(frames):
     return 0.0 if not np.isfinite(med) else float(med)
 
 
+def emission_autocorrelation_inflation(members, mu):
+    """How much the HMM's independent-window likelihood overstates the evidence.
+
+    `members` is a list of (counts, offsets, keep) arrays over ALL windows of a
+    sequence in genome order. Returns (vif, block, tau) where `vif` >= 1.
+
+    The emissions treat each window as an independent draw given its state. Real
+    window depths are not: a 150-bp read spans two 100-bp windows, the two mates
+    of a fragment land a few windows apart, and library-preparation bias acts at
+    the fragment scale. Measured on four ADP1 samples after the GC and OTR
+    corrections, on CN = 1 windows: lag-1 ACF 0.55-0.63, a second bump at lags
+    3-5 (0.28-0.40), and the variance of a 10-window mean 3.4-4.7x what
+    independence predicts. A 1 kb excursion therefore enters Viterbi as 3-5x the
+    evidence it carries, and that is exactly the size of the 1.6-2.3x, 0.4-1.5 kb
+    CN = 2 calls those samples produced with no junction, no read-pair or
+    duplicate anomaly, and no step edge in the profile.
+
+    `step/window` (overlap_weighting) only ever corrected the share of this that
+    overlapping windows create by construction, and at -w 100 -s 100 it is 1.
+
+    Measured, never chosen, and on the same terms the OTR bootstrap already
+    uses: tau is the first lag at which the residual ACF falls below 1/e
+    (_otr_autocorr_length), and the inflation is the batch-means variance ratio
+    over blocks of OTR_BLOCK_AUTOCORR_MULTIPLE * tau windows -- the block length
+    that file measured as the one at which a block bootstrap holds its nominal
+    size. The residual is the Pearson-style ratio counts / (mu * offset) - 1 on
+    windows that are kept AND inside _censor_bounds()'s [0.5, 1.5] x mode band,
+    so a deletion or an amplification -- which is copy number, not noise --
+    cannot inflate its own discount.
+    """
+    resid_all, keep_all = [], []
+    for counts, offsets, keep in members:
+        counts = np.asarray(counts, dtype=float)
+        offsets = np.asarray(offsets, dtype=float)
+        keep = np.asarray(keep, dtype=bool).copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scaled = counts / offsets
+        keep &= np.isfinite(scaled) & (offsets > 0)
+        lo, hi = _censor_bounds(np.round(scaled[keep]).astype(int)) if keep.any() else (None, None)
+        if lo is not None:
+            keep &= (scaled >= lo) & (scaled <= hi)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = scaled / float(mu) - 1.0
+        resid_all.append(np.where(keep, r, 0.0))
+        keep_all.append(keep)
+
+    if not resid_all or mu <= 0:
+        return 1.0, 1, 1
+    good = np.concatenate(keep_all)
+    if good.sum() < 100:
+        return 1.0, 1, 1
+    pooled = np.concatenate(resid_all)
+    var1 = float(np.var(pooled[good]))
+    if not np.isfinite(var1) or var1 <= 0:
+        return 1.0, 1, 1
+
+    # tau on the longest member, which dominates the pool; centred on the kept
+    # windows so censored zeros carry no signal of their own.
+    longest = int(np.argmax([r.size for r in resid_all]))
+    r0 = resid_all[longest]
+    k0 = keep_all[longest]
+    centred = np.where(k0, r0 - r0[k0].mean(), 0.0)
+    tau = int(_otr_autocorr_length(centred))
+    block = max(2, OTR_BLOCK_AUTOCORR_MULTIPLE * tau)
+
+    means = []
+    for r, k in zip(resid_all, keep_all):
+        nb = r.size // block
+        if nb < 1:
+            continue
+        R = r[:nb * block].reshape(nb, block)
+        K = k[:nb * block].reshape(nb, block)
+        full = K.all(axis=1)
+        means.append(R[full].mean(axis=1))
+    means = np.concatenate(means) if means else np.zeros(0)
+    if means.size < 30:
+        return 1.0, block, tau
+    vif = float(np.var(means) / (var1 / block))
+    if not np.isfinite(vif):
+        return 1.0, block, tau
+    return max(1.0, vif), block, tau
+
+
 def run_HMM_group(frames, output,
                   deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRACTION,
                   changeprob=None,
                   max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100,
                   bias="all",
                   change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
+                  autocorr_weighting=True,
                   interior_change_rate=DEFAULT_INTERIOR_CHANGE_RATE,
                   fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY,
                   polymorphism=False, cn_resolution=DEFAULT_CN_RESOLUTION, refine=True,
@@ -6136,6 +6386,29 @@ def run_HMM_group(frames, output,
     # exactly what censoring them was meant to prevent.
     emission_weight = min(1.0, step_bp / window_bp) if overlap_weighting else 1.0
 
+    # Window-to-window autocorrelation discounts the evidence further. Measured
+    # on the windows the emission fit sees, minus anything the previous pass
+    # called off single copy; see emission_autocorrelation_inflation(). Taken as
+    # a MIN with the overlap factor, never a product: overlap-induced
+    # correlation is part of what the ACF measures, so multiplying would charge
+    # for it twice.
+    autocorr_vif = 1.0
+    if autocorr_weighting:
+        ac_series = []
+        for gid in live:
+            prep = preps[gid]
+            keep = prep["not_redundant"].copy()
+            if "is_cn_variant" in prep["new_exp"].columns:
+                keep &= ~prep["new_exp"]["is_cn_variant"].to_numpy(dtype=bool)
+            ac_series.append((prep["counts_all"], prep["offsets_all"], keep))
+        autocorr_vif, ac_block, ac_tau = emission_autocorrelation_inflation(
+            ac_series, mu)
+        emission_weight = min(emission_weight, 1.0 / autocorr_vif)
+        if write:
+            print(f"{group_label}: window autocorrelation inflates per-window "
+                  f"evidence {autocorr_vif:.2f}x (tau {ac_tau}, block {ac_block} "
+                  f"windows); emissions weighted {emission_weight:.3f}.")
+
     for gid in live:
         preps[gid]["window_tau"] = offset_tau(
             preps[gid]["new_exp"], bias=bias)[preps[gid]["called"]]
@@ -6284,7 +6557,7 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
             changeprob=None,
             max_copy_number=DEFAULT_MAX_COPY_NUMBER, min_called_windows=100, bias="all",
             change_rate=DEFAULT_CHANGE_RATE, overlap_weighting=True, write=True,
-            genome_id=None,
+            autocorr_weighting=True, genome_id=None,
             interior_change_rate=DEFAULT_INTERIOR_CHANGE_RATE,
             fold_change_penalty=DEFAULT_FOLD_CHANGE_PENALTY,
             polymorphism=False, cn_resolution=DEFAULT_CN_RESOLUTION, refine=True):
@@ -6360,6 +6633,7 @@ def run_HMM(df, output, deletion_coverage_fraction=DEFAULT_DELETION_COVERAGE_FRA
         bias=bias,
         change_rate=change_rate,
         overlap_weighting=overlap_weighting,
+        autocorr_weighting=autocorr_weighting,
         write=write,
         interior_change_rate=interior_change_rate,
         fold_change_penalty=fold_change_penalty,
