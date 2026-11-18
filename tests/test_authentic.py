@@ -52,18 +52,38 @@ import pandas as pd
 import pytest
 
 from CNery.core import (
+    GC_SKEW_METHOD,
+    GC_SKEW_TER_REFINED_METHOD,
     STRAND_SPLIT_COLUMNS,
     TOTAL_ONLY_COLUMNS,
     _detect_delimiter,
     _read_coverage_table,
+    _skew_block_length,
     apply_otr_correction,
     fit_otr_bias,
     genome_id_from_path,
+    plot_correction_stages,
+    plot_gc_skew,
+    predict_ori_ter_from_skew,
     preprocess,
     process_multi_genome,
+    read_coverage_table,
     relative_copy_numbers,
     resolve_coverage_inputs,
+    plot_gc_passes,
     run_HMM,
+    run_HMM_group,
+    cn_censor_keep_fraction,
+    declined_otr_results,
+    write_otr_results,
+    no_skew_prediction,
+    DEFAULT_FRAG_SIZE,
+    frag_candidates,
+    pass1_summary,
+    select_frag_size,
+    refit_gc_bias_pooled,
+    stage_pass1,
+    write_gc_skew_results,
 )
 from data._fetch import load_registry
 
@@ -90,6 +110,8 @@ class Sequence:
     expected_cn: int = 1         # modal copy number run_HMM actually calls
     otr_detected: bool = False   # does otr_fit find a replication gradient here?
     otr_tightens: bool = True    # ...and is the gradient strong enough to help?
+    otr_source: str = None       # "coverage fit" or "GC skew" -- WHICH estimate won
+    skew_confident: bool = True  # does the cumulative GC skew clear its own gate?
     has_deletions: bool = True  # any window at or below 10% of the median
     has_repeats: bool = True    # any window carrying redundant coverage
 
@@ -119,13 +141,44 @@ class Spec:
 REL606 = 4_629_812
 
 DATASETS = {
+    # The only sequence where the coverage fit BEATS the GC skew. Both arms are
+    # live and the likelihood ratio picks the coverage (p = 0.004): the two agree
+    # on the origin to ~1% of the genome but put the terminus 10.6% apart, and a
+    # tent hinged at the skew's terminus mis-slopes the whole curve -- 87% of the
+    # coverage fit's advantage comes from OUTSIDE the disputed stretch. Worth
+    # knowing that the skew is nonetheless the better landmark estimate here:
+    # mapped back through the 2,314,906 bp rotation its terminus lands at 1.526 Mb
+    # against REL606's dif at ~1.55 Mb, while the coverage fit's is ~490 kb off.
+    # The observed coverage trough is at neither, sitting between them -- a
+    # single-kink tent cannot represent a terminus REGION.
     "ltee_ara_p1_50k_shift": Spec(
-        (Sequence("REL606_2314906bp_shift", REL606, otr_detected=True),), 0, 4, 9),
+        # Now the skew's ORIGIN with the terminus refined by the coverage: the
+        # free fit is no longer offered as the alternative to a credible skew.
+        # The refined tent lands 12 kb from where the free fit put its terminus,
+        # with the origin snapped 22 kb onto the skew's, and its residual
+        # structure score falls from 2.5 to 1.44.
+        (Sequence("REL606_2314906bp_shift", REL606, otr_detected=True,
+                  otr_source="GC skew, terminus refined by coverage"),), 0, 4, 9),
+    # Confident skew, but the coverage says the skew's ORIGIN is the low point
+    # (anchor ratio 0.907), so the prediction is rejected rather than relabelled.
     "ltee_ara_m3_32k_2rg": Spec((Sequence("REL606", REL606),), 2, 10, 25),
-    "ltee_ara_m3_38k": Spec((Sequence("REL606", REL606),), 1, 7, 17),
+    # Stationary phase, so there is no replication gradient in the coverage and
+    # the free fit cannot clear its own gate. The skew arm used to fire with a
+    # ramp of 1.069 (fixed-breakpoint p 0.243) -- but that ramp was the citT
+    # amplification: its anchors were solved WITHOUT the pass-1 CN censor. With
+    # the 187 CN != 1 windows (2.3%) excluded, as every other fit excludes them,
+    # the same anchors read 0.979: the coverage contradicts the skew's
+    # orientation at noise level, so no tent is applied. That is the honest
+    # verdict for a sample with no gradient.
+    "ltee_ara_m3_38k": Spec(
+        (Sequence("REL606", REL606),), 1, 7, 17),
+    # The strong case, and the one that validates the whole arbitration. Both arms
+    # fire and agree to 1.8% of the genome, so the likelihood ratio cannot separate
+    # them (p = 0.82) and defers to the skew -- whose origin lands on REL606's oriC
+    # at ~3.886 Mb, where the coverage fit was 82 kb short.
     "ltee_ara_p5_75k_exp": Spec(
-        (Sequence("REL606", REL606, otr_detected=True),), 0, 4, 4,
-        schema="total_only"),
+        (Sequence("REL606", REL606, otr_detected=True, otr_source="GC skew"),),
+        0, 4, 4, schema="total_only"),
     # The only multi-sequence dataset, and the only CSV one. The plasmids are the
     # reason it is here: process_multi_genome normalises every sequence against ONE
     # pooled median, so a multi-copy plasmid lands at a multiple of the chromosome
@@ -138,16 +191,37 @@ DATASETS = {
     # so n_states comes out 39. Of the 79 chromosome windows above 10x, 76 ARE
     # redundant and correctly censored -- these three are not.
     "cwbi_ssym_ht04": Spec(
-        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_tightens=False),
-         # The chromosome's fitted ratio is a marginal 1.217, and the correction is a
-         # wash: windows within 20% of single-copy go 91.8% -> 91.5%, IQR 0.130 -> 0.136.
-         # Contrast p5_75k_exp at ratio 2.05 (53% -> 95%). Recorded rather than asserted
-         # away -- a weak gradient that neither helps nor harms is the honest reading.
-         Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False),
-         Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False)),
+        (Sequence("chromosome", 3_354_690, otr_detected=True, otr_tightens=False,
+                  otr_source="GC skew"),
+         # The chromosome's COVERAGE fit fails its own gate in pass 1 (p = 0.41)
+         # and the GC-skew arm supplies the breakpoints, at ratio 1.169. Under the
+         # CN censor the coverage evidence sharpens a long way -- r-squared
+         # 0.0047 -> 0.079, p 0.41 -> 0.028 -- but the AMPLITUDE barely moves
+         # (1.1690 -> 1.1699), because the skew fixes the breakpoints and the OLS
+         # anchors were never what the CN-34 amplification at 59,501 was
+         # distorting. So the correction is still a wash on this sequence, which
+         # is what otr_tightens=False records.
+         # Neither plasmid clears the GC-skew gate, which is the expected answer:
+         # a plasmid has no bidirectional replication origin, so there is no sign
+         # change for the cumulative curve to turn on. Both are rejected by the
+         # bootstrap (p = 0.36 and 0.44) rather than by their size -- plasmid_1
+         # even lands inside the 35-65% separation band at 0.444, so separation
+         # alone would pass it, and both get an adequate 21 and 16 blocks, so the
+         # rejection is on evidence rather than on having too little data.
+         Sequence("plasmid_1", 116_754, relative_cn=2.9531, has_deletions=False,
+                  skew_confident=False),
+         Sequence("plasmid_2", 82_656, relative_cn=1.8980, has_deletions=False,
+                  skew_confident=False)),
         0, 4, 4, schema="total_only", ending="coverage.csv"),
+    # Like m3_38k, corrected on the skew's coordinates rather than the coverage's
+    # -- the free fit's optimum is a degenerate spike 1.1% of the genome wide,
+    # nowhere near the 35-65% band. LB culture, so some fork activity is at least
+    # plausible, and the correction does tighten (94.1% -> 95.0%); but the
+    # coverage's own evidence at those breakpoints is p = 0.615, so read the ramp
+    # (1.067) as sequence-justified rather than coverage-justified.
     "adp1_mgd06_lb": Spec(
-        (Sequence("ADP1-ISx", 3_592_307),), 0, 4, 4, schema="total_only"),
+        (Sequence("ADP1-ISx", 3_592_307, otr_detected=True, otr_source="GC skew"),),
+        0, 4, 4, schema="total_only"),
 }
 
 ALL = list(DATASETS)
@@ -211,33 +285,162 @@ def raw_tables(dataset_dir):
 _PIPELINES = {}
 
 
-def _run_pipeline(name, path, out):
-    """process_multi_genome once, then OTR + HMM per sequence, mirroring get_CNV.main()."""
-    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr"):
+def _run_pipeline(name, path, out, win=WIN, step=STEP, frag=FRAG, groups=None):
+    """The full two-pass pipeline for one dataset, mirroring get_CNV.main().
+
+    Mirroring it is load-bearing and has bitten this file twice: once when the GC
+    skew was computed AFTER the OTR fit (silently running the coverage-only arm),
+    once when the pooled second GC pass was left out. The structure below is
+    main()'s at --bias all: correct, call copy number, censor everything not
+    called CN = 1, then run both fits again.
+
+    `groups` is {seq_id: group_id}, as --group-table produces. Its members share
+    one HMM baseline, decline the OTR fit and do not have their GC skew measured
+    -- so the loops below are GROUP-MAJOR, exactly as main() now is. With every
+    sequence its own group, which is what `groups=None` means, this is the
+    per-sequence pipeline it has always been.
+    """
+    for sub in ("CNV_plt", "CNV_csv", "GC_bias", "OTR_corr", "GC_skew"):
         (out / sub).mkdir()
 
-    per_genome = process_multi_genome(
+    per_genome, gc_flags = process_multi_genome(
         resolve_coverage_inputs([str(path)]),
         output_prefix=str(out),
-        win=WIN, step=STEP, frag=FRAG,
+        win=win, step=step, frag=frag,
+        # The fragment scan needs the reference to rescore candidates. Kept here
+        # so the scan can be exercised without paying for a second pipeline run.
+        collect_gc_flags=True,
     )
 
-    # Mirrors get_CNV.main(): one number per sequence, computed across ALL of them
+    if groups is None:
+        groups = {seq_id: seq_id for seq_id in per_genome}
+    members = {}
+    for seq_id in per_genome:
+        members.setdefault(groups[seq_id], []).append(seq_id)
+
+    def grouped(seq_id):
+        return len(members[groups[seq_id]]) > 1
+
+    # Mirrors get_CNV.main(): one number per GROUP, computed across all of them
     # because apply_otr_correction() runs per sequence and cannot see the others.
-    relative_cn = relative_copy_numbers(per_genome)
+    relative_cn = relative_copy_numbers(per_genome, groups)
 
-    frames = {}
-    for seq_id, df_gc in per_genome.items():
-        # df_gc already carries is_deletion/is_redundant from the
-        # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
-        # so fit_otr_bias() reuses them.
-        df_otr, ori, ter = apply_otr_correction(
-            fit_otr_bias(df_gc, str(out)), str(out),
-            relative_copy_number=relative_cn[seq_id],
-        )
-        frames[seq_id] = {"gc": df_gc, "otr": df_otr, "cnv": run_HMM(df_otr, str(out))}
+    # ---- Pass 1: correct, then call copy number without writing anything -----
+    frames, staged = {}, {}
+    for group_id, member_ids in members.items():
+        prepared = {}
+        for seq_id in member_ids:
+            df_gc = per_genome[seq_id]
+            # df_gc already carries is_deletion/is_redundant from the
+            # mask_coverage_windows() call inside process_multi_genome()'s GC stage,
+            # so fit_otr_bias() reuses them.
+            # Ahead of the OTR fit, exactly as get_CNV.main() places it. This
+            # ORDERING IS LOAD-BEARING: it reads only ref_base, so it is available
+            # whatever the coverage does, and fit_otr_bias() takes it as the second
+            # breakpoint candidate.
+            # A contig of a draft assembly has no coordinate for an origin to sit
+            # on, so main() skips the measurement and writes the declined record.
+            if grouped(seq_id):
+                skew = no_skew_prediction(
+                    reason=f"member of reference group {group_id!r}")
+                write_gc_skew_results(skew, str(out), seq_id)
+                df_otr = df_gc.copy()
+                df_otr["otr_gc_corr_norm_cov"] = df_otr["gc_corr_norm_cov"]
+                write_otr_results(
+                    declined_otr_results(
+                        df_otr,
+                        correction_type=(f"No OTR correction (reference group "
+                                         f"{group_id!r})"),
+                        relative_copy_number=relative_cn[seq_id],
+                        reference_group=group_id,
+                    ),
+                    str(out), seq_id,
+                )
+                res1 = None
+            else:
+                skew = predict_ori_ter_from_skew(df_gc, win=win, step=step)
+                write_gc_skew_results(skew, str(out), seq_id)
+                plot_gc_skew(df_gc, str(out), skew)
 
-    return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames}
+                res1 = fit_otr_bias(df_gc, str(out), skew_result=skew)
+                df_otr, _ori, _ter = apply_otr_correction(
+                    res1, str(out), relative_copy_number=relative_cn[seq_id],
+                )
+            prepared[seq_id] = (df_otr, skew, res1)
+
+        # Provisional calls: they exist only to build the CN censor for pass 2,
+        # and main() writes none of them. Decoded per GROUP, which is what makes
+        # its members share one baseline.
+        # BOTH run_HMM calls in this harness stay at their defaults, and that is
+        # load-bearing rather than incidental: the eight goldens below are what
+        # prove polymorphism mode left the consensus path alone, and they can
+        # only prove it while this harness asks for the consensus path. Do not
+        # thread -p (or any other HMM tuning flag) through here -- exercise it
+        # from the pass-2 frame instead, as TestPolymorphismOnRealCoverage does.
+        called = run_HMM_group({s_: prepared[s_][0] for s_ in prepared}, str(out),
+                               write=False, group_id=group_id)
+        keep_fraction = cn_censor_keep_fraction(called.values())
+        for seq_id in member_ids:
+            df_otr, skew, res1 = prepared[seq_id]
+            df_staged, cn_applied = stage_pass1(called[seq_id],
+                                                keep_fraction=keep_fraction)
+            staged[seq_id] = df_staged
+            frames[seq_id] = {"gc": per_genome[seq_id], "skew": skew, "res1": res1,
+                              "cn_applied": cn_applied, "staged": df_staged,
+                              "pass1_keys": (pass1_summary(res1, df_staged)
+                                             if res1 is not None else None)}
+
+    # ---- Pooled GC refit, between the passes ---------------------------------
+    # Pooled, so like main() it cannot run inside the loop above: it needs every
+    # sequence OTR-corrected AND called first.
+    corrected, _gc2 = refit_gc_bias_pooled(staged)
+    plot_gc_passes(corrected, str(out))
+    # gc_corr_norm_cov now means raw/G rather than raw/g1, and this reads it.
+    relative_cn = relative_copy_numbers(corrected, groups)
+
+    # ---- Pass 2: the same fits, on CN=1 windows ------------------------------
+    # Group-major, like pass 1 and like main(): the published calls come from one
+    # baseline per group, so every member is corrected before any is called.
+    for group_id, member_ids in members.items():
+        final = {}
+        for seq_id in member_ids:
+            f = frames[seq_id]
+            df_staged = corrected[seq_id]
+            if grouped(seq_id):
+                df_final = df_staged.copy()
+                df_final["otr_gc_corr_norm_cov"] = df_final["gc_corr_norm_cov"]
+                write_otr_results(
+                    declined_otr_results(
+                        df_final,
+                        correction_type=(f"No OTR correction (reference group "
+                                         f"{group_id!r})"),
+                        relative_copy_number=relative_cn[seq_id],
+                        reference_group=group_id,
+                    ),
+                    str(out), seq_id,
+                )
+                res = None
+            else:
+                # The median filter seeds the ori/ter guess, so it is recomputed
+                # from the coverage this pass fits rather than inherited from the
+                # last one.
+                df_fit = df_staged.drop(columns=["gc_cor_med_fil"], errors="ignore")
+                res = fit_otr_bias(df_fit, str(out), skew_result=f["skew"])
+                df_final, _ori, _ter = apply_otr_correction(
+                    res, str(out), relative_copy_number=relative_cn[seq_id],
+                    extra_results=f["pass1_keys"],
+                )
+            plot_correction_stages(df_final, str(out), res, bias="all")
+            f["res"] = res
+            f["otr"] = df_final
+            final[seq_id] = df_final
+
+        called = run_HMM_group(final, str(out), group_id=group_id)
+        for seq_id in member_ids:
+            frames[seq_id]["cnv"] = called[seq_id]
+
+    return {"name": name, "spec": DATASETS[name], "out": out, "frames": frames,
+            "gc_flags": gc_flags, "win": win}
 
 
 @pytest.fixture(scope="session")
@@ -247,6 +450,40 @@ def pipeline(dataset_dir, tmp_path_factory):
     if name not in _PIPELINES:
         _PIPELINES[name] = _run_pipeline(name, path, tmp_path_factory.mktemp(f"out_{name}"))
     return _PIPELINES[name]
+
+
+#: The CLI's own defaults, which are NOT the windowing the goldens use.
+#: One run uses them because the emission-variance correction only bites at this
+#: resolution: measured at -w 1000 -s 500 it moves nothing on any of the eight
+#: sequences, so a suite that only ever ran the golden windowing would let the
+#: whole mechanism be deleted without a single failure.
+CLI_WIN, CLI_STEP, CLI_FRAG = 100, 100, 400
+
+#: Two datasets, and the second is not optional. m3_32k is the positive case;
+#: adp1 is the NEGATIVE control -- the rejected GC-tail clamp fixed m3_32k while
+#: splitting a spurious CN-2 island out of adp1's amplification, so a suite
+#: without adp1 here would not catch a change that merely trades one artifact for
+#: another.
+CLI_DEFAULT_DATASETS = ("ltee_ara_m3_32k_2rg", "adp1_mgd06_lb")
+
+
+@pytest.fixture(scope="session")
+def cli_default_pipelines(tmp_path_factory):
+    """{dataset: pipeline} at the CLI's default -w/-s/-f.
+
+    Session-scoped: 46,298 and 35,923 windows against the goldens' 9,258 and
+    6,810, so these are the most expensive runs in the suite and must happen once.
+    """
+    from conftest import _dataset_or_skip
+
+    out = {}
+    for name in CLI_DEFAULT_DATASETS:
+        path = _dataset_or_skip(name)
+        out[name] = _run_pipeline(
+            name, path, tmp_path_factory.mktemp(f"cli_{name}"),
+            win=CLI_WIN, step=CLI_STEP, frag=CLI_FRAG,
+        )
+    return out
 
 
 @pytest.fixture
@@ -483,44 +720,180 @@ class TestPipelineShape:
 
 @per_sequence
 class TestOriginTerminus:
-    """Whether OTR correction fires, per sequence, and that it does real work when it does.
+    """Whether OTR correction fires, per sequence, WHICH estimate supplied the
+    breakpoints, and that it does real work when it does.
 
-    `otr_fit` gates on two things: origin and terminus 35-65% of the genome apart as a
-    circular distance, and a fitted anchor ratio above `bias_threshold`. Which sequences
-    clear that is a property of the sample, so `Sequence.otr_detected` records it rather
-    than the suite assuming one answer for all of them. It is per SEQUENCE, not per
-    dataset: a plasmid has no replication origin.
+    There are now two candidates and three gates between them.
 
-    ltee_ara_p5_75k_exp is the reason this is recorded rather than blanket-asserted: it is
-    an EXPONENTIAL-phase culture, so replication forks are active and the gradient is real
-    -- measured independently of the fit at 1.95x peak-to-trough, 47.4% apart. The
-    stationary-phase Ara-3 samples sit at 31.6% and 14.2% separation and cannot clear the
-    gate at all.
+    The COVERAGE fit must land 35-65% of the genome apart AND beat a circular
+    block bootstrap at p <= 0.01. That second condition is new and is the whole
+    point: the old `bias_threshold` was vacuous (the label swap in otr_fit()
+    guarantees y_ori >= y_ter, so "ratio > 1.0" reduced to "y_ter > 0"), so
+    nothing ever tested the tent against a null and a flat genome whose best-fit
+    tent happened to be antipodal had its coverage divided by noise. CWBI's
+    chromosome was exactly that case at a marginal 1.217.
 
-    These assertions fail if detection starts OR stops happening anywhere -- either is a
-    real change worth noticing.
+    The GC-SKEW fit is admitted whenever the skew's own bootstrap called the
+    prediction confident and the coverage does not contradict its ORIENTATION.
+    It needs no coverage significance of its own (OTR_SKEW_MAX_P is None), which
+    is a deliberate decision with a visible cost -- see ltee_ara_m3_38k and
+    adp1_mgd06_lb in DATASETS above.
+
+    When BOTH are live a bootstrap likelihood-ratio test decides, and only then:
+    the two models are nested, differing by exactly the two breakpoint
+    parameters. On this corpus that happens on two sequences and splits them,
+    which is why `otr_source` is recorded per sequence and not assumed.
+
+    Note what this costs the suite: TestGCSkewOriginTerminus is NO LONGER an
+    independent cross-check on these coordinates, because the skew now feeds the
+    OTR fit. What it still independently establishes is that the skew estimate is
+    a function of the reference sequence alone -- which is what makes it usable
+    on stationary-phase samples where the coverage carries no gradient, and also
+    what makes ramp injection there a real possibility rather than a hypothetical.
+
+    These assertions fail if detection starts OR stops happening anywhere, or if
+    the winning estimate changes -- all three are real changes worth noticing.
     """
 
     def test_detection_matches_the_spec(self, seq):
         # Read what the run PRODUCED, not the golden -- asserting that the golden says what
         # the golden says would be circular and would pass no matter what the code did.
         with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
-            ratio = json.load(fh)["Origin-to-Termius/Bias Ratio"]
+            ratio = json.load(fh)["Origin-to-Terminus/Bias Ratio"]
         if seq["seq"].otr_detected:
             assert ratio != "Not detected", "expected OTR correction to fire"
             assert float(ratio) > 1.0, f"origin should out-cover terminus, got {ratio}"
         else:
             assert ratio == "Not detected"
 
-    def test_coverage_passes_through_when_no_bias_is_found(self, seq):
-        # With no bias detected, otr_correction must leave the GC-corrected values alone.
+    def test_correction_source_matches_the_spec(self, seq):
+        """WHICH estimate supplied the breakpoints, not merely whether one did.
+
+        Recorded per sequence because the two arms answer for different reasons.
+        ltee_ara_p5_75k_exp is the case worth understanding: BOTH fire and agree
+        to 1.8% of the genome, so the likelihood ratio cannot separate them
+        (p = 0.82) and defers to the GC skew as the better-supported estimate of
+        the same thing -- REL606's oriC is at ~3.886 Mb, where the skew lands,
+        and the coverage fit was 82 kb short of it.
+
+        ltee_ara_p1_50k_shift is the other end: both fire and the skew tent
+        loses the likelihood ratio, so the coverage refines the skew's terminus
+        -- holding the skew's origin -- rather than replacing both breakpoints.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        expected = seq["seq"].otr_source or "not corrected"
+        assert data["Breakpoint source"] == expected
+        # "Correction type" is how a reader of the file alone tells them apart.
+        if expected == "GC skew":
+            assert data["Correction type"] == GC_SKEW_METHOD
+        elif expected == "GC skew, terminus refined by coverage":
+            assert data["Correction type"] == GC_SKEW_TER_REFINED_METHOD
+        else:
+            assert data["Correction type"] == "Ori-ter coordinates fit by coverage"
+
+    def test_reported_ratio_reproduces_from_its_own_two_values(self, seq):
+        """The file's arithmetic must check out for a reader who does it by hand.
+
+        This was `yori / (yter + 0.001)`, a divide-by-zero guard that left the
+        printed ratio ~0.1% below what the two coverage values printed directly
+        above it give. yter is a least-squares anchor on a curve clipped at
+        0.1x the median coverage, so it cannot be zero and the guard bought
+        nothing but a file that contradicted itself.
+        """
+        if not seq["seq"].otr_detected:
+            pytest.skip("no ratio reported on this sequence")
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        assert data["Origin-to-Terminus/Bias Ratio"] == pytest.approx(
+            data["Origin coverage (normalized)"] / data["Terminus coverage (normalized)"],
+            rel=1e-12,
+        )
+
+    def test_residual_structure_is_reported_for_an_applied_tent(self, seq):
+        """Reported only -- nothing gates on it, so this pins presence and shape.
+
+        The score answers a question r-squared cannot: not how much variance the
+        tent explained, but whether what it FAILED to explain is structured.
+        ltee_ara_p1_50k_shift used to read 2.62 alone under the free
+        two-breakpoint fit -- the tent-model limitation CLAUDE.md documents for a
+        terminus macrodomain. With the skew's origin held and only the terminus
+        refined it reads 1.44, and on four ADP1 samples the score flagged exactly
+        the fits that were wrong (3.0-4.6 on the free fits, 4.25 on a refinement
+        pinned at its bound) -- the evidence it measures misspecification.
+
+        Not compared against the golden as a float -- it rides on a bootstrap and
+        on scipy, and CLAUDE.md asks for structural assertions on drifty summary
+        statistics.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            data = json.load(fh)
+        score = data["Residual structure score"]
+        tau_bp = data["Residual decorrelation length (bp)"]
+        if not seq["seq"].otr_detected:
+            assert score is None and tau_bp is None
+            return
+        assert score is not None, "an applied tent must report its residual structure"
+        assert tau_bp > 0
+        # The floor the score is normalised against must be a real length, not
+        # the whole genome -- if it ever approaches the sequence length the
+        # bootstrap has nothing left to destroy.
+        assert tau_bp < 0.25 * seq["seq"].length
+
+    def test_no_applied_tent_reads_as_structured(self, seq):
+        """The corpus-wide verdict, as a per-sequence assertion.
+
+        Stated as a threshold rather than exact values because the score is a
+        bootstrap z. p1 used to be the one exception at 2.62 under the free
+        two-breakpoint fit; with the skew's origin held and only the terminus
+        refined it reads 1.44, below the "structured" line with everything else.
+        """
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            score = json.load(fh)["Residual structure score"]
+        if score is None:
+            pytest.skip("no tent applied on this sequence")
+        assert score < 2.0, f"unexpected residual structure: {score}"
+
+    def test_skew_sourced_coordinates_agree_with_the_skew_file(self, seq):
+        """The two JSONs now share a coordinate and must not be able to disagree."""
+        source = seq["seq"].otr_source
+        if source not in ("GC skew", "GC skew, terminus refined by coverage"):
+            pytest.skip("breakpoints did not come from the GC skew here")
+        with open(_produced(seq["out"], seq["seq_id"], "OTR_corr", "_otr_results.json")) as fh:
+            otr = json.load(fh)
+        with open(_produced(seq["out"], seq["seq_id"], "GC_skew", "_gc_skew_results.json")) as fh:
+            skew = json.load(fh)
+        # The origin is the skew's in both arms; only refinement may move the
+        # terminus, and never past OTR_TER_SHIFT_MAX of the sequence.
+        assert otr["Origin window"] == skew["Origin (bp)"]
+        if source == "GC skew":
+            assert otr["Terminus window"] == skew["Terminus (bp)"]
+        else:
+            from CNery.core import OTR_TER_SHIFT_MAX
+            length = seq["seq"].length
+            d = (otr["Terminus window"] - skew["Terminus (bp)"]) % length
+            assert min(d, length - d) <= OTR_TER_SHIFT_MAX * length + 2 * STEP
+
+    def test_no_tent_is_applied_when_no_bias_is_found(self, seq):
+        """No ramp detected must mean no TENT divided out.
+
+        Bit-identical, and the two-pass restructure is what made it so again. For
+        one release this had to divide the second GC pass back out first: that
+        pass updated `gc_corr_fact` to the composed G but left `gc_corr_norm_cov`
+        at raw/g1, so the column and its own factor disagreed and the invariant
+        could only be checked modulo g2.
+
+        Now refit_gc_bias_pooled() writes `gc_corr_norm_cov = raw/G` -- it has to,
+        since that column is what the second OTR fit is handed as input -- so the
+        GC correction is entirely accounted for before the OTR stage runs, and an
+        undetected ramp contributes exactly nothing.
+        """
         if seq["seq"].otr_detected:
             pytest.skip("OTR fires here; see test_correction_tightens_coverage")
         df = seq["otr"]
         np.testing.assert_allclose(
             df["otr_gc_corr_norm_cov"].to_numpy(),
-            df["gc_corr_norm_cov"].to_numpy(),
-            rtol=1e-9,
+            df["gc_corr_norm_cov"].to_numpy(), rtol=1e-9,
         )
 
     def test_correction_tightens_coverage(self, seq):
@@ -575,9 +948,22 @@ class TestOriginTerminus:
                 got = json.load(fh)
             with open(want_path) as fh:
                 want = json.load(fh)
-            assert got["Origin-to-Termius/Bias Ratio"] == want["Origin-to-Termius/Bias Ratio"]
+            # Detected-or-not is the structural claim and is compared exactly;
+            # the ratio itself is an optimizer output, so it gets a tolerance for
+            # the same reason "Relative copy number" does. Comparing it exactly
+            # made this golden fail on a 1e-6 change in the breakpoints, which is
+            # noise about the shape of the tent rather than a change in what
+            # CNery decided.
+            got_ratio, want_ratio = (got["Origin-to-Terminus/Bias Ratio"],
+                                     want["Origin-to-Terminus/Bias Ratio"])
+            assert isinstance(got_ratio, str) == isinstance(want_ratio, str)
+            if isinstance(want_ratio, str):
+                assert got_ratio == want_ratio
+            else:
+                assert got_ratio == pytest.approx(want_ratio, rel=1e-4)
             assert got["Origin window"] == want["Origin window"]
             assert got["Terminus window"] == want["Terminus window"]
+            assert got["Breakpoint source"] == want["Breakpoint source"]
             # A float, so compared with tolerance -- LOWESS and scipy.optimize drift
             # across library versions.
             assert got["Relative copy number"] == pytest.approx(
@@ -588,6 +974,147 @@ class TestOriginTerminus:
             _golden(seq["name"], seq["seq_id"], "_otr_results.json"),
             regenerate_goldens, compare,
         )
+
+
+# --------------------------------------------------------------------------- GC skew
+
+
+# Coordinate rotation baked into the p1_50k_shift reference, and named in its
+# sequence ID (REL606_2314906bp_shift): adding it to a coordinate in that
+# reference gives the same locus in the unrotated REL606 references.
+SHIFT_BP = 2_314_906
+SHIFTED = "ltee_ara_p1_50k_shift"
+
+#: Every dataset whose reference is REL606 in its published orientation. Three
+#: different clones across two growth phases, which is what makes
+#: test_same_reference_agrees_exactly a real test rather than a tautology.
+UNSHIFTED = ["ltee_ara_m3_38k", "ltee_ara_m3_32k_2rg", "ltee_ara_p5_75k_exp"]
+
+
+def _circular_delta(a, b, length=REL606):
+    d = abs(a - b) % length
+    return min(d, length - d)
+
+
+@pytest.fixture(scope="session")
+def skew_by_sequence():
+    """{(dataset, seq_id): prediction} for every sequence in every dataset.
+
+    Built from preprocess() alone rather than from the `pipeline` fixture: the
+    cross-dataset comparisons below are about the prediction being a function of
+    the reference and nothing else, so they should not run through the
+    bias-correction stages at all.
+    """
+    from conftest import _dataset_or_skip
+
+    out = {}
+    for name, spec in DATASETS.items():
+        path = _dataset_or_skip(name)
+        for seq_id, table in _tables(path, name).items():
+            df = preprocess(read_coverage_table(table),
+                            win=WIN, step=STEP, frag=FRAG)
+            out[(name, seq_id)] = predict_ori_ter_from_skew(df, win=WIN, step=STEP)
+    return out
+
+
+@per_sequence
+class TestGCSkewArtifacts:
+    def test_json_and_plot_are_written(self, seq):
+        for suffix in ("_gc_skew_results.json", "_GC_skew.pdf"):
+            assert os.path.exists(
+                _produced(seq["out"], seq["seq_id"], "GC_skew", suffix)
+            ), suffix
+
+    def test_confidence_matches_the_spec(self, seq):
+        # Recorded per sequence rather than blanket-asserted, for the same reason
+        # otr_detected is: a plasmid has no replication origin, so there is no
+        # sign change for the cumulative curve to turn on.
+        assert seq["skew"]["Prediction confident"] is seq["seq"].skew_confident
+
+    def test_confident_predictions_are_near_antipodal(self, seq):
+        if not seq["seq"].skew_confident:
+            pytest.skip("no confident skew prediction on this sequence")
+        assert 0.35 <= seq["skew"]["Separation (fraction of genome)"] <= 0.65
+
+    def test_p_value_agrees_with_the_verdict(self, seq):
+        # Every chromosome exhausts the bootstrap and reads back its floor of
+        # 1/(B+1); neither plasmid comes close (0.36 and 0.44). Asserted as a
+        # band rather than exactly, since p is a Monte Carlo estimate.
+        p = seq["skew"]["Replichore skew p-value"]
+        floor = 1 / (seq["skew"]["Bootstrap surrogates"] + 1)
+        if seq["seq"].skew_confident:
+            assert p == pytest.approx(floor, rel=0.01), "expected p at its floor"
+        else:
+            assert p > 0.1, "a sequence with no origin should be nowhere near significant"
+
+    def test_plasmids_are_rejected_on_evidence_not_on_size(self, seq):
+        # The bootstrap replaced a minimum-window gate, so it matters that the
+        # plasmids fail for the right reason. Both get an adequate number of
+        # blocks (21 and 16) and still land at p > 0.1 -- they are rejected
+        # because there is no replichore structure, not because they are short.
+        if seq["seq"].skew_confident:
+            pytest.skip("this sequence has a confident prediction")
+        n = seq["skew"]["Windows"]
+        assert n / _skew_block_length(n) >= 10, "too few blocks to conclude anything"
+
+    def test_skew_json_matches_golden(self, seq, regenerate_goldens):
+        from conftest import golden_compare
+
+        def compare(got_path, want_path):
+            with open(got_path) as fh:
+                got = json.load(fh)
+            with open(want_path) as fh:
+                want = json.load(fh)
+            # Integer coordinates and the verdict only. The floats (separation,
+            # amplitude, t) are left out deliberately -- they are summary
+            # statistics that drift with library versions, and the structural
+            # facts are what a reviewer needs to see change.
+            for key in ("Origin (bp)", "Terminus (bp)",
+                        "Origin window index", "Terminus window index",
+                        "Windows", "Bootstrap surrogates", "Prediction confident"):
+                assert got[key] == want[key], key
+
+        golden_compare(
+            _produced(seq["out"], seq["seq_id"], "GC_skew", "_gc_skew_results.json"),
+            _golden(seq["name"], seq["seq_id"], "_gc_skew_results.json"),
+            regenerate_goldens, compare,
+        )
+
+
+class TestGCSkewOriginTerminus:
+    """The prediction is a function of the reference sequence and nothing else.
+
+    That the SAMPLE cannot matter is true by construction -- the estimate reads
+    only `ref_base` -- and the synthetic tier pins it directly at two depths
+    (test_gc_skew.py::test_prediction_is_independent_of_coverage_depth). What is
+    worth checking on real tables is narrower: that the sequence CNery recovers
+    is the same one no matter how the table around it is SHAPED. The three
+    unrotated REL606 datasets differ in schema (strand-split vs --total-only),
+    in read-group column count (0, 1, 2) and in footer length (4, 7, 10), so a
+    parsing change that shifted ref_base by a row would split them.
+
+    The rotated dataset tests the other property: the same sequence cut at a
+    different coordinate must still predict the same locus, which is what
+    subtracting the mean before cumulating buys.
+    """
+
+    def test_same_reference_agrees_exactly(self, skew_by_sequence):
+        results = [skew_by_sequence[(n, "REL606")] for n in UNSHIFTED]
+        first = results[0]
+        for other, name in zip(results[1:], UNSHIFTED[1:]):
+            assert other["Origin (bp)"] == first["Origin (bp)"], name
+            assert other["Terminus (bp)"] == first["Terminus (bp)"], name
+
+    @pytest.mark.parametrize("key", ["Origin (bp)", "Terminus (bp)"])
+    def test_permuted_reference_predicts_the_same_locus(self, skew_by_sequence, key):
+        mapped = skew_by_sequence[(SHIFTED, "REL606_2314906bp_shift")][key] + SHIFT_BP
+        reference = skew_by_sequence[(UNSHIFTED[0], "REL606")][key]
+        delta = _circular_delta(mapped, reference)
+        assert delta <= WIN, (
+            f"{key}: rotated reference maps to {mapped % REL606}, "
+            f"unrotated says {reference} ({delta} bp apart)"
+        )
+
 
 
 # --------------------------------------------------------------------------- copy number
@@ -657,3 +1184,391 @@ class TestCopyNumber:
         if not seq["seq"].has_deletions:
             pytest.skip("no deletions on this sequence (neither CWBI plasmid has one)")
         assert 0 in set(seq["cnv"]["prob_copy_number"].unique()), "expected called deletions"
+
+
+class TestOffsetUncertaintyAtCliDefaults:
+    """The GC correction is an ESTIMATE, and the HMM is told how good a one.
+
+    run_HMM divides nothing: it compares raw counts against `k * mu * offset`,
+    where the offset is a LOWESS fit evaluated at the window's GC. Treating that
+    fit as exact understates the emission variance, and understates it MORE at
+    high copy number -- the offset's error is multiplied by k, so the variance it
+    contributes grows as k^2.
+
+    The consequence is concrete. A 1.1 kb stretch at the 99.5th GC percentile
+    inside ltee_ara_m3_32k_2rg's 26 kb CN-3 amplification has its offset divided
+    down to 0.82, which puts its corrected level at 4.2 and earns it its own CN-4
+    segment -- on a GC excursion rather than on copy number. `gc_corr_tau`
+    (_gc_curve_tau) measures how well the curve is determined at each GC by
+    resampling the fit, and that is enough to keep the block whole.
+
+    THESE ASSERTIONS NEED THEIR OWN RUN. At the goldens' -w 1000 -s 500 the same
+    correction moves zero windows on all eight sequences, which is why no golden
+    changed when it landed.
+    """
+
+    #: The amplification, in bp: ~263 windows uniformly around 3.3x the median.
+    AMP = ("ltee_ara_m3_32k_2rg", "REL606", 599_601, 625_901)
+    #: adp1's, which contains 4 windows below the 0.25th GC percentile.
+    CONTROL = ("adp1_mgd06_lb", "ADP1-ISx", 2_410_101, 2_481_401)
+
+    def _block(self, pipelines, case):
+        name, seq_id, lo, hi = case
+        df = pipelines[name]["frames"][seq_id]["cnv"]
+        inside = ((df["win_st"] >= lo) & (df["win_st"] < hi)).to_numpy()
+        return df, inside
+
+    def test_the_amplification_is_called_as_one_state(self, cli_default_pipelines):
+        """No sliver: the whole block comes back at a single copy number."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        assert inside.sum() > 200, "the amplification should span 200+ windows"
+        called = set(df.loc[inside, "prob_copy_number"].unique().tolist())
+        assert called == {3}, f"expected one CN-3 block, got states {called}"
+
+    def test_no_window_in_it_is_called_cn_4(self, cli_default_pipelines):
+        """The specific regression: 11 windows here come back CN 4 without the
+        correction."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        assert int((df.loc[inside, "prob_copy_number"] == 4).sum()) == 0
+
+    def test_the_gc_excursion_is_still_extreme(self, cli_default_pipelines):
+        """Guards the guard. If the GC inside the block ever stopped being
+        extreme, the two tests above would start passing for the wrong reason."""
+        df, inside = self._block(cli_default_pipelines, self.AMP)
+        gc = df["gc_percent"].to_numpy(dtype=float)
+        assert int((gc[inside] > np.percentile(gc, 99)).sum()) >= 5
+
+    def test_the_negative_control_is_not_split(self, cli_default_pipelines):
+        """adp1's amplification must stay whole.
+
+        It carries the opposite excursion -- 4 windows BELOW the 0.25th GC
+        percentile -- and the GC-tail clamp that fixed m3_32k split a CN-2 island
+        out of it here. Discounting evidence where the curve is uncertain is
+        sign-blind and must not do that.
+        """
+        df, inside = self._block(cli_default_pipelines, self.CONTROL)
+        assert inside.sum() > 600
+        called = set(df.loc[inside, "prob_copy_number"].unique().tolist())
+        assert called == {3}, f"expected one CN-3 block, got states {called}"
+
+    def test_tau_is_concentrated_at_the_gc_tails(self, cli_default_pipelines):
+        """The correction has to be CONCENTRATED where the curve is uncertain.
+
+        A uniformly larger tau is a different thing and is measurably worse:
+        scaling this one up 4x everywhere brings the sliver back at five times the
+        size, because it also inflates the interior where the fit is sound.
+        """
+        df, _ = self._block(cli_default_pipelines, self.AMP)
+        assert "gc_corr_tau" in df, "the emission model reads this column"
+        gc = df["gc_percent"].to_numpy(dtype=float)
+        tau = df["gc_corr_tau"].to_numpy(dtype=float)
+        lo, hi = np.percentile(gc, [1, 99])
+        interior = (gc > lo) & (gc < hi)
+        tails = ~interior
+        assert tails.sum() > 50
+        assert tau[tails].mean() > 2.0 * tau[interior].mean()
+
+    def test_the_real_events_still_call(self, cli_default_pipelines):
+        """Not blanket conservatism. The genuine deletion and high-copy blocks
+        are all still there."""
+        df = cli_default_pipelines[self.AMP[0]]["frames"][self.AMP[1]]["cnv"]
+        states = set(df["prob_copy_number"].unique().tolist())
+        assert 0 in states, "the deletion must still be called"
+        assert 3 in states, "the CN-3 amplification must still be called"
+        assert max(states) >= 10, f"the high-copy block is gone; states {states}"
+
+
+class TestFragmentSizeScanAtCliDefaults:
+    """Choosing the library's fragment size from the data instead of asking.
+
+    `-f` sets the neighbourhood each window's gc_percent is measured over. It
+    models the sequenced fragment, which is where Illumina GC bias physically
+    arises, so the right value is a property of the LIBRARY -- something a user
+    may simply not know and cannot read off a coverage table. Left unset, CNery
+    scores candidate sizes by how well the GC they imply predicts HELD-OUT
+    coverage.
+
+    Everything here runs at the CLI's windowing, because the scan needs
+    `frag > win` to have any resolution at all: preprocess() measures GC over
+    max(frag, win), so at the goldens' -w 1000 most candidates are the same
+    computation and the scan declines outright.
+    """
+
+    def _scan(self, pipeline, repeats=3):
+        staged = {s: f["staged"] for s, f in pipeline["frames"].items()}
+        return select_frag_size(staged, pipeline["gc_flags"], pipeline["win"],
+                                DEFAULT_FRAG_SIZE, repeats=repeats)
+
+    def test_the_scan_runs_at_this_windowing(self, cli_default_pipelines):
+        frag, detail = self._scan(cli_default_pipelines["ltee_ara_m3_32k_2rg"])
+        assert detail["Fragment size scanned"] is True
+        assert frag in frag_candidates(CLI_WIN)
+
+    def test_it_never_lands_on_the_top_of_the_grid(self, cli_default_pipelines):
+        """The confound signature, and the reason the target has the replication
+        ramp divided out and is normalised per sequence.
+
+        At a large fragment size "GC" stops being a fragment property: it becomes
+        a long-range positional average that can predict coverage by proxying the
+        replication ramp, and on a short replicon it becomes nearly constant and
+        so acts as a REPLICON LABEL for that sequence's copy-number level. Either
+        one makes the top of the grid win. Measured, scanning raw pooled coverage
+        picked 2500 on cwbi_ssym_ht04; with both controlled it picks 400.
+        """
+        for name in CLI_DEFAULT_DATASETS:
+            frag, _detail = self._scan(cli_default_pipelines[name])
+            assert frag < max(frag_candidates(CLI_WIN)), name
+
+    def test_a_multi_replicon_sample_agrees_with_its_own_chromosome(
+            self, cli_default_pipelines):
+        """Not asserted here for cwbi -- it is not in the CLI-default fixture --
+        but the property that matters is that the scan is POOLED: one library,
+        one fragment size. This pins that a single call covers every sequence."""
+        pipeline = cli_default_pipelines["adp1_mgd06_lb"]
+        _frag, detail = self._scan(pipeline)
+        assert detail["Fragment size candidates"] == frag_candidates(CLI_WIN)
+
+    def test_the_choice_is_reproducible(self, cli_default_pipelines):
+        """Seeded, so a given input always gives the same answer -- otherwise a
+        rerun could silently change every downstream call."""
+        pipeline = cli_default_pipelines["ltee_ara_m3_32k_2rg"]
+        assert self._scan(pipeline)[0] == self._scan(pipeline)[0]
+
+    def test_it_declines_at_the_goldens_windowing(self, cli_default_pipelines):
+        """THE PROPERTY THAT KEEPS THE GOLDENS VALID. At -w 1000 the candidates
+        collapse, and the scan says so rather than choosing among duplicates."""
+        pipeline = cli_default_pipelines["ltee_ara_m3_32k_2rg"]
+        staged = {s: f["staged"] for s, f in pipeline["frames"].items()}
+        frag, detail = select_frag_size(staged, pipeline["gc_flags"], 2000,
+                                        DEFAULT_FRAG_SIZE, repeats=2)
+        assert frag == DEFAULT_FRAG_SIZE
+        assert detail["Fragment size scanned"] is False
+
+    def test_a_pinned_size_is_honoured(self, cli_default_pipelines):
+        """The fixture itself is the assertion: it passes an explicit frag, so no
+        scan ran, and every golden in this suite was produced that way."""
+        assert cli_default_pipelines["adp1_mgd06_lb"]["frames"]["ADP1-ISx"]["gc"][
+            "gc_percent"].notna().all()
+
+
+@per_sequence
+class TestPolymorphismOnRealCoverage:
+    """-p against real coverage, from the same pass-2 frame the goldens use.
+
+    Deliberately NOT a new golden file. A golden for a mode whose whole output
+    is a continuous number is a float-exact golden, and this repo's own guidance
+    argues against those -- LOWESS and scipy.optimize results drift across
+    library versions. Structural claims are the house style here.
+
+    Reusing `seq["otr"]` rather than re-running the pipeline keeps this to one
+    extra decode per sequence instead of a second full authentic run.
+    """
+
+    def _call(self, seq, tmp_path):
+        from CNery.core import run_HMM, DEFAULT_CN_RESOLUTION  # noqa: F401
+        out = tmp_path / "poly"
+        (out / "CNV_csv").mkdir(parents=True, exist_ok=True)
+        return run_HMM(seq["otr"].copy(), str(out), write=False, polymorphism=True)
+
+    def test_the_calls_are_continuous_and_finite(self, seq, tmp_path):
+        called = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        assert np.all(np.isfinite(called))
+        assert called.dtype.kind == "f"
+
+    def test_rounding_reproduces_the_consensus_call(self, seq, tmp_path):
+        """THE claim this mode has to earn: it REFINES calls, it does not move
+        them. Measured on the corpus, rounding the continuous calls reproduces
+        the consensus call on 99.6-100% of windows across all eight sequences.
+
+        This is the test that would catch the continuous grid quietly
+        relabelling real biology, which no synthetic frame can rule out.
+        """
+        poly = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        assert (np.rint(poly) == consensus).mean() > 0.99
+
+    def test_a_healthy_sequence_stays_within_one_step_of_single_copy(
+            self, seq, tmp_path):
+        """The false-positive control, on real coverage with real bias residual.
+
+        NOT "every window reads exactly 1.0": measured, only 34-100% of windows
+        do, and the shortfall is diagnostic rather than alarming. The calls that
+        are not 1.0 sit at 0.95 and 1.05 -- one grid step either side, roughly
+        symmetric (cwbi's chromosome: 2261 windows at 1.00, 2045 at 1.05, 1938
+        at 0.95) -- and the two lowest sequences are the two with the strongest
+        residual replication ramp. That is leftover GC/OTR bias resolved at the
+        grid's own limit, which is a true statement about the coverage, not an
+        invented copy-number variant. What WOULD be alarming is a healthy
+        reference wandering further than one step, so that is what is asserted.
+
+        Skipped where the modal consensus call is not 1, and on sequences
+        carrying a real amplification, whose windows legitimately sit far away.
+        """
+        if seq["seq"].expected_cn != 1:
+            pytest.skip("not a single-copy reference")
+        called = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        single_copy = consensus == 1
+        if single_copy.sum() < 100:
+            pytest.skip("too few single-copy windows to measure")
+        from CNery.core import DEFAULT_CN_RESOLUTION
+        within = np.abs(called[single_copy] - 1.0) <= DEFAULT_CN_RESOLUTION + 1e-9
+        # Measured across the corpus, restricted to windows consensus mode calls
+        # CN 1: 0.940 - 1.000, the minimum on ltee_ara_m3_38k. The bar is set
+        # below that range rather than inside it, so this fails on a real
+        # regression and not on library drift.
+        assert within.mean() > 0.90, sorted(set(called[single_copy]))[:12]
+
+    def test_the_consensus_events_survive(self, seq, tmp_path):
+        """Every window consensus mode called CN 0 must still read near zero,
+        and the modal call must still agree with the consensus mode to within
+        one copy. A continuous grid may refine a call; it must not move it."""
+        consensus = seq["cnv"]["prob_copy_number"].to_numpy()
+        poly = self._call(seq, tmp_path)["prob_copy_number"].to_numpy()
+        deleted = consensus == 0
+        if deleted.any():
+            assert (poly[deleted] < 0.5).mean() > 0.90
+        assert abs(pd.Series(poly).mode()[0]
+                   - pd.Series(consensus).mode()[0]) <= 1.0
+
+    def test_the_cn_censor_would_still_apply(self, seq, tmp_path):
+        """The exact `cn != 1.0` predicate must not make CN_CENSOR_MIN_KEEP fire
+        on a healthy sequence -- if it does, the grid is finer than this
+        sequence's dispersion supports and that is a finding, not a nuisance.
+
+        The two CWBI plasmids are excluded because they already decline the
+        censor in consensus mode, for an unrelated reason: 52% of plasmid_1's
+        windows are repeats.
+        """
+        from CNery.core import add_cn_censor
+        if seq["seq"].expected_cn != 1 or not seq["seq"].otr_detected:
+            pytest.skip("not a clean single-copy reference")
+        called = self._call(seq, tmp_path)
+        _df, applied = add_cn_censor(called, polymorphism=True)
+        assert applied
+
+
+# ---------------------------------------------------------------------------
+# Reference groups on real coverage.
+# ---------------------------------------------------------------------------
+GROUPED_DATASET = "cwbi_ssym_ht04"
+GROUPED_LABEL = "one_assembly"
+
+
+def _otr_json_at(out, seq_id):
+    with open(_produced(out, seq_id, "OTR_corr", "_otr_results.json")) as fh:
+        return json.load(fh)
+
+
+@pytest.fixture(scope="session")
+def pipeline_cwbi(tmp_path_factory):
+    """The ordinary, ungrouped run of the same dataset, for the before/after."""
+    from conftest import _dataset_or_skip
+
+    path = _dataset_or_skip(GROUPED_DATASET)
+    if GROUPED_DATASET not in _PIPELINES:
+        _PIPELINES[GROUPED_DATASET] = _run_pipeline(
+            GROUPED_DATASET, path, tmp_path_factory.mktemp("out_cwbi"))
+    return _PIPELINES[GROUPED_DATASET]
+
+
+@pytest.fixture(scope="session")
+def grouped_pipeline(tmp_path_factory):
+    """cwbi_ssym_ht04 with its chromosome and both plasmids in ONE group.
+
+    Biologically wrong on purpose -- those are three separate replicons -- and
+    mechanically ideal, because the truth is already published. The chromosome
+    contributes 6,709 of the ~7,100 windows, so a pooled fit lands near its own
+    baseline, and the two plasmids' measured levels (2.9531 and 1.8980 relative,
+    from `"Relative copy number"`) say what a shared baseline must call them.
+
+    It is also the only multi-sequence dataset in the corpus, so it is the only
+    place the grouped path can be exercised on real coverage at all.
+    """
+    from conftest import _dataset_or_skip
+
+    path = _dataset_or_skip(GROUPED_DATASET)
+    groups = {seq.seq_id: GROUPED_LABEL
+              for seq in DATASETS[GROUPED_DATASET].sequences}
+    return _run_pipeline(
+        GROUPED_DATASET, path, tmp_path_factory.mktemp("grouped_cwbi"),
+        groups=groups,
+    )
+
+
+class TestReferenceGroupOnRealCoverage:
+    """One baseline across three sequences, against calls that are already known."""
+
+    @staticmethod
+    def _calls(pipeline, seq_id):
+        return pipeline["frames"][seq_id]["cnv"]["prob_copy_number"]
+
+    def test_ungrouped_the_plasmids_are_called_single_copy(self, pipeline_cwbi):
+        # The starting point, and the thing being fixed: run_HMM refits the
+        # single-copy level from whichever sequence it is handed (fitted mu
+        # 100.9 / 300.0 / 194.6), so a plasmid at 2.95x the chromosome is CN 1.
+        for seq_id in ("plasmid_1", "plasmid_2"):
+            assert int(self._calls(pipeline_cwbi, seq_id).mode()[0]) == 1
+
+    @pytest.mark.parametrize("seq_id,expected", [
+        ("plasmid_1", 3),      # measured relative copy number 2.9531
+        ("plasmid_2", 2),      # measured relative copy number 1.8980
+    ])
+    def test_grouped_each_plasmid_is_called_at_its_measured_level(
+            self, grouped_pipeline, seq_id, expected):
+        called = self._calls(grouped_pipeline, seq_id)
+        assert int(called.mode()[0]) == expected
+        # Not a stray window or two: the level is what most of the replicon reads.
+        assert (called == expected).mean() > 0.5
+
+    def test_the_chromosome_still_anchors_the_group(self, grouped_pipeline):
+        called = self._calls(grouped_pipeline, "chromosome")
+        assert int(called.mode()[0]) == 1
+
+    def test_the_chromosomes_big_amplification_survives(self, grouped_pipeline,
+                                                        pipeline_cwbi):
+        # The group's baseline comes overwhelmingly from the chromosome, so its
+        # own structure must not move: the CN-34 block is the loudest feature in
+        # the corpus and the most sensitive to a shifted mu.
+        for pipe in (grouped_pipeline, pipeline_cwbi):
+            df = pipe["frames"]["chromosome"]["cnv"]
+            block = df.loc[(df["win_st"] >= 59_501) & (df["win_st"] < 70_000)]
+            assert block["prob_copy_number"].max() > 20
+
+    def test_every_member_publishes_the_groups_relative_copy_number(
+            self, grouped_pipeline):
+        # One group, so it anchors itself and every member reads exactly 1.0 --
+        # the per-sequence 2.95 and 1.90 are now a statement about copy NUMBER,
+        # which is where they belong, rather than a number beside a call of 1.
+        out = grouped_pipeline["out"]
+        values = set()
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            record = _otr_json_at(out, seq.seq_id)
+            assert record["Reference group"] == GROUPED_LABEL
+            assert GROUPED_LABEL in record["Correction type"]
+            values.add(round(record["Relative copy number"], 6))
+        assert values == {1.0}
+
+    def test_the_declined_records_are_still_what_breseq_reads(
+            self, grouped_pipeline):
+        out = grouped_pipeline["out"]
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            record = _otr_json_at(out, seq.seq_id)
+            assert record["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+            # breseq does not type-check these two, so a null costs it the file.
+            assert isinstance(record["Origin window"], int)
+            assert isinstance(record["Terminus window"], int)
+
+            breaks = pd.read_csv(_produced(out, seq.seq_id, "CNV_csv",
+                                           "_break_pts.csv"))
+            assert list(breaks.columns) == ["Startpos", "State", "Segment_Size"]
+            assert breaks["State"].dtype == "int64"
+
+    def test_gc_skew_is_reported_as_not_measured(self, grouped_pipeline):
+        out = grouped_pipeline["out"]
+        for seq in DATASETS[GROUPED_DATASET].sequences:
+            with open(_produced(out, seq.seq_id, "GC_skew",
+                                "_gc_skew_results.json")) as fh:
+                record = json.load(fh)
+            assert record["Prediction confident"] is False
+            assert GROUPED_LABEL in record["No prediction reason"]

@@ -278,3 +278,49 @@ class TestTotalOnlyIsLossless:
         a, b = self._both(tmp_path, redundant=0)
         assert (a["pct_redundant"] == 0).all()
         assert (b["pct_redundant"] == 0).all()
+
+
+class TestTableWithNoDataRows:
+    """A valid header and no positions is a REFERENCE WITH NO READS, not a broken file.
+
+    bam2cov writes one for a sequence nothing mapped to, and every check
+    read_coverage_table() makes passes: the columns are all there, only the rows
+    are missing. preprocess() then took df.index[0] to find the first coordinate
+    and raised a bare IndexError four frames below the input boundary -- taking
+    down every other reference in the same invocation with it.
+    """
+
+    def test_it_is_accepted_by_the_reader(self, tmp_path):
+        path = _write_strand(tmp_path / "none.tsv", n=0)
+        df = read_coverage_table(path)
+        assert len(df) == 0
+
+    def test_windowing_it_yields_no_windows(self, tmp_path):
+        path = _write_strand(tmp_path / "none.tsv", n=0)
+        out = preprocess(read_coverage_table(path), win=100, step=100)
+        assert len(out) == 0
+
+    def test_the_empty_frame_still_carries_the_column_contract(self, tmp_path):
+        # Each stage reads the previous stage's columns BY NAME, so an empty
+        # frame missing them fails later and less clearly than one that has them.
+        path = _write_strand(tmp_path / "none.tsv", n=0)
+        out = preprocess(read_coverage_table(path), win=100, step=100)
+        for col in ("win_st", "win_end", "win_len", "gc_percent",
+                    "read_count_cov", "pct_redundant", "window_num",
+                    "norm_raw_cov", "gc_skew", "cum_gc_skew"):
+            assert col in out.columns
+
+    def test_window_coordinates_stay_integers(self, tmp_path):
+        # Built from empty LISTS, which pandas types as `object`. Left that way,
+        # pd.concat with a populated frame in process_multi_genome promotes the
+        # POOLED column -- so one empty plasmid would silently turn a healthy
+        # chromosome's win_st into floats, all the way out to its CNV.csv.
+        path = _write_strand(tmp_path / "none.tsv", n=0)
+        empty = preprocess(read_coverage_table(path), win=100, step=100)
+        full = preprocess(
+            read_coverage_table(_write_strand(tmp_path / "some.tsv", n=500)),
+            win=100, step=100,
+        )
+        pooled = pd.concat([empty, full], ignore_index=True)
+        for col in ("win_st", "win_end", "win_len", "window_num"):
+            assert pd.api.types.is_integer_dtype(pooled[col]), col

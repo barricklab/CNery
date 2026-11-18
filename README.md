@@ -8,11 +8,17 @@ Recent updates (latest commits):
 - **CSV or TSV, full or `--total-only`** — all four shapes of table are read without being declared. The delimiter is detected from the file's own header row, and the column schema from its column names. `--total-only` tables are the recommended input: they carry three coverage columns instead of eight, so they are markedly smaller, and CNery loses nothing by using them.
 - **Files and folders on the command line** — name coverage tables directly, or name folders and let `CNery` find them by file ending (`--file-ending`, defaults `coverage.csv`, `coverage.tsv` and `coverage.tab`). Files and folders can be mixed in one command.
 - **Multi-genome CNV analysis** — `CNery` processes *all* the coverage tables given in one pass. Each reference (chromosome, plasmid, contig, etc.) is preprocessed separately, pooled for a shared LOWESS GC-bias fit, and then bias-corrected and CN-called independently.
-- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created automatically.
+- **Cumulative GC skew origin/terminus prediction** — `CNery` now also locates the replication origin and terminus from the reference's own cumulative GC skew ([Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593)), independently of read depth. Reported in `GC_skew/` as a marked-up plot and a JSON summary, and used as the fallback origin/terminus when the coverage profile carries no usable gradient of its own.
+- **Output flexibility** — output prefix defaults to `CNV_out/` in the current folder. Output subfolders (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created automatically.
 - **Modular bias correction** — the `--bias` flag lets you choose `all` (GC + OTR), `gc`, `otr`, or `none`.
 - **A per-base segment-length prior** — `--change-rate` is the probability per *base* that copy
   number changes, so re-tiling a genome with different `-w`/`-s` does not restate the biology.
   Read `1/rate` as the expected segment length.
+- **Boundaries priced by fractional change** — a boundary *inside* an already-amplified region is
+  both rarer (`--interior-change-rate`) and, when the two states are close in ratio, a claim the
+  coverage cannot support (`--fold-change-penalty`, charged per doubling as `BETA / |log2(l/k)|`).
+  Without this, deep coverage resolves 126 copies from 139 on counting noise alone and reports one
+  amplification as a segment plus a shoulder.
 - **Pip-installable package** — `requirements.txt` and a fixed `pyproject.toml` allow install directly from GitHub via `pip install git+...`.
 ---
 
@@ -42,7 +48,8 @@ you do not have them yet. Point it at the folder holding them:
 CNery <folder> [-o <output folder>] [-w <window>] [-s <step size>] [-f <fragment length>]
 ```
 
-Run with no arguments at all and it reads the current folder. You can also name tables directly, or
+Run with no arguments at all and it reads the current folder (`CNery --version` prints the installed
+version). You can also name tables directly, or
 mix files and folders in one command:
 
 ```bash
@@ -59,6 +66,59 @@ rather than adding to them:
 ```bash
 CNery coverage/ --file-ending cov.txt
 CNery coverage/ --file-ending cov.txt --file-ending coverage.csv
+```
+
+### Reference groups — contigs of one draft assembly
+
+A draft genome arrives as hundreds of contigs, and CNery calls copy number per reference: each
+contig refits its own baseline, so **every one of them comes out at copy number 1** however
+amplified it really is. `--group-table` says which coverage tables are contigs of one molecule
+(breseq's `-c`) so that they share a single background coverage distribution.
+
+```bash
+CNery --group-table 08_mutation_identification/reference_groups.tsv -o CNV_out
+```
+
+The table has two columns, `file` and `group`; any other column is ignored, so it can carry
+provenance. `file` names a coverage table **exactly** — no stem matching — resolved relative to
+the table's own folder. A blank `group` means the sequence stands alone.
+
+```
+file	group	length	source
+REL606.coverage.tsv		4629812	REL606.gbk
+pKAN.coverage.tsv		5988	pKAN.gbk
+NZ_MJGT01000001.coverage.tsv	pine3-8-t1	412887	pine3-8-t1.fasta
+NZ_MJGT01000002.coverage.tsv	pine3-8-t1	98014	pine3-8-t1.fasta
+```
+
+For a group of two or more sequences:
+
+- they share one baseline depth, one dispersion and one copy-number grid, so a contig at three
+  times the assembly's level is called copy number 3;
+- **origin-to-terminus correction is declined** and **GC skew is not measured** — contig order and
+  orientation are unknown, so there is no coordinate for a replication ramp or an origin to sit
+  along. Both still write their JSON, saying so;
+- `"Relative copy number"` is measured across the whole group, and the longest group anchors the
+  run at 1.0. A finished chromosome beside a longer draft assembly will therefore no longer read
+  exactly 1.0 — it reads its level relative to the assembly.
+
+A sequence in no group, and every sequence when `--group-table` is not given, behaves exactly as
+before. A table in which nothing is grouped is a no-op, which is what lets a caller pass the flag
+unconditionally.
+
+**The table can also supply the inputs.** With `--group-table` and no `INPUT` argument, the
+coverage tables read are the ones the table names — which is how breseq keeps its command line to
+one line on a draft assembly rather than repeating hundreds of paths. Given both, they must agree
+exactly: every input named by a row, every row naming an input.
+
+Naming a folder is another way to keep the command line short. breseq's
+`08_mutation_identification/` holds one `*.coverage.tsv` per contig — hundreds of them on a
+draft genome — beside its own `*.coverage.tab` files, which share a default ending but not the
+schema and would be rejected by name. Restricting the ending picks out exactly the tables CNery
+wants, in one argument instead of hundreds:
+
+```bash
+CNery 08_mutation_identification/ --file-ending coverage.tsv -o 09_copy_number_variation/cnery_out
 ```
 
 A table's sequence ID comes from its file name, with the matched ending and the `.` in front of it
@@ -120,9 +180,46 @@ CNery <inputs> -o <output folder> -w 500 -s 250 --bias gc
 
 # No bias correction before CN prediction
 CNery <inputs> -o <output folder> -w 500 -s 250 --bias none
+
+# Polymorphism mode: call a continuous copy number instead of an integer one
+CNery <inputs> -o <output folder> -p
+
+# ...at a finer grid (levels 1.02, 1.04, ... instead of 1.05, 1.10, ...)
+CNery <inputs> -o <output folder> -p --copy-number-resolution 0.02
 ```
 
-When OTR correction is applied, the origin and terminus of replication are automatically inferred from the coverage profile — no manual coordinates are required.
+### Consensus and polymorphism modes
+
+By default CNery calls an **integer** copy number: a region is at one copy, or two, or thirty-four.
+That is the right answer for a clonal isolate, and it is the mode breseq consumes.
+
+`-p/--polymorphism-mode` instead calls a **continuous level**, so a region can come back at 1.30.
+Read that as a measurement of relative depth and nothing more — it does **not** say *why*. A level of
+1.30 is consistent with 30% of the population carrying a duplication, with a mixed sample, or with
+aneuploidy, and CNery does not claim to distinguish them; there is no cell-fraction parameter,
+deliberately. This is the same stance as the `"Relative copy number"` already reported per sequence
+in `OTR_corr/*_otr_results.json`, which is likewise non-integral on purpose.
+
+`--copy-number-resolution` sets how fine the grid is (default 0.05, so the smallest change above
+single copy that can be called is 1.05). It is rounded so that single copy always lands exactly on
+the grid. Finer is not automatically better: the default is roughly the smallest difference a 10 kb
+event can support at the default windowing, and a grid finer than the coverage's own scatter will
+simply cost sensitivity.
+
+Two practical notes:
+
+- **Consensus-mode output is completely unchanged by this feature**, bit for bit.
+- **`-p` output is not readable by breseq.** The `State` column of `CNV_csv/*_break_pts.csv` becomes
+  fractional, and breseq expects an integer copy number there. Use the default mode when the results
+  are destined for breseq.
+- **A level one step off single copy is usually residual bias, not biology.** On real data the GC and
+  replication corrections leave a slow wander of a few percent, and a fine grid resolves it into long
+  stretches at 0.95 or 1.05. Measured across the test corpus, rounding the continuous calls
+  reproduces the ordinary integer call on 99.6–100% of windows — the mode refines calls rather than
+  changing them — so treat a one-step departure as the resolution limit and look for events that
+  stand clear of it.
+
+When OTR correction is applied, the origin and terminus of replication are automatically inferred — no manual coordinates are required. CNery fits them from the coverage profile, falling back to the reference's own cumulative GC skew when the coverage carries no usable gradient. Either way the correction is applied only if it beats a bootstrap null, so a flat genome is left alone.
 
 ---
 
@@ -272,14 +369,93 @@ cut -f1,2 data/reference.fasta.fai
 
 Given an output folder `CNV_out/`, `CNery` writes:
 
+The `-f` fragment size is optional. GC bias acts at the scale of the sequenced
+fragment, so that size belongs to the library rather than to the analysis — and
+it is not something a coverage table shows you. Left unset, CNery scores
+candidate sizes by how well the GC each implies predicts held-out coverage (with
+the replication ramp divided out and copy-number variants excluded, so neither
+can be mistaken for a GC effect) and reports what it chose. The 400 bp default is
+kept unless a candidate beats it by more than the measurement's own error. Pass
+`-f` to pin it.
+
+CNery corrects coverage and calls copy number in **two passes**. The first runs GC
+correction, origin-to-terminus correction and the HMM as usual. The second repeats
+both fits with every window the first pass did not call single-copy excluded from
+them, then calls copy number again — only the second pass's results are written.
+
+An amplification is invisible to the crude censoring the first pass has available
+(near-zero depth, repeat overlap), so it otherwise sits in the GC and ramp fits at
+full weight and distorts them. Measured on synthetic coverage where the truth is
+known, a real 1.5x replication ramp with an amplification on top is detected 0 times
+in 60 without this and 60 times in 60 with it, at no cost in false positives. If
+excluding the non-single-copy windows would leave under half a sequence, it is
+skipped for that sequence and reported as such.
+
 - `CNV_out/CNV_plt/` — per-reference CNV prediction plots.
 - `CNV_out/CNV_csv/` — per-window coverage + CN calls as CSV.
-- `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot.
+- The GC correction is a fitted curve, not an exact quantity, so how well it is determined at each window's GC is measured (by resampling the fit) and carried into the copy-number model as extra variance. The effect grows with copy number, because a correction factor's error is multiplied by the number of copies — which is why a window at an extreme GC inside an amplification is no longer able to earn its own copy-number segment on the strength of the correction alone.
+- `CNV_out/GC_bias/` also holds `GC_passes.pdf` — the GC correction is fitted in two pooled passes, once on raw coverage and again after OTR correction (which reintroduces a GC trend, because the replication ramp varies with position and position correlates with GC). The second pass additionally excludes every window the first pass's copy-number calls did not put at CN=1. The plot shows both curves and their product, which is the total correction actually applied.
+- `CNV_out/GC_bias/` — pooled LOWESS GC-bias diagnostic plot, `GC_vs_NormRds.pdf`. Both files here cover the whole run rather than one reference, which is why neither is named for a sequence.
+- `CNV_out/corr_plots/` — per-reference **before/after** diagnostic (`*_correction_stages.pdf`): one row for each correction step — GC and OTR, in each of the two passes — showing coverage before and after it, with the fitted curve overlaid, and directly beneath each row a strip of which windows that particular fit was allowed to see. Deletions are drawn as spans, repeats as a density track, and the second pass's strips additionally mark everything called CN≠1. One row does not continue from the one above it, and says so: the second OTR fit divides the first pass's ramp back out, because a ramp has to be fitted to coverage that still contains it. Each row is labelled with the fraction of windows within 20% of single copy before and after, reported both over all windows and over uncensored windows only — the two can differ a lot on a repeat-heavy replicon, and the strip below shows why. Produced in every `--bias` mode.
+
 - `CNV_out/OTR_corr/` — per-reference OTR bias plots and a JSON summary (`*_otr_results.json`) containing the inferred origin window, terminus window, normalized coverage at each, the origin-to-terminus ratio, and the sequence's **relative copy number**.
 
+  This file is written for **every** reference in **every** `--bias` mode, including ones where no correction was attempted and ones with no usable coverage at all. A reference whose table has no position rows, or whose every window reads zero, is reported rather than treated as an error: it gets the ratio `"Not detected"`, a `"No usable coverage reason"` saying which of the two it was, and its own (empty) CSVs and plots, and the run continues with the other references and exits 0. A plasmid that got no reads does not cost you the chromosome sequenced alongside it.
+
+  It also reports how well the applied ramp actually fits, beyond r²: `"Residual structure score"` asks whether what the tent *failed* to explain is systematically structured rather than just noisy — a fit can explain a lot of variance and still be the wrong shape over a long stretch. It is a z-score against a bootstrap null, so read it as roughly: below 1 unstructured, 1–2 mild, above 2 structured. `"Residual decorrelation length (bp)"` is the scale of correlation that would be present anyway, published alongside so the score can be judged in context. Both are diagnostic only — nothing in CNery acts on them.
+
+  It also records the evidence behind the decision, whether or not a correction was applied: `"Coverage fit r-squared"` / `"Coverage fit p-value"`, the same pair for the GC-skew-anchored fit, the `"Coverage vs skew likelihood ratio"` and its p-value when both candidates were live, `"Bootstrap surrogates"`, and `"Breakpoint source"` (`coverage fit`, `GC skew`, or `not corrected`). A rejected fit is therefore diagnosable from the file alone. Note the p-values are floored at `1/(surrogates+1)`, so `0.001` is an upper bound rather than a measurement.
+
   `"Relative copy number"` is that sequence's coverage relative to the longest sequence in the run, which reads exactly `1.0`. It is not rounded to an integer: a plasmid at `2.95` is a measurement, and it is the only place plasmid copy number is reported — `prob_copy_number` in the CSVs is called per reference, so a uniformly multi-copy plasmid comes out as `1` there.
+- `CNV_out/GC_skew/` — per-reference cumulative GC-skew plots with the predicted origin and terminus marked, and a JSON summary (`*_gc_skew_results.json`).
 
 Each coverage table produces its own set of outputs, named with the sequence ID derived from its file name. The GC-bias plot is the exception: one pooled fit covers every table in the run.
+
+### Origin and terminus from GC skew
+
+Bacterial genomes are G-rich on the leading strand and C-rich on the lagging strand, so the sign of the GC skew `(G−C)/(G+C)` flips at the two points where the replication strands switch. Summing the skew along the genome turns those sign changes into extrema: following [Grigoriev 1998](https://academic.oup.com/nar/article/26/10/2286/1030593), the cumulative curve reaches its **minimum over the replication origin** and its **maximum at the terminus**.
+
+`CNery` computes this from the coverage table's `ref_base` column — no FASTA and no read depth involved — and writes the result for every reference, in all four `--bias` modes:
+
+```json
+{
+    "Origin (bp)": 3885501,
+    "Terminus (bp)": 1526001,
+    "Origin window index": 7771,
+    "Terminus window index": 3052,
+    "Windows": 9258,
+    "Separation (fraction of genome)": 0.4903,
+    "Cumulative skew amplitude": 151.2949,
+    "Replichore skew t-statistic": 34.77,
+    "Replichore skew p-value": 0.001,
+    "Bootstrap surrogates": 1000,
+    "Prediction confident": true,
+    "Prediction method": "Ori-ter coordinates from cumulative GC skew (Grigoriev 1998)"
+}
+```
+
+`Prediction confident` requires two things: the two extrema roughly antipodal (35–65% of the sequence apart, as bidirectional replication implies), and a p-value of 0.01 or better. **The coordinates are reported either way** — a low-confidence call stays diagnosable from the JSON and the plot rather than being reduced to a flag.
+
+#### How the p-value is computed, and how to read it
+
+Adjacent windows are not independent — genome composition varies on scales far longer than one window — so an ordinary *t*-test would badly overstate significance. `Replichore skew t-statistic` is therefore reported as an **effect size only**; its magnitude is inflated by an unknown factor and should not be converted to a p-value.
+
+The p-value instead comes from a **circular block bootstrap**. Contiguous blocks of windows are resampled with replacement around the circle, which preserves local autocorrelation while destroying the long-range two-arm pattern being tested for; the null is "a sequence that wobbles like this one but has no single origin". The full procedure — locating the extrema, then scoring the two arms — is re-run on every surrogate, so choosing the breakpoints by looking at the data is paid for rather than ignored.
+
+Two things to know when reading it:
+
+- **It is floored at `1/(B+1)`.** A real chromosome beats all 1,000 surrogates and reads back exactly `0.001`. That is an upper bound, not a measurement — read it as "p < 0.001". `Bootstrap surrogates` is reported so the floor is visible.
+- **Block length adapts to sequence length.** What governs power is the number of blocks rather than their size, so CNery targets ~20 blocks, bounded to 10–200 windows each. Sequences too short to give both long-enough and numerous-enough blocks simply do not reach significance, which is an honest reflection of how little evidence they carry.
+
+The bootstrap is seeded, so repeated runs on the same input give the same p. It adds roughly 3% to the per-sequence cost (~0.15 s on a 4.6 Mb genome).
+
+Expect `false` on plasmids. They have no bidirectional replication origin, so there is no sign change for the cumulative curve to turn on, and the two extrema you get back are noise — the two in the test data land at `p` = 0.36 and 0.44. That is the intended answer, not a failure, and chromosomes in the same run are unaffected since the prediction is made per reference.
+
+Two properties worth knowing. The prediction depends only on the reference, so different samples aligned to the same reference give identical answers, whatever their depth or growth phase. And it is invariant to circular permutation: a reference whose coordinates start elsewhere predicts the same locus.
+
+These values feed the OTR correction as its second candidate. CNery prefers the coverage-derived origin and terminus when they clear their own significance test *and* a likelihood-ratio test says they fit better than a ramp hinged at the GC-skew coordinates; otherwise it uses the skew's, provided the skew prediction is confident and the coverage does not contradict which end is the origin. `"Correction type"` and `"Breakpoint source"` in `*_otr_results.json` say which was used.
+
+The practical consequence: a sequence with no replication gradient in its coverage but a confident skew prediction now receives a small correction where it previously received none. The magnitude is still fitted from the coverage, not imported — on a genuinely flat sequence the fitted ramp is close to 1.0 — but the evidence for such a correction is the reference sequence, not the reads. `"GC skew fit p-value"` reports what the coverage itself had to say about it.
 
 ---
 
@@ -291,6 +467,10 @@ $ CNery -h
 usage: CNery [-h] [--file-ending ENDING] [--region SEQ_ID:START-END] [-o O]
              [-w W] [-s S] [-f F]
              [-z DELETION_COVERAGE_FRACTION] [--change-rate CHANGE_RATE]
+             [--interior-change-rate INTERIOR_CHANGE_RATE]
+             [--fold-change-penalty FOLD_CHANGE_PENALTY]
+             [--max-copy-number MAX_COPY_NUMBER] [-p]
+             [--copy-number-resolution CN_RESOLUTION]
              [--bias {all,none,gc,otr}]
              [INPUT ...]
 
@@ -363,6 +543,53 @@ options:
                         length: the default 1e-06 is one copy-number boundary
                         per megabase. Larger values give more, shorter
                         segments.
+  --interior-change-rate INTERIOR_CHANGE_RATE
+                        Prior probability PER BASE of a boundary INSIDE an
+                        already-altered region -- one amplified state abutting
+                        another, with no return to single copy between them.
+                        Same units as --change-rate and converted the same way,
+                        so -w/-s does not restate it. Rarer than an ordinary
+                        boundary because it takes two events rather than one.
+                        Default: 1e-08, one per 100 Mb.
+  --fold-change-penalty FOLD_CHANGE_PENALTY
+                        Extra cost in NATS for an interior boundary, per
+                        doubling: moving from copy number k to l costs this
+                        divided by |log2(l/k)|. So it is 2 nats at a 2-fold
+                        change, 7x that at 10%, 70x at 1% -- scale-free, so
+                        1 -> 2 and 100 -> 200 cost the same. It is what stops
+                        deep coverage resolving 126 from 139 and splitting one
+                        amplification into a segment and a shoulder. Applies
+                        only between two amplified states; transitions to or
+                        from single copy and the deletion state are untouched.
+                        0 disables it. Default: 2.
+  --max-copy-number MAX_COPY_NUMBER
+                        Highest copy number the HMM can call. This is a
+                        CEILING, not the grid: the number of states is sized
+                        from the data, so raising this changes nothing unless
+                        the sample really does carry a segment above the old
+                        value. Memory is linear in the states actually used. A
+                        call that lands exactly on the ceiling is reported as
+                        such, because it is a clipped value rather than a
+                        measurement. Default: 500.
+  -p, --polymorphism-mode
+                        Call a CONTINUOUS copy number instead of an integer
+                        one. The HMM decodes over a grid of coverage levels
+                        spaced by --copy-number-resolution, finely between 0
+                        and 2 and on the integers above, refined where a
+                        segment's own data asks for it. A level is a measured
+                        relative depth and asserts no mechanism: 1.3 may be a
+                        subpopulation carrying a duplication, a mixed sample,
+                        or aneuploidy, and this mode does not claim to tell
+                        them apart. NOTE the copy number written to
+                        break_pts.csv is fractional in this mode, which breseq
+                        cannot read; consensus mode is unchanged.
+  --copy-number-resolution CN_RESOLUTION
+                        Spacing of the copy-number grid under -p, in copies:
+                        0.05 means the finest level above single copy is 1.05.
+                        Rounded to one that divides 1.0 exactly, so single copy
+                        is always on the grid. The default is about the finest
+                        step a 10 kb event supports at the default windowing.
+                        Default: 0.05.
   --bias {all,none,gc,otr}
                         Select which bias correction to apply before CN
                         prediction. 'all' applies GC + OTR, 'gc' or 'otr'

@@ -7,10 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Environment.** Two specs, for two audiences:
 
 - `environment.yml` — the user-facing install path, as documented in `README.md`.
-- `dev-environment.yml` — the contributor path. Adds `pytest` (absent from the runtime manifests, so
-  the suite cannot run without it), pins `pandas<3`, drops the `pathlib` stdlib-backport entry, and
-  includes `breseq`. Following the same convention as the `breseq` repo, it builds into an untracked
-  `env/` inside the repo (already covered by `.gitignore`):
+- `dev-environment.yml` — the contributor path. Adds `pytest` and `pooch` (absent from the runtime
+  manifests, so the suite cannot run without them) and pins `python=3.11` for a fast, reproducible
+  solve. Otherwise the three dependency lists are **the same list, written three times** —
+  `requirements.txt` for the wheel (`pyproject.toml` reads it via `dynamic = ["dependencies"]`),
+  `environment.yml` for conda users, and this one for contributors. Nothing checks that they agree,
+  so a version floor changed in one has to be changed in all three by hand.
+  Following the same convention as the `breseq` repo, it builds into an untracked `env/` inside the
+  repo (already covered by `.gitignore`):
 
 ```bash
 conda env create -f dev-environment.yml --prefix=$PWD/env
@@ -31,12 +35,42 @@ with no install step and no `PYTHONPATH` fiddling.
 A bare `pytest` runs **both** tiers. `-m synthetic` and `-m authentic` opt *out* of one.
 
 ```bash
-conda run -p $PWD/env pytest                    # all 221; ~105 MB download on a cold cache
-conda run -p $PWD/env pytest -m synthetic       # 137, offline, ~14s -- the inner loop
-conda run -p $PWD/env pytest -m authentic       # 84, real coverage tables
+conda run -p $PWD/env pytest                    # all 948; ~105 MB download on a cold cache
+conda run -p $PWD/env pytest -m synthetic       # 567, offline, ~90s -- the inner loop
+conda run -p $PWD/env pytest -m authentic       # 381, real coverage tables (35 skip per-sequence)
 conda run -p $PWD/env pytest tests/test_hmm.py  # one file
 conda run -p $PWD/env pytest tests/test_utils.py::TestFindNearest::test_exact_match
 conda run -p $PWD/env pytest -k gc_correction   # by name
+```
+
+**pandas 2 and pandas 3 are both supported, and the suite is identical on each** — measured at
+697/32 on 2.3.3 and 3.0.5 when that was established, goldens included; the suite has grown since
+and currently reads **913 passed, 35 skipped** on 3.0.5 (2.3.3 not re-measured).
+The `pandas<3` cap is gone; what replaced it is two
+invariants that are not obvious from the code, both recorded in `dev-environment.yml`:
+
+1. **Every function in `core.py` that takes a DataFrame and writes to it calls `.copy()` first.**
+   Under pandas 3's Copy-on-Write a write through a view does not propagate, so a stage that mutated
+   its argument in place would fail *silently* rather than raise. There are no chained assignments
+   (`df[col][mask] = x`) anywhere, and adding one would be a bug on pandas 3 only.
+2. **`preprocess` casts a zero-window frame's columns to int/float explicitly.** Empty lists give
+   `object`, which `pd.concat` then promotes across the *pooled* frame — so one empty plasmid would
+   turn a healthy chromosome's `win_st` into floats.
+   `tests/test_coverage_table_io.py::test_window_coordinates_stay_integers` pins it.
+
+There is no CI, so a contributor **on pandas 2** can check pandas-3 readiness without reinstalling,
+by turning on the two options that account for most of the 3.0 behaviour change. (On pandas 3 the
+command is pointless: Copy-on-Write is mandatory there and `mode.copy_on_write` is already a
+deprecated no-op that pandas 4 removes.) `pyproject.toml` ignores `DeprecationWarning`, which hides
+exactly the signals worth seeing here, hence the `-W` override:
+
+```bash
+conda run -p $PWD/env python -c "
+import pandas as pd, pytest, sys
+pd.options.mode.copy_on_write = True
+pd.options.future.infer_string = True
+sys.exit(pytest.main(['-m','synthetic','-q','-W','error::DeprecationWarning',
+                      '-W','error::FutureWarning']))"
 ```
 
 **Running the tool.** Console entry point is `CNery` → `CNery.get_CNV:main`. Full flag list is in
@@ -110,11 +144,16 @@ wrong numbers or a `KeyError` deep inside a stage, never a clear error at the bo
 | `read_count_cov` | `preprocess` | median total (unique + redundant) coverage in the window |
 | `norm_raw_cov` | `preprocess` | `read_count_cov` / its median |
 | `pct_redundant` | `preprocess` | fraction of the window's bases overlapping repeat coverage |
+| `gc_skew` | `preprocess` | `(G-C)/(G+C)` over the window's `ref_base` letters |
+| `cum_gc_skew` | `preprocess` | running sum of `gc_skew`, mean-subtracted first |
 | `is_deletion` / `is_redundant` | `mask_coverage_windows` | the two censoring reasons, kept separate |
 | `gc_corr_norm_cov` | `apply_gc_correction` | divided by the LOWESS fit at that window's GC |
 | `otr_gc_corr_norm_cov` | `apply_otr_correction` | divided by the ori→ter ramp |
+| `is_cn_variant` | `add_cn_censor` | pass-1 HMM did not call this window CN=1 |
+| `gc_corr_tau` | `apply_gc_correction` | relative sd of the GC curve at this window's GC |
+| `*_pass1` | `stage_pass1` | the first pass's value, before pass 2 overwrites it |
 | `otr_gc_corr_rdcnt_cov` | `run_HMM` | back-converted to integer read counts (output/plots only — **not** the HMM's observation) |
-| `prob_copy_number` | `run_HMM` | Viterbi state |
+| `prob_copy_number` | `run_HMM` | Viterbi state — an integer copy number, or a continuous level under `-p` |
 
 Supporting columns other stages depend on: `gc_cor_med_fil` (median filter of `gc_corr_norm_cov`;
 seeds the ori/ter guess in `otr_fit`), `exclude_from_fit` / `censor_reason` (`is_deletion OR
@@ -130,16 +169,20 @@ Adding a stage means reading the previous column name and writing the next one.
 
 ### `--bias` works by aliasing columns
 
-`get_CNV.py:212-265` implements the four modes by *renaming data into the column the next stage
-expects*, rather than by branching inside the correction functions. `fit_otr_bias` unconditionally
+`get_CNV.main`'s `correct_one()` implements the four modes by *renaming data into the column the
+next stage expects*, rather than by branching inside the correction functions. It is called once per
+pass, so a mode's aliasing is defined in exactly one place for both. `fit_otr_bias` unconditionally
 reads `gc_corr_norm_cov`. The aliasing still drives the corrected-coverage columns written to
 `CNV.csv` and the plots — but **not** the HMM, which now takes `bias` as an argument and composes its
 emission offset from the correction-factor columns directly.
 
-- `all` — no aliasing; both corrections run in sequence.
-- `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely.
-- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input.
-- `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`.
+- `all` — no aliasing; both corrections run in sequence, and both are refitted in pass 2.
+- `gc` — copy `gc_corr_norm_cov` → `otr_gc_corr_norm_cov`, skipping OTR entirely. The pooled GC
+  refit still runs in pass 2, since the CN censor sharpens a GC fit whether or not an OTR stage
+  exists.
+- `otr` — copy `norm_raw_cov` → `gc_corr_norm_cov` so `fit_otr_bias` sees uncorrected input. No GC
+  refit, because the GC correction was explicitly opted out of.
+- `none` — copy `norm_raw_cov` → `otr_gc_corr_norm_cov`. No second pass at all.
 
 Any new bias mode is another aliasing branch here, not a new parameter threaded through `core.py` —
 *plus* an entry in `BIAS_OFFSET_COLUMNS`, since the HMM composes its emission offset from the
@@ -149,6 +192,466 @@ Note that GC correction has *already run* by the time this dispatch executes —
 does it unconditionally, and the `otr`/`none` branches discard the result by overwriting the column.
 That is also why `is_deletion` / `is_redundant` are present on the frame in all four modes:
 `mask_coverage_windows` runs as part of that unconditional GC stage.
+
+### The pipeline runs TWICE, and the first HMM censors the second run
+
+Every fit in CNery is contaminated by real copy-number variation.
+`mask_coverage_windows` censors on two crude proxies computed once on
+*uncorrected* coverage — `is_deletion` (≤10% of the global median) and
+`is_redundant` (any repeat overlap) — and an **amplification is caught by
+neither**, so it goes into the GC LOWESS and the OTR tent at full weight. The HMM
+knows where the copy-number variation is; nothing else in the pipeline does.
+
+```
+PASS 1   censoring: is_deletion | is_redundant
+  process_multi_genome:  preprocess -> pool -> mask -> pooled GC fit g1 -> apply
+  per sequence:          GC skew -> otr_fit (gate + arbitration) -> tent T1 -> apply
+  per sequence:          run_HMM(write=False)                              -> CN1
+
+  is_cn_variant := (CN1 != 1)          <- add_cn_censor(), folded into exclude_from_fit
+
+PASS 2   censoring: is_deletion | is_redundant | is_cn_variant
+  pooled GC refit g2 on raw/(g1*T1)    ->  G = g1*g2,  gc_corr_norm_cov = raw/G
+  per sequence: full otr_fit on raw/G  ->  T2          (the gate RE-RUNS)
+  per sequence: run_HMM(write=True)    ->  the published calls, plots
+```
+
+This is alternating conditional fitting: `g2` is fitted on the residual with the
+current tent removed, `T2` on the residual with the current GC curve removed.
+
+- **The second OTR fit reads `raw/G`, never the residual `raw/(g1·T1·g2)`.** A
+  tent has to be fitted to a series that still *contains* the ramp; fitting the
+  residual would return a near-flat tent and the correction would collapse.
+  `refit_gc_bias_pooled` therefore writes `gc_corr_norm_cov = raw/G` — the column
+  and its own factor `gc_corr_fact = G` finally agree, which for one release they
+  did not. The pass's own before/after, `raw/(g1·T1)` → `raw/(g1·T1·g2)`, is kept
+  separately as `gc2_resid_cov` because the figure draws it and nothing else
+  should consume it. `test_the_next_otr_fit_reads_raw_over_the_total_curve` pins
+  the distinction.
+- **`raw/G` is deliberately NOT flat against GC**, and reading its GC span as a
+  regression is a mistake: `G` includes `g2`, which was fitted to flatten the
+  *tent-corrected* series, so `raw/G` carries exactly the GC trend that the tent's
+  own GC-projection implies (12.11% on `p5_75k_exp`). Dividing by `T2` removes it,
+  and the FINAL column is what should be judged.
+
+Span of a LOWESS of coverage against GC over the 1st–99th GC percentile, at each
+stage — note `raw/G` is an intermediate, not a result:
+
+| sequence | raw | `raw/g1` | `raw/(g1·T1)` | `raw/G` | **final** |
+| --- | --- | --- | --- | --- | --- |
+| `p5_75k_exp` | 18.27% | 1.20% | 10.27% | 12.11% | **0.93%** |
+| `p1_shift` | 70.30% | 0.56% | 2.67% | 3.34% | **0.46%** |
+| `adp1` | 12.85% | 1.03% | 1.74% | 2.44% | **0.81%** |
+| `cwbi:chromosome` | 12.23% | 1.99% | 2.25% | 2.64% | **1.74%** |
+
+- **Composition is exact and `gc_corr_fact` is the TOTAL.** Both passes are
+  functions of GC alone, so `G = g1·g2` is a single curve. `gc_corr_fact` holds
+  `G`, which is what `bias_offsets` feeds the HMM; the components stay on the
+  frame as `gc_corr_fact_pass1` / `_pass2`, and all three are drawn in
+  `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at the extremes, so the
+  second pass is mostly *removing* correction the first over-applied to the
+  replication ramp.
+- **The GC refit is pooled and applied to EVERY sequence**, including ones where
+  no ramp was found — GC bias belongs to the sequencing chemistry, so one curve
+  should describe the run rather than a different correction reaching each
+  reference depending on whether its own OTR fit cleared a gate.
+- **An undetected ramp again means bit-identical coverage.** Because
+  `gc_corr_norm_cov` is now `raw/G`, the GC correction is fully accounted for
+  before the OTR stage runs, so "no tent detected" means the OTR stage contributed
+  exactly nothing. `test_no_tent_is_applied_when_no_bias_is_found` asserts that
+  directly again, instead of having to divide `g2` back out first.
+- **The pooled refit is what forces the pass structure.** It cannot run until
+  every sequence is OTR-corrected *and* called, and the published HMM must not see
+  coverage that is about to change.
+  `tests/test_authentic.py::_run_pipeline` mirrors that split — that harness
+  silently diverging from `main()` has cost real debugging time twice.
+
+#### What the censor is worth, and what it costs
+
+- **It changes no copy-number call on the corpus** — 0 windows on all 8
+  sequences. What moves is the *evidence*: censoring the amplification takes
+  `adp1` from r² 0.051 (p = 0.32) to r² 0.240 (p = 0.001) and `p5_75k_exp` from
+  r² 0.473 to 0.943. The coverage arm now stands on its own where it previously
+  needed the GC skew to carry it, and `adp1` acquires a live likelihood-ratio test
+  for the first time (p = 0.167, still deferring to the skew).
+- **The skew arm's anchors now honour the censor too, and amplitudes DO move.**
+  `_otr_skew_candidate` used to rebuild its own mask from `is_deletion |
+  is_redundant`, silently dropping `is_cn_variant`, so the anchors a skew-sourced
+  tent APPLIES were solved on contaminated data in both passes. That is why this
+  bullet once read "amplitudes barely move" (`adp1` 1.0673 → 1.0725,
+  `cwbi:chromosome` 1.1690 → 1.1699) and explained CWBI's ratio not falling toward
+  1.075 as the amplification "never being what those anchors were fitting" — that
+  explanation was wrong; the anchors simply never saw the censor. `otr_fit` now
+  passes its own `fit_mask`. Measured: `cwbi:chromosome` 1.1699 → **1.0784** (the
+  1.075 the excision experiment predicted; its CN-34 call becomes 35),
+  `adp1_mgd06_lb` 1.0725 → **1.1543**, `p5_75k_exp` 2.0791 → 2.0762, and
+  `ltee_ara_m3_38k` 1.0697 → **not corrected**: censoring its 187 CN ≠ 1 windows
+  (2.3%) turns the anchors to 0.979, so its old ramp was the citT amplification.
+  On ADP1 IG0622 the same bug let a 25–29× Himar1 element invert the anchors
+  (1.0243 vs 1.0274) and reject a correct skew in both passes.
+- **`CN_CENSOR_MIN_KEEP = 0.5`.** If the censor would leave under half a
+  sequence's windows it is declined and pass 2 censors exactly as pass 1 did — a
+  genuinely duplicated replicon is every window at CN=2, and censoring it entirely
+  is an empty fit, not a clean one. The floor is checked on what SURVIVES, so
+  deletions and repeats already excluded count against it. CWBI's `plasmid_1`
+  trips it on the corpus.
+- **The gate re-runs in pass 2 and its p-values are the reported ones.** Pass 1's
+  are kept beside them under `... (pass 1)` keys, so a verdict that changed under
+  the censor is legible from the file alone.
+
+#### Polymorphism mode calls a continuous level, and asserts no mechanism
+
+`-p/--polymorphism-mode` decodes over a grid of coverage **levels** instead of the integers.
+`--copy-number-resolution` (default 0.05) sets the spacing. It is **strictly opt-in**: consensus
+mode is bit-identical, which `tests/test_hmm.py::TestConsensusPathIsUnchanged` pins directly and the
+eight `_break_pts.csv` goldens pin end to end.
+
+**A level is a measured relative depth and nothing more.** 1.3 may be a subpopulation carrying a
+duplication, a mixed sample, or aneuploidy; the mode does not claim to tell them apart. The absence
+of a mixture model is a **decision, not an omission** — there is no cell-fraction parameter to fit
+and none should be added without a reason to believe the mixture is identifiable from depth alone.
+This is the stance `relative_copy_numbers()` already takes with `"Relative copy number": 2.953`.
+
+**The grid.** `polymorphism_levels()` is `resolution`-spaced over `[0, 1]` *and* `[1, 2]` — a
+partial loss is as real a measurement as a partial gain — then the integers up to
+`robust_state_count`'s ceiling. Built with `linspace` per unit interval, so **1.0 and 2.0 are exact
+grid members by the endpoint contract rather than by luck of floating-point accumulation**;
+`snap_cn_resolution` rounds `r` to `1/round(1/r)` for the same reason and reports when it does. That
+matters because `_default_log_start()` reads the row of level 1.0 and `add_cn_censor` tests against
+it exactly — at `r = 0.03` an unsnapped grid runs `... 0.99, 1.02 ...` with **no single-copy state on
+it at all**, which is not a subtle failure but is a silent one.
+
+**The off-diagonal is weighted by level SPACING, not by state count**, and on the integer grid that
+is the historical `change_prob / (n_states - 1)` bit for bit — this is the old prior rewritten in
+units that survive a non-uniform grid, not a new one. `level_spacing()` uses a central difference
+with **full-step ends**; the natural-looking half-width Voronoi convention gives 0.5 at the
+boundaries and silently moves every probability in the matrix (measured: it breaks bit-identity at
+`n_states` 5, 8 and 39).
+
+Two things go wrong under count-weighting. The prior would depend on the resolution rather than on
+the data — widening the grid from 6 to 140 levels costs a segment 21.6 → 28.3 nats. And, worse, it
+would break refinement: `sum(w)` is the grid's **span**, not its count, so adding levels *inside*
+the existing range leaves every other transition's price untouched and refinement stays a local
+perturbation. Under count-weighting, refining one band re-prices every transition in the genome, and
+a segment megabases away could change call as a pure resolution artifact — indistinguishable, in the
+output, from data.
+
+**The fold-change kernel and the interior discount are unchanged, scope included**: both still apply
+only between two levels at or above 2.0. Extending the kernel down to baseline was measured and
+rejected. It is not needed — 46,000 windows of flat synthetic coverage on the `r = 0.05` grid come
+back **100% at level 1.0 in a single segment** either way — and at β = 2 it charges 28.4 nats for a
+1.00 → 1.05 step, roughly tripling the evidence a real subclonal segment must produce. Left alone, the
+prior already demands, on the shipped `r = 0.05` grid, **27.8 nats** to enter and leave a level near
+baseline — ~592 windows (59 kb at `-w 100`) for a 1.05 call, ~148 (15 kb) for 1.10 and ~16 (2 kb)
+for 1.30. That is the protection that keeps a flat genome whole, and it is why the kernel does not
+need to reach down to baseline as well.
+
+**The baseline is re-anchored on the calls, and this is not optional.**
+`fit_censored_negative_binomial` censors to `[0.5, 1.5] × mode`, which excludes an integer
+amplification but **cannot** exclude a subclonal one: a level of 1.1–1.5 lies inside that band by
+construction, so *the very events this mode exists to find are the ones that bias its baseline*.
+Measured with the truth known: a 20% block at 1.30 pulls the fitted `mu` **4.4%** high and a 30%
+block at 1.10 pulls it **2.6%** high, which on a fine grid reads as **100%** and **51%** of the
+genome called off single copy. So each round re-estimates `mu` from the windows on the modal level —
+single copy by definition, the same assumption `_censor_bounds()` already makes — using the
+**continuous MLE** `sum(counts)/sum(offsets)` over them. Anchoring on the *quantized* modal level
+instead overshoots, because the level is only accurate to half a step and the correction lands on the
+far side: measured, that left the 1.10 case with 51% of the genome still off baseline where the MLE
+converges in one round. This is alternating conditional fitting, exactly like the pooled GC refit
+between the two pipeline passes, and it is a no-op once the mode sits at 1.0.
+
+**Refinement above the fine band.** A coarse level is refined only when (1) its segment spans at
+least `CN_REFINE_MIN_WINDOWS = 3` windows — same argument as `robust_state_count(support=3)` — and
+(2) the segment's own pooled level MLE sits further than half a step from the call. Condition (2) is
+the termination *proof*, not a heuristic: if the MLE is within half a step, the current level is
+already the nearest point of the grid we would add, so refinement **provably cannot** move the call.
+That is what stops a clean CN-3 amplification buying 25 states to confirm it is 3. Fine levels are
+never re-refined, so the loop terminates by construction; the round caps are backstops.
+
+**Resolution is absolute in the fine band and relative above it** (`refine_step`), the two agreeing
+exactly at the edge. Relative above it because the prior is scale-free: at copy number 34 an absolute
+0.05 step is 0.15%, which the fold-change kernel prices at **943 nats** — an absolute grid there
+would spend ~38 states the decode is then forbidden to use, and a uniformly spaced grid under a
+log-spaced prior is a contradiction the decode resolves by ignoring most of the grid. Relative
+spacing degrades into the integers above copy number ~`2/resolution`, which is the correct limit. A
+refinement that would exceed `CN_MAX_LEVELS` is **declined and reported**, never silently coarsened —
+same principle as the copy-number ceiling warning.
+
+**The CN censor's band under `-p` is ONE GRID STEP** — `|cn - 1| > resolution` — which is neither
+`np.rint`'s half unit nor exact equality, and the reason is a corpus measurement.
+
+Exact equality was implemented first and is wrong. It censors 51–66% of the windows on four of the
+eight sequences and tips three of them past `CN_CENSOR_MIN_KEEP`, which silently reverts pass 2 to
+pass 1's censoring. The diagnosis is in *where* those windows sit: almost all of them are at exactly
+0.95 or 1.05, one step either side and roughly symmetric — cwbi's chromosome reads 2261 windows at
+1.00, 2045 at 1.05 and 1938 at 0.95 — and the two worst sequences (`p5_75k_exp`, `cwbi:chromosome`)
+are the two with the strongest residual replication ramp. **That is leftover GC/OTR bias being
+resolved at the grid's own limit, not copy number**, and censoring it strips the bias fits of exactly
+the windows that inform them. One step is the finest distinction the model claims to make, so a
+window one step off baseline is not a variant it can stand behind. The threshold is `resolution`
+itself, not a new constant.
+
+The cost is explicit: a genuine subclonal event at exactly 1 ± `resolution` stays in the pass-2 fits.
+It is by construction the smallest level the grid can express, and at that size it is not separable
+from residual bias anyway. With this band the censor applies on 7 of 8 sequences; the one that
+declines is CWBI's `plasmid_1`, which **already** declines in consensus mode because 52% of its
+windows are repeats — an unrelated and pre-existing reason.
+
+A side effect worth knowing: under `-p` the censor now catches subclonal events that consensus mode
+cannot see at all. On a synthetic 400 kb reference carrying a 1.35x block over 100 kb, pass 1
+censors exactly the 500 windows of that block from the pass-2 GC/OTR fits; in consensus mode the
+same block rounds to CN 1 and stays in them. So `-p` improves the bias fits as well as the calls.
+
+Measured with this band, on windows consensus mode calls CN 1, the fraction within one step of
+single copy is **0.940–1.000** across the corpus. And rounding the continuous calls reproduces the
+consensus call on **99.6–100%** of windows on all eight sequences: the mode refines calls, it does
+not move them. `TestPolymorphismOnRealCoverage` pins both.
+
+**`-p` output is not breseq-consumable, deliberately.** `_break_pts.csv` keeps its three columns, so
+breseq's fatal column assert still holds, but `State` is fractional and breseq parses that field into
+an AMP's `new_copy_number` as an integer. This is an accepted, opt-in-only break — breseq never
+passes `-p` — in the same spirit as the `"Termius"` spelling fix, and it is recorded here rather than
+left to be discovered. **In consensus mode `State` stays `int64`**, and that dtype is part of the
+contract: `run_HMM` passes `levels=None` into `HMM_copy_number` unless `-p` is set, precisely so the
+path index is written straight through. Passing the levels array in both modes writes identical
+*values* as float64 and fails all eight goldens on dtype alone — which is how that was caught.
+
+**Cost.** At CLI defaults the transition matrix is already non-flat (`r = 1e-8/1e-6 != 1`), so
+production runs already decode with the general O(K²) recursion and polymorphism mode is not a
+regression in kind. Measured decode of 46,000 windows: 0.13 s at K = 6, 0.25 s at K = 44, 0.54 s at
+K = 78, 0.92 s at K = 118 — against `preprocess`'s ~4 s, the extra rounds are free.
+
+#### The fragment size is chosen from the data unless `-f` is given
+
+`frag` sets the neighbourhood each window's `gc_percent` is measured over. It
+models the sequenced fragment, which is where Illumina GC bias physically arises,
+so the right value is a property of the **library** — something a user may not
+know and cannot read off a coverage table. `-f` therefore defaults to `None`,
+meaning "scan"; passing a value pins it.
+
+**The grid.** `FRAG_SCAN_GRID` is
+`100, 150, 200, 250, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 2500`,
+filtered by `frag_candidates(win)` to those at or above the window size.
+
+- **The lower bound is `win`, and that is not a convention.** `preprocess`
+  measures GC over `max(frag, win)`, so every candidate at or below the window
+  size is the *same computation* — a 150 bp "fragment" and a 400 bp one are
+  bit-identical at `-w 500`. Offering them would let the scan choose between
+  duplicates and report the difference as signal.
+- **Roughly geometric** (ratios 1.20–1.50) because fragment-scale effects are
+  multiplicative: 150 → 200 changes the averaging window by 33%, 800 → 850 by 6%.
+  Deliberately coarsest at the low end, where the measured optima are shallow and
+  the argmin jitters, so finer spacing would offer resolution the data cannot
+  support.
+- **Fewer than `FRAG_SCAN_MIN_CANDIDATES = 4` survivors and the scan declines**
+  rather than choosing among near-duplicates. That is what happens at large `-w`.
+
+**The criterion is held-out prediction error, and the obvious alternative is
+circular.** Candidates are scored by 5-fold CV MSE of coverage predicted from the
+GC they imply. Judging instead by "how flat is the corrected coverage against GC"
+cannot work: the correction is a LOWESS of coverage *on* `gc_percent(frag)`, so it
+flattens that axis by construction whatever frag it was handed. Measured, every
+candidate looks best on its own axis — `adp1_mgd06_lb` reads 0.63% residual trend
+at its own 400 and 4.98% at 150, and at frag 150 it reads 0.62% and 1.88% the
+other way round.
+
+**Two confounds, both of which had to be controlled before the answer meant
+anything.** `frag_scan_target` handles all three parts:
+
+- **Copy number.** `cwbi_ssym_ht04`'s chromosome carries a CN-34 amplification
+  whose variance swamps every GC effect — held-out MSE 2.64 against 0.01–0.2
+  elsewhere, and an apparent optimum 0.04% deep, i.e. noise. Only windows the
+  first pass called CN = 1 are scored.
+- **Position.** At large frag, "GC" becomes a long-range average that tracks
+  genomic coordinate, so it can predict coverage by proxying the replication ramp
+  rather than by modelling chemistry. The fitted tent is divided out first.
+  Uncontrolled, the scan picks the top of the grid on two of eight sequences.
+- **Replicon level.** The scan is pooled, and `norm_raw_cov` is normalised against
+  the POOLED median, so CWBI's plasmids sit at 2.95× and 1.90× against a
+  chromosome at 1.0. At a large fragment size a short plasmid's GC is nearly
+  constant, which turns GC into a **replicon label** predicting those levels
+  perfectly. Measured, that alone made the integrated scan pick 2500; normalising
+  each sequence to its own median first brings it back to 400.
+
+**Selection and judging use different windows.** The winner is chosen on one half
+and tested against the default on the other. Testing the winner on the data that
+chose it is the classic selection-bias error — with 14 candidates a pure-noise
+series produced a "significant" improvement and selected 500 over the default. The
+default is kept unless the winner beats it out-of-sample by more than the standard
+error of the paired per-fold differences, so there is no invented threshold.
+
+**Measured on the corpus**, at the CLI defaults: `adp1_mgd06_lb` → 150 and
+`ltee_ara_p1_50k_shift` → 250 (the two deepest optima, 3.2% and 40%); the other
+four keep 400. `ltee_ara_m3_32k_2rg` is the instructive one — its best candidate
+is 500 but it does not survive the held-out test, which is right: its optimum is
+5% deep and flat, and its argmin jitters across four values on independent splits.
+
+**It runs AFTER pass 1, and a changed answer costs a second pass 1.** The scan
+needs the tent and the copy-number calls to control its confounds, so by the time
+a size is chosen the pooled GC curve was fitted against the *old* `gc_percent`.
+`apply_frag_size` rebuilds both together — a curve fitted on one GC axis and
+applied on another is not a correction — and `get_CNV.main` then re-runs pass 1.
+The provisional pass is silent; only the final one prints.
+
+**The goldens are unaffected because `tests/test_authentic.py` pins `frag`
+explicitly**, which counts as user-specified. The scan is exercised instead by
+`TestFragmentSizeScanAtCliDefaults`, which has to run at `-w 100`: at the goldens'
+`-w 1000` most candidates collapse into each other and the scan declines outright.
+
+#### The GC correction is an ESTIMATE, and the HMM is told how good a one
+
+`bias_offsets` hands `run_HMM` a LOWESS fit evaluated at each window's GC.
+Treating that fit as exact understates the emission variance, and understates it
+**more at high copy number** — the offset's error is multiplied by `k`. Writing
+`o = ô(1 + ε)` with `Var(ε) = τ²`, the law of total variance gives
+
+```
+Var(y | k) = m + m² · (1/(k·size) + τ²)          m = k · mu · ô
+```
+
+so the uncertainty adds in the reciprocal-size scale and the extra term `m²τ²`
+grows as **k²**. The emission row for state `k` therefore uses
+`k·size/(1 + k·size·τ²)`.
+
+- **The k² scaling falls out; it is not imposed.** That is the whole reason this
+  is a derivation rather than a knob, and it is why the correction is negligible
+  at CN 1 and largest exactly where the offset is multiplied up.
+  `test_the_added_variance_grows_as_k_squared` pins the exact form —
+  `Var_with/Var_without − 1 = k·mu·τ²/(1 + mu/size)`, strictly linear in `k`.
+- **The effective size must be formed PER STATE**, `k·r/(1 + k·r·τ²)`, not
+  `k·(r/(1 + r·τ²))`. The second is the natural-looking refactor and it silently
+  flattens the k² property to a constant.
+- **τ is measured, never chosen.** `_gc_curve_tau` resamples the fit windows,
+  refits the LOWESS on a 200-point GC grid `GC_TAU_SURROGATES = 100` times, and
+  takes the sd of `log(curve)` — a relative sd, which is the form a
+  multiplicative offset needs. Seeded, so goldens are stable.
+- **Why no percentile or window-count rule works.** LOWESS uses a
+  nearest-neighbour bandwidth (`frac=0.3`), so every fitted point averages the
+  same ~0.3n windows — at GC 0.62 on `ltee_ara_m3_32k_2rg` there are still
+  ~12,700 in the neighbourhood. The tails are not sparse; they are **one-sided**,
+  so the local linear fit extrapolates within its own window. That is a boundary
+  effect, invisible to any count-based rule, and resampling is what sees it.
+  Measured τ is U-shaped: interior 0.0030, rising to 0.0095 at the 99.5th GC
+  percentile and 0.0225 at the extreme.
+
+**What it does, measured at the CLI defaults.** Exactly one thing:
+`ltee_ara_m3_32k_2rg` goes 31 → 29 segments, dropping an 11-window **CN-4 sliver**
+that sat inside a 263-window CN-3 amplification. Those windows are at the 99.5th
+GC percentile, where the offset is divided down to 0.82 and the corrected level
+reads 4.2 — a GC excursion wearing a copy-number costume. **Zero windows move on
+the other seven sequences**, and no golden changed, because at the goldens'
+`-w 1000 -s 500` the correction is a measured no-op. That is why
+`tests/test_authentic.py::TestOffsetUncertaintyAtCliDefaults` runs its own two
+datasets at `-w 100 -s 100 -f 400`; without it the whole mechanism could be
+deleted with the suite still green.
+
+- **`adp1_mgd06_lb` is the negative control and is not optional.** Its CN-3
+  amplification contains 4 windows *below* the 0.25th GC percentile — the
+  opposite excursion. Discounting evidence where the curve is uncertain is
+  sign-blind, so it must leave that block whole, and the test asserts it does.
+- **The fix has a working band, not unlimited headroom.** It holds from 1× to 2×
+  the measured τ, but a **uniform** 4× inflation brings the sliver back at five
+  times the size (55 windows) and loses the CN-12 call, because it also inflates
+  the interior where the fit is sound. The *shape* of τ matters, not its scale.
+  Do not "strengthen" this by scaling it.
+
+**Two alternatives were measured and rejected. Do not retry them.**
+
+- **Clamping the GC correction at the tails.** It changes the point estimate, so
+  it necessarily helps one sign of excursion and hurts the other: at 0.5% tails
+  it merges `m3_32k` (31 → 29) and *splits* `adp1` (7 → 9), a wash. Its threshold
+  is also non-monotonic — at 1% and above the sliver returns **worse** (22 windows
+  against 11 unclamped), because the clamp is a global refit that shifts `mu`,
+  the state count and `g2`.
+- **A fixed-width GC kernel.** Its point estimates agree with the rank-based one
+  to ≤2% over the 1st–99th percentile and across a 12× bandwidth range, and both
+  fix the artifact. It would cost a hand-rolled smoother, sparse-GC guards and a
+  full golden regeneration for no measured gain in what is actually applied. It
+  does report tail uncertainty better (τ 4× larger, 5–6× tail/interior contrast
+  against 3×), which is the one real argument for it.
+
+**`frac=0.3` is CV-validated, not an unexamined constant.** 5-fold
+cross-validation cannot separate it from any bandwidth in 0.05–0.50 (within
+0.03% MSE on both `m3_32k` and `adp1`); only 0.02 is clearly worse, at 49%. It is
+also a sensible density-adaptive rule in disguise — measured at **0.26–0.44 × the
+GC standard deviation** across six references, median 0.32. Its one weakness is
+the tails, where the 30% neighbourhood spans 2.4–4.0 × the GC sd.
+
+#### Neighbouring windows are not independent, and the emissions are told so
+
+Viterbi scores each window as an independent draw given its state. Window depths
+are not independent: a 150-bp read spans two 100-bp windows, mates land a few
+windows apart, and library bias acts at the fragment scale. Measured on four ADP1
+samples (`-w 100 -s 100`, after the GC and OTR corrections, CN = 1 windows): lag-1
+ACF 0.55–0.63, a second bump at lags 3–5 (0.28–0.40), and a 10-window mean with
+**3.4–4.7×** the variance independence predicts. A 1-kb excursion therefore entered
+the decode as 3–5× the evidence it carries, and that is exactly what those samples
+were calling: 0.4–1.5 kb CN = 2 segments at 1.6–2.3× with no junction, no read-pair
+or duplicate anomaly, no `-M` pseudoread excess, and no step edge in the profile.
+`step/window` (`overlap_weighting`) only ever covered the share of this that
+overlapping windows create by construction, and at `-w 100 -s 100` it is 1.
+
+- **`emission_autocorrelation_inflation` measures the discount; nothing chooses
+  it.** τ is the first lag at which the residual ACF drops below 1/e
+  (`_otr_autocorr_length`), and the inflation is the batch-means variance ratio
+  over blocks of `OTR_BLOCK_AUTOCORR_MULTIPLE · τ` windows — the block length the
+  OTR bootstrap already established as the one that holds nominal size. The
+  emission weight becomes `min(step/window, 1/inflation)`: a MIN, never a product,
+  because overlap-induced correlation is part of what the ACF measures. Printed per
+  run ("window autocorrelation inflates per-window evidence 3.05x…").
+- **Copy number cannot inflate its own discount.** The residual is
+  `counts/(mu·offset) − 1` on windows that are not redundant, not `is_cn_variant`
+  (pass 2), and inside `_censor_bounds`' [0.5, 1.5] × mode band — so a CN-25 element
+  or a deletion contributes nothing. Independent counts measure 1.0 ± 0.08, with or
+  without such events, and `test_independent_windows_are_not_discounted` pins it.
+- **Measured effect.** ADP1: 12 short CN ≠ 1 calls → 4, the survivors being the
+  ones ≥ 2× raw (ACIAD1795 recurs in independent libraries), with the Himar1 element
+  (CN 9–25), a transposon-bounded 14-kb CN-3 and every large deletion kept. It also
+  removed IG0627's GC-tail call (0.24× raw depth at 19% GC, called CN = 2). The
+  cost: IG0647's one-window CN = 0 over ~200 bp of zero depth is no longer called
+  (breseq's own MC evidence still reports it). On the corpus at the goldens'
+  windowing exactly one segment moves — `m3_32k`'s 19.5-kb CN-4 block inside the
+  citT CN-3 amplification merges into CN-3 (21 → 20 segments).
+
+#### Why re-running the gate on censored data is safe HERE
+
+CLAUDE.md used to record that an iterative fit–censor–refit loop took the OTR
+false-positive rate from 0/8 to 4/8, because excising 1–2% of windows removes
+87–98% of the variance the bootstrap was calibrated against. That measurement was
+on a **residual-driven** censor: it excised the interval where the tent under test
+fit worst, so the selection served the hypothesis. The HMM censor does not look at
+the tent's residual at all.
+
+Measured, on synthetic coverage built on `adp1`'s real geometry and GC with the
+truth known — flat AR(1) trend at the measured 83-window scale, negative-binomial
+counts, 60 seeds per arm, coverage-fit gate at a nominal 1%:
+
+| arm | pass 1 clears | pass 2 clears |
+| --- | --- | --- |
+| flat, no amplification | 3% | **3%** |
+| flat + CN-3 amplification | 0% | **3%** |
+| 1.5× ramp + CN-3 amplification | **0%** | **100%** |
+
+Two things to read off that. The censor does **not** inflate the false-positive
+rate: it returns the gate to its own baseline (3% at a nominal 1% — the gate is
+mildly anti-conservative on this synthetic, and was already), which the
+amplification's variance had been artificially suppressing to 0%. And the last row
+is the whole point: a real 1.5× ramp with an amplification on top is detected
+**0/60 times** without the censor and **60/60 times** with it.
+
+- **The variance-collapse effect is real and is not the failure it looks like.**
+  Censoring 2.71% of `adp1`'s windows takes the weighted SST of the decimated
+  series from 433.9 to 72.2 and its tent r² from 0.016 to 0.463. The bootstrap
+  null resamples the same censored series, so it carries the same SST; what
+  changed is that the amplification is no longer a block no tent can fit,
+  dominating both numerator and denominator.
+- **Do not build a ramp-free control by dividing out the best-fit tent.** It was
+  tried and it is invalid: that tent is fitted on *contaminated* data — on `adp1`
+  it sits inside the CN-3 amplification — so what is left is (real ramp − wrong
+  tent), which still contains a ramp. Censoring then lets the fit find it, and the
+  control reads 4/8 "false positives" that are nothing of the kind. The measured
+  giveaway was a residual with τ = 1 cell over a series with τ = 223. Build the
+  null synthetically, where the truth is known.
 
 ### Multi-genome flow
 
@@ -170,6 +673,89 @@ sample**. Passing two samples' tables together cross-normalizes them against eac
 
 Note that `process_multi_genome` does no globbing: resolution is the caller's job, so that bad inputs
 are rejected before `get_CNV.main` creates any output directory.
+
+### Reference groups: several tables that are one molecule
+
+`--group-table` declares which coverage tables are contigs of ONE reference — breseq's `-c`. The
+unit of the background coverage distribution then becomes the **group**, not the sequence.
+
+**The bug it fixes.** `run_HMM` refits `mu` from whatever frame it is handed, so a contig is
+called CN 1 by construction whatever its real copy number. `cwbi_ssym_ht04` shows it on real
+data: its plasmids sit at 2.9531× and 1.8980× the chromosome, are published as
+`"Relative copy number"`, and are both called CN 1 (fitted mu 100.9 / 300.0 / 194.6). Grouped,
+they call 3 and 2 — `TestReferenceGroupOnRealCoverage` pins both directions.
+
+**A sequence in no group is a group of ONE.** `resolve_reference_groups` returns a mapping that is
+total over the inputs, so no consumer carries an `if grouped:` — the only predicate anywhere is
+`len(members[group_id]) > 1`. That is also what makes the invariant testable, and the invariant is
+the design: **a run with no `--group-table` and a run whose table groups nothing produce
+byte-identical output**, pinned end to end by
+`tests/test_cli.py::TestReferenceGroups::test_an_all_singleton_table_is_byte_identical_to_no_table`
+(PDFs by name only — matplotlib stamps a `CreationDate`; do not "fix" that by comparing bytes).
+
+**The table names FILES, exactly.** Columns `file` and `group`; any other column is ignored.
+Relative paths resolve against the table's own directory. There is deliberately **no stem matching
+and no ending inference**, unlike `genome_id_from_path`: a near-miss between breseq's sequence ID
+and the name CNery derives from a file is the failure this handoff invites, and matching it loosely
+would turn that into a silently *ungrouped* run — reproducing the very bug the table exists to fix.
+For the same reason the table must correspond to the run exactly in both directions; a row with no
+input, or an input with no row, is an error and not a warning. With no positional `INPUT`, the
+table also **supplies** the coverage tables to read, which is what keeps breseq's command line to
+one line on a 137-contig assembly.
+
+**`run_HMM` is `run_HMM_group` on one member**, literally — a wrapper, so the two cannot drift.
+Every pooled step is written so that pooling one member is the same numpy call on the same array
+(`np.concatenate([a])` is a copy of `a`, a max over one element is that element, a union of one set
+is that set). Eight goldens depend on it; if one moves, the refactor is wrong, not the golden.
+
+| shared across the group | why it must be |
+| --- | --- |
+| the read-count median behind `otr_gc_corr_rdcnt_cov` and `plot_copy`'s second axis | two contigs of one library would otherwise carry two read-count scales; `group_read_count_scale` is the single definition both use, because computing it twice is how that alignment was lost before (CN-1 line drawn 56% and 92% too high) |
+| the offset anchor | an offset is meaningful only up to a constant, trading off against `mu` — re-centred per member, one `mu` means a different depth on each and the shared fit is void |
+| `fit_censored_negative_binomial`, so `mu` and `size` | the point of the feature |
+| the `min_called_windows` verdict | per contig, a 20 kb contig reverts to observing repeat windows while its 3 Mb sibling censors them |
+| the level grid, refinement included | members on different grids produce `State` values that are not comparable and are priced differently |
+| `_baseline_mu` under `-p` | **correctness, not polish**: it takes the modal level OF THE FRAME IT IS GIVEN, so run per contig every contig's mode is 1.0 by construction and the shared baseline is undone in round 1 |
+| `add_cn_censor`'s `CN_CENSOR_MIN_KEEP` floor (`cn_censor_keep_fraction`) | the floor asks whether enough of *the thing with one baseline* survives, and the verdict must be uniform or one contig's pass-2 fits see the censor while its sibling's do not, both feeding the same pooled `g2` |
+
+| NOT shared | why |
+| --- | --- |
+| the decode | contig order is unknown, so **Viterbi never crosses a member boundary**: a segment spanning the join asserts an adjacency nobody has evidence for, and its `Startpos`/`Segment_Size` mean nothing in either contig's coordinates — in a file breseq parses into an AMP |
+| `window_geometry` | `np.diff` over a concatenation crosses that join |
+| `robust_state_count` | its 3-window median filter would smear a peak at the head of one contig against the tail of another. Sized per member against the shared `mu`; the group takes the largest |
+| the degenerate short-circuit, and every write | one contig with no reads must not take its siblings down, and it is kept out of the group's depth |
+
+**OTR and GC skew are declined for a group of ≥ 2**, and only for ≥ 2: the justification is that
+order and orientation are unknown, which is a property of a multi-contig assembly and not of the
+group abstraction. The OTR decline reuses the existing `--bias gc`/`none` branch in `correct_one`,
+which already aliases `otr_gc_corr_norm_cov` and leaves `otr_gc_corr_fact` unwritten — exactly what
+`bias_offsets` needs. The bias mode is checked **first**, so `--bias gc` on a grouped run still says
+so. Both files are still written: the skew gets `no_skew_prediction(reason=...)` (the 1000-surrogate
+bootstrap and the PDF skipped, ~0.15 s a sequence for a coordinate that means nothing), and the OTR
+record gains `"Reference group"`, present and `null` when ungrouped so a reader never tells "not in
+a group" from "this CNery predates the key". `Windows` stays 0 in that skew record even for a
+healthy contig — it is what `_otr_skew_candidate` checks the positional indices against, and those
+ARE 0.
+
+**`relative_copy_numbers` measures the group**, pooling every member's censored windows into ONE
+median rather than averaging per-member medians (on a draft assembly those are estimates of wildly
+different precision, and pooling weights each contig by its window count). The anchor is the
+longest GROUP by summed length, so a finished chromosome beside a longer draft assembly no longer
+reads exactly 1.0. Correct, and surprising; it is in `README.md`.
+
+**`frag_scan_target` stays PER SEQUENCE and must not be made per-group.** Its normalisation
+(`core.py`) exists to stop GC acting as a *replicon label*, and contigs are the worst case for that
+confound — hundreds of short sequences, each with near-constant GC at large `frag`, each at its own
+level, is a stronger label than CWBI's two plasmids ever supplied. Under grouping a multi-copy
+contig is called CN 3 anyway, so every one of its windows becomes `is_cn_variant` and it leaves the
+scan entirely. Leaving it alone also keeps a real invariant: the chosen fragment size is a property
+of the library and does not move when references are regrouped.
+
+**Both passes are group-major** in `get_CNV.main` and in `tests/test_authentic.py::_run_pipeline`:
+per-member corrections, then one `run_HMM_group`, then per-member staging and plots. With every
+group a singleton that reproduces the old interleaving *and the old stdout*, which is what makes
+the byte-identity test meaningful. The harness mirroring `main()` has cost real debugging twice
+already, and this is where they would drift next.
 
 ### Deliberate behavior that reads like a bug
 
@@ -196,7 +782,10 @@ are rejected before `get_CNV.main` creates any output directory.
 - `apply_otr_correction` (`core.py:767`) applies the OTR factor everywhere except `is_deletion`
   windows, for the same reason.
 - The HMM stacks a geometric zero-state row on top of one negative-binomial emission row per copy
-  number, so **state index == copy number** and the matrices are `n_states + 1` square/rows. The
+  number, so on the default integer grid **state index == copy number** and the matrices are
+  `n_states + 1` square/rows. That identity is now a property of the *grid*, not an assumption in the
+  code: the emission and transition builders take an explicit `levels` vector (see "Polymorphism
+  mode" below), and passing `consensus_levels(n)` reproduces the integer behaviour bit for bit. The
   negative binomial (not Poisson) is intentional: coverage is overdispersed.
 - **The zero state's mean is a fraction of the local baseline**, `deletion_coverage_fraction * mu *
   offset` (`-z`, default 0.02), which makes it the `k = 0.02` case of the emission contract below
@@ -238,28 +827,434 @@ are rejected before `get_CNV.main` creates any output directory.
   `w=100` against 54 at `w=200`), so `-w` remains a resolution knob. That is why the default is
   `-w 100 -s 100`: at `-w 200` the weakest two-window events stop being callable.
 - `robust_state_count` sizes the state space from a 3-window rolling median, not `int(max(coverage))`
-  — with a flat off-diagonal the switch cost carries `-log(n_states)`, so one outlier window would
-  otherwise make every duplication call dearer genome-wide.
+  — the switch cost carries `-log(n_states)` from the uniform division at `per_state_prob`, so one
+  outlier window would otherwise make every duplication call dearer genome-wide. (Still true under
+  the interior prior below: that reweights rows 2 and up, and the uniform division survives in rows
+  0 and 1 and in the normalizer everywhere else.)
+- **An interior boundary — one amplified state abutting another — is priced separately, by two
+  knobs.** `--interior-change-rate` (`DEFAULT_INTERIOR_CHANGE_RATE`, 1e-8) is a per-base rate like
+  `--change-rate`, converted through the same `remain_prob_for_step()`; `--fold-change-penalty`
+  (`DEFAULT_FOLD_CHANGE_PENALTY`, 2) charges `BETA / |log2(l/k)|` nats, i.e. per doubling, so it is
+  scale-free and 1→2 costs what 100→200 costs. Both apply **only when k ≥ 2 and l ≥ 2**.
+  - **Why it exists.** The off-diagonal was one number, so CN 0 → CN 7 cost precisely what CN 126 →
+    CN 139 cost. At 6,600 reads/window the counting floor is 1.2% and the NB adds little, so the
+    emission expects ~1.7% scatter and real coverage shows ~4.4%; a 10% shoulder then reads as six
+    sigma. On SRR37077254 that split one amplification into 126 over a single window and 139 over
+    the other nine — and arbitrarily, since a window reading 127 stayed inside while one reading
+    122 did not. Measured: the split bought ~25 nats against a ~14 nat boundary; the two knobs add
+    ~14.6 at that ratio, and ~176 at a 1% step.
+  - **Rows 0 and 1 are left uniform, deliberately.** An ordinary duplication call (1→2) pays
+    nothing, and `_default_log_start()` reads row 1 as the start distribution — reweighting it would
+    quietly restate that too. State 0 is exempt as a target for the same reason it has its own
+    emission row: `log(l/0)` is undefined, and a deletion abutting an amplification is a real
+    IS-mediated configuration.
+  - **Normalizing to `change_prob` is what keeps `remain_prob` meaning what it meant.** Every row
+    still sums to 1 and the total escape probability is unchanged; only the destination moves, and
+    it moves toward baseline (from an amplified state, returning to CN 1 gets ~4 nats *cheaper*).
+    That is the biology — segments end by returning to single copy — and it cannot cause a spurious
+    drop inside an array, because the CN 1 emission at 6,600x is astronomically bad.
+  - It is a penalty, not a prohibition, and the goldens show the difference: on
+    `ltee_ara_m3_32k_2rg` it removed the two spurious 3↔4 interior boundaries that
+    `TestUncertaintySuppressesAGcSliver` documents as a GC artifact on that very dataset, while
+    leaving the 4→3 boundary at 647501 — the same 1.33 ratio — standing, because the evidence there
+    is real. That was the only one of the eight authentic goldens to move.
+  - **It overlaps `offset_tau`**: at defaults it independently suppresses 4 of the 6 seeds in
+    `TestUncertaintySuppressesAGcSliver`, whose sliver is a 1.33-fold interior step. That class
+    therefore runs with this prior held neutral, so it still measures tau and only tau.
+  - **Neutral arguments rebuild the old matrix bit for bit**, via an explicit early return. That is
+    load-bearing, not tidiness: `_flat_transition_params` detects flatness with `==`, so a neutral
+    matrix differing in the last bit would silently cost every run its O(n_states) decode.
+  - **Cost**: at non-neutral settings the matrix is not flat, so decoding is O(n_states²) per window
+    — nothing at the usual `n_states=5`, and 41 s for the whole pipeline on a 4.6 Mb genome at
+    `n_states≈139`.
+- **`DEFAULT_MAX_COPY_NUMBER` (500) is a ceiling on the grid's top LEVEL, not the grid.** (`CN_MAX_LEVELS`
+  is the separate bound, on the level *count*, that polymorphism-mode refinement is checked against;
+  the two are different units and must not be conflated.) It is the default for
+  *both* `robust_state_count(max_states=...)` and `run_HMM(max_copy_number=...)`, and must stay that
+  way: the two used to carry independent literals of 100, and because `run_HMM` always passed its own
+  value the signature that read as the authority was never consulted. That is how the ceiling stayed
+  invisible while a breseq sample's 991 bp amplification, measured at 135x, was called at exactly 100
+  — the largest state the grid held. breseq writes `prob_copy_number` straight into an AMP's
+  `new_copy_number`, so it reached the user as "991 bp x100" over a coverage plot sitting 35 copies
+  higher. `run_HMM` now says so when a call lands on the ceiling: a clipped value looks exactly like a
+  measurement, and nothing downstream can tell them apart. Raising the ceiling is free on a genome
+  that does not need it — the grid is still sized from the data — and costs memory linear in the
+  states actually used.
 - The decode is a **real Viterbi backtrace**. `make_viterbi_mat` returns forward scores only; the
   path comes from `viterbi_path`. Taking `np.argmax(logv, axis=1)` per window is *not* a path — it
   can name a state no single path passes through, which is how a 3-window amplification came out
   labelled `1,1,3`, on its lowest window. `log_transition` is indexed **`[from, to]`**.
+- **A flat transition decodes in `O(n_states)` per window, and `viterbi_path` detects that.** With one
+  value on the diagonal and one everywhere else, the best predecessor of state `l` is either `l`
+  itself (`log_remain`) or the best *other* state (`log_change`) — building the full `(n_states,
+  n_states)` `cand` to discover that is the only reason the general recursion is quadratic. Two
+  traps, both silent: the jump source must be the **runner-up** when `l` is itself the best state,
+  since the off-diagonal candidates exclude `k == l` (using the global argmax misprices an `l -> l`
+  move whenever `log_change > log_remain`, reachable with a large `changeprob` on a narrow grid); and
+  ties must break to the **lowest index**, as `np.argmax` does, or the two recursions decode
+  different — equally likely — paths and stop being substitutable. `_flat_transition_params` detects
+  flatness by exact equality rather than assuming it, because `make_viterbi_mat` is public and takes
+  whatever matrix a caller hands it. `tests/test_hmm.py::TestFlatTransitionFastPath` pins both traps.
+- `viterbi_path` passes `keep_scores=False`: `_backtrace` reads only the final row, and on a wide
+  grid the full score matrix is the largest array in the run (180 MB at 500 states over a 4.6 Mb
+  genome, against 90 MB of backpointers that cannot be avoided). `make_viterbi_mat` still keeps it.
 - `OTR_corr/<sample><seq_id>_otr_results.json` carries **`"Relative copy number"`**: this sequence's
   coverage relative to the longest sequence in the run, which reads exactly 1.0. Deliberately
   non-integral — 2.95 copies is a measurement. Computed by `relative_copy_numbers()` from the censored
   median of `gc_corr_norm_cov`, and passed *into* `apply_otr_correction` rather than carried on the
   frame: it is one scalar per sequence, and a constant column would add 226–407 kB to an 8.3 MB
   `CNV.csv`.
+- `"Origin-to-Terminus/Bias Ratio"` is plain `yori / yter`, so the file's own three numbers agree. It
+  used to be `yori / (yter + 0.001)` — a divide-by-zero guard that put the reported ratio ~0.1% below
+  what the two coverage values printed beside it give (1.06627 against 1.06733 on `adp1_mgd06_lb`),
+  so a reader checking the arithmetic found it wrong. `yter` is a least-squares anchor on a curve
+  already clipped at `otr_floor = 0.1 x` the median coverage, so it cannot be zero; the explicit
+  `yter > 0` test remains and emits `null` rather than a fabricated number.
+  `TestOriginTerminus::test_reported_ratio_reproduces_from_its_own_two_values` pins it.
 - **That JSON must stay strict JSON.** breseq parses it with nlohmann, which has no `allow_nan`, so a
   single bare `NaN` makes the whole file unparseable and silently costs it all OTR reporting.
-  `_json_safe` maps non-finite values to `null` on the way out. Two further constraints from the same
-  reader: `"Origin-to-Termius/Bias Ratio"` is load-bearing **including the typo** (renaming it makes
-  breseq's `j.count()` fail), and `"Origin window"` / `"Terminus window"` are not type-checked there,
-  so they must never be null. Adding keys is safe; `_break_pts.csv` is not — breseq asserts exactly
-  three columns and the assert is fatal.
-- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`) are created once in
-  `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
-  functions in `core.py` assume they already exist.
+  `_json_safe` maps non-finite values to `null` on the way out. `"Origin window"` / `"Terminus
+  window"` are not type-checked by that reader, so they must never be null. Adding keys is safe;
+  `_break_pts.csv` is not — breseq asserts exactly three columns and the assert is fatal.
+- **`"Origin-to-Terminus/Bias Ratio"` was `"Termius"` and the typo was load-bearing.** breseq looks
+  the key up by name with `j.count()`, so the spelling was kept wrong on purpose to keep that reader
+  working. It is now spelled correctly, which **breaks breseq's OTR reporting until breseq is updated
+  to match** — a deliberate, one-time break taken because the misspelling was in a published output
+  file that users read. Anything else about the key's contract is unchanged, and pass 1's companion
+  moved with it: `"Origin-to-Terminus/Bias Ratio (pass 1)"`.
+- `corr_plots/<sample><seq_id>_correction_stages.pdf` is the per-sequence **before/after** diagnostic:
+  one row per fitting *change* — GC and OTR — each with its own censoring strip beneath it. It is emitted in **all four `--bias` modes**, and **self-creates its directory** rather
+  than being added to `out_subdirs`, which is what lets the self-creation test assert something
+  instead of passing vacuously. Three things about it are load-bearing:
+  - **The censoring strip is drawn per row even though the rows agree today.** Both fits exclude
+    the same `is_deletion | is_redundant` set, so the two strips come out identical — which is the
+    useful reading, not a redundancy: those fits saw the same data. A step that ever sees a
+    different set then shows it where it applies rather than in one detached track.
+    (`is_deletion`/`is_redundant` are computed once in `mask_coverage_windows` on *uncorrected*
+    coverage and never revisited, so "≤10% of the global median" means something different near
+    the origin than near the terminus; the strips make that frozen-ness legible rather than
+    implicit.)
+  - **The in-band metric is divided by `censored_median_coverage` first.** Without it the measure
+    reads **0.000 for every stage and both denominators** on both CWBI plasmids — `norm_raw_cov` is
+    normalised against the *pooled* median while they sit at 2.95× and 1.90× — and three empty bars
+    would read as "the pipeline did nothing". The scaling is a no-op elsewhere (0.981–1.001 on all
+    five chromosomes).
+  - **Both denominators are reported because the LEVEL differs**, not the delta. On `plasmid_1` the
+    uncensored figure reads a flat **1.000** against an honest **0.819**, since 52% of its windows
+    are repeats sitting at 0.6–0.75. The censoring strip is what explains the gap.
+- **The censoring strip needs two renderings.** Deletions are 1–15 runs of 12–55 windows and draw as
+  true spans; repeats are 79–**332** runs of **2–4 windows**, which at 9,258 windows across ~10
+  inches is ~0.001 inch each — spans there render as invisible stippling that reads as *nothing
+  censored*, so they get a binned density lane at `min(400, n)` bins. Do not fold deletions into that
+  density: a 12-window deletion in a 23-window bin reads 0.5 and understates it.
+- **`OTR_STAGE_ROWS` is a table rather than "whatever columns are present"** because `--bias otr`
+  aliases `gc_corr_norm_cov = norm_raw_cov` (`get_CNV.py`), so a GC row there would plot a
+  bit-identical copy of the raw series under a label that is false.
+- Output subdirectories (`CNV_plt/`, `CNV_csv/`, `GC_bias/`, `OTR_corr/`, `GC_skew/`) are created
+  once in `get_CNV.py`, *after* inputs are resolved so a bad invocation creates nothing; the writer
+  functions in `core.py` assume they already exist. `write_gc_skew_results` and `plot_gc_skew` are
+  the exceptions, making their own like `apply_otr_correction` does.
+- **A reference with nothing to measure is a RESULT, not an error.** Three real inputs used to take
+  a whole run down with a bare library exception naming no file: a header-only coverage table
+  (`IndexError` from `preprocess`), an all-zero one (`ValueError` from `np.interp` inside
+  `fit_gc_bias`), and — the one that will actually happen — a healthy chromosome beside a plasmid
+  that got no reads (`ZeroDivisionError` from `solve_pr`, five lines of normal-looking progress into
+  the run). Each now warns, writes the sequence its full output set, and **exits 0**, because a
+  plasmid with no reads must not cost the chromosome sharing the invocation.
+  - `no_usable_coverage_reason` classifies it, and recognises exactly two conditions: **no windows**,
+    and **no window with finite positive coverage**. It is reported in the JSON under
+    `"No usable coverage reason"`.
+  - **"Every window is a repeat" is deliberately NOT one of them.** An all-repeat replicon has real
+    coverage and gets real calls: `otr_fit` and `run_HMM` already cope by widening the mask, and the
+    only stage that could not survive it — `fit_gc_bias` — now declines to an **identity curve**
+    (flat 1.0, so `apply_gc_correction` is an exact no-op). That matters past the corrected column:
+    `run_HMM` composes its emission offsets from `gc_corr_fact`, so a fabricated curve would reach
+    the copy-number model where no bias could be measured.
+  - **Only a windowless frame gets a special branch in `main()`.** An all-zero sequence travels the
+    ordinary path end to end and reports more for it — the GC skew is a property of `ref_base` and is
+    still measured, `otr_fit` declines, `run_HMM` calls CN 0. Divert it and you throw that away.
+  - `run_HMM`'s short-circuit predicate is **the data being empty**, never `fit_result is None`:
+    `fit_censored_negative_binomial` also returns `None` on healthy-but-small frames, where the
+    moment fallback below it is live and correct.
+  - `relative_copy_numbers` ranks by `win_end.max()`, and a zero-window frame gives `NaN`. **`max()`
+    with a NaN key silently returns the first key** rather than raising, so one empty table sorting
+    first used to anchor the run on a NaN and write `"Relative copy number": null` into every
+    *healthy* sequence's JSON too. It now ranks only sequences that have windows.
+  - The empty windowed frame is built from empty **lists**, which pandas types as `object`. Left
+    that way, `pd.concat` in `process_multi_genome` promotes the *pooled* column, so one empty
+    plasmid turns a healthy chromosome's `win_st` into floats all the way out to its CSV. The dtypes
+    are cast explicitly for that reason.
+- **The OTR results JSON is written on EVERY path, and `write_otr_results` is the only writer.**
+  breseq reads it by name with nlohmann, and a missing file costs it exactly what an unparseable one
+  does. Two paths produced none at all before: `--bias gc` and `--bias none`, which return from
+  `correct_one` before any OTR stage runs — so **two of the four bias modes gave breseq nothing on a
+  completely healthy run**. They now write the declined record, with `"Correction type"` naming the
+  mode so the file says why rather than implying a fit was attempted and rejected.
+  - `declined_otr_results` builds that record with the same key set as a rejected fit, so a reader
+    never tells the cases apart by which keys are absent. `"Origin window"` / `"Terminus window"`
+    stay real ints (0 when there is no coordinate); the ratio stays the string `"Not detected"`.
+  - The dump is now `allow_nan=False`, matching `write_gc_skew_results`. `_json_safe` is a *shallow*
+    guard — top-level values only — so this is what stands between breseq and an unparseable file
+    when a future statistic arrives nested or as a width `isinstance(x, float)` misses. It is a
+    deliberate new failure mode: a run that would have written bare `NaN` was already failing, just
+    silently and in the field rather than loudly in the suite.
+- **`sample_prefix` rstrips the separator, and that fixed a real naming split.** The JSON writers
+  used `output.strip().split("/")[-1]` while `run_HMM` used `rstrip`. The default `out_dir` is
+  `"CNV_out/"` **with** a trailing slash, so by default one invocation wrote
+  `OTR_corr/chrA_otr_results.json` beside `CNV_csv/CNV_outchrA_CNV.csv` — the JSON silently losing
+  the sample prefix. The name must not depend on how the caller spelled `-o`. **This renamed both
+  JSONs under the default `-o`**, so breseq may need updating if it globs for the old spelling.
+- **The two pooled GC figures are named `GC_bias/GC_vs_NormRds.pdf` and
+  `GC_bias/GC_passes.pdf` — no sample prefix, no sequence IDs.** They are the only outputs pooled
+  across the whole run, so exactly one of each lands in a given output directory and that directory
+  is already the discriminator; everything else is per-sequence and needs `<sample><seq_id>` to tell
+  the files apart. They used to join *every* genome ID into the name, which grows without bound: a
+  137-contig draft assembly produced a 2,700-character basename and the run died inside `savefig()`
+  with `OSError: [Errno 63] File name too long` — *after* every per-sequence output had been
+  written, which made it read as a plotting bug. The count of sequences moved into the plot titles,
+  where it is legible without being a filename. **This renames both files**; breseq does not read
+  them, but a user script that globbed for the old spelling will need updating.
+- `predict_ori_ter_from_skew` (`core.py`) **does not censor** `is_deletion` / `is_redundant`
+  windows, unlike every other fit stage. GC skew is a property of the *reference sequence*, and a
+  deletion in the sample does not change the reference's base composition. Because `cum_gc_skew`
+  is a running sum, dropping a window would not merely omit it — it would displace every point
+  after it.
+- `cum_gc_skew` subtracts the mean skew before cumulating (`preprocess`). That is **not cosmetic
+  detrending**: it forces the sum to end at exactly zero, which is what makes `argmin`/`argmax`
+  independent of where the reference's coordinate 1 falls. Rotating the start by `r` windows then
+  maps the curve to `C'(k) = C((r+k) mod n) - C(r)`, a constant offset. Without it the sum ends at
+  `n * mean(skew) != 0`, the wraparound adds a linear ramp, and a circularly permuted copy of the
+  same genome predicts a different origin — which `TestGCSkewOriginTerminus` in
+  `tests/test_authentic.py` checks against the `REL606_2314906bp_shift` dataset.
+- Overlapping windows (`step < win`) count each base `win/step` times over in `cum_gc_skew`. That
+  is one uniform factor across every window, so it rescales the curve without moving either
+  extremum; no stride weighting is applied.
+- The skew estimate's confidence gate is **two conditions**: ori/ter 35–65% apart (the same band
+  `otr_fit` uses), and a circular block bootstrap p-value at or below 0.01. There is deliberately
+  **no minimum window count** — the bootstrap subsumes it, since a short sequence cannot reach
+  significance on its own, and one arbitrary constant beats two. `Sequence.skew_confident` in
+  `tests/test_authentic.py` records which sequences pass.
+- **The t-statistic is an effect size, not a test statistic.** Skew is spatially autocorrelated
+  (REL606's ACF is still 0.22 at lag 10), so t's magnitude is inflated by an unknown factor and
+  `t = 34.8` emphatically does not mean `p ≈ 1e-250`. `_replichore_t` deflates the effective sample
+  size by the `win/step` overlap factor, which stops t growing as `sqrt(win/step)` from nothing but
+  a finer stride — but that fixes double-counting only, not the autocorrelation. The p-value is
+  what carries inferential weight; t is retained because it is the readable effect size.
+- `_skew_bootstrap_p` re-runs the **whole** procedure — extrema search included — on every
+  surrogate. The breakpoints are chosen by looking at the data, so a null holding them fixed would
+  ignore that selection and be far too easy to beat.
+- **What governs the bootstrap's power is the NUMBER of blocks, not their length.** Measured on a
+  synthetic switch: 24 blocks puts p at its floor, 12 gives 0.004, 6 gives 0.035 and 3 gives 0.041,
+  whatever the block length. Hence `_skew_block_length` targets `SKEW_TARGET_BLOCKS = 20` and
+  adapts to `n`, rather than taking a fixed length. Bounded to 10–200 windows: at least the local
+  autocorrelation length, and past 200 nothing is gained while blocks are lost.
+- **p is floored at `1/(B+1)` and is an upper bound, not a measurement.** Every real chromosome
+  exhausts all 1000 surrogates and reads back exactly 0.001. `"Bootstrap surrogates"` is in the
+  JSON so that floor is legible from the file alone. Resolving further means `B ≈ 1e6` at ~90 s per
+  sequence, to say something already obvious.
+- The gate sets a flag; it never suppresses a coordinate. `GC_skew/*_gc_skew_results.json` always
+  carries the measured origin, terminus, separation, amplitude, t and p, so a rejected prediction
+  can be diagnosed from the file and the plot. Contrast the OTR JSON, which discards its
+  coordinates behind `"Not detected"`. Like that file it is written with `allow_nan=False` and
+  stays strict RFC JSON — every value in it is finite by construction, and the assertion is
+  deliberate.
+- The bootstrap is seeded (`seed=0`) so a given input always gives the same p and the goldens stay
+  stable. It costs ~0.15 s on a 4.6 Mb genome against ~4 s for `preprocess`, so roughly 3%.
+
+### Deciding whether the OTR tent is real, and whose breakpoints to use
+
+- **Everything here rests on one identity.** `_otr_design_matrix`'s rows sum to exactly 1, so for
+  fixed breakpoints the tent's column span is `span{1, u}` for a single phase vector `u` (0 at the
+  origin, 1 at the terminus, back to 0). Hence `1 - RSS/SST == r²(u, y)` — a dot product, not a
+  least-squares solve, which is what makes scoring a whole breakpoint grid across 1000 surrogates
+  affordable. It is the *same* objective the Nelder–Mead search minimizes, not an approximation.
+  Do not "simplify" `_otr_grid_scores` back into a loop over `minimize`.
+- **The decimated series carries a WEIGHT per cell, and empty cells weigh nothing.** `_otr_decimate`
+  returns `(values, weights)`, the weight being how many unmasked windows fell in that cell. Cells
+  with none used to be filled by circular `np.interp` — fabricating coverage that supports whatever
+  trend the neighbours imply, and not rarely: on CWBI's `plasmid_1`, 121 of 232 cells held no
+  unmasked window, so **52% of the scored series was invented** and the statistic read r² 0.175
+  (p = 0.034) against 0.120 (p = 0.099) once the fabrication was removed. The weighting also makes a
+  cell holding three windows count three times one holding one, which is what the full-resolution
+  objective does; equal-weighting cells silently reweighted the genome wherever censoring was uneven.
+  The cell count is capped at the number of unmasked windows, since asking for more cells than
+  observations only manufactures empty ones. In the bootstrap the **weights stay fixed at their
+  lattice positions while values are resampled** — where the repeats and deletions sit is a property
+  of the reference, and the null is "same censoring geometry, trend destroyed", not "the censoring
+  happened elsewhere".
+- **The free search is constrained to the band, and that constraint is load-bearing.** It is
+  parametrised as `(x_ori, separation)` with `separation` a box bound, seeded from the grid's argmax
+  and refined by Nelder–Mead. Unconstrained, this objective's global optimum is usually **not a tent
+  at all**: as separation → 0 the short arc vanishes and the regressor tends to
+  `1 - ((x - x_ori) mod L)/L`, a circular **sawtooth** — a straight line across the genome with one
+  free discontinuity. Same two parameters, strictly larger shape class (any monotone drift *plus* one
+  step), so RSS is monotone non-increasing as separation shrinks unless the coverage really is
+  V-shaped. Measured: fitting the pure sawtooth family alone reproduces the unconstrained optimum
+  (adp1 r² 0.1130 vs 0.1138, break at window 4820 vs 4821.2), and on adp1 that break sits on a real
+  2.7× amplification edge — it was absorbing a copy-number step, not a replication ramp. Over 40 flat
+  AR(1) nulls the unconstrained optimum landed below 5% separation 20 times and in-band 6.
+- **This was never an optimiser weakness.** Brute force (500×500 grid + local refinement + 600 random
+  restarts) confirms multi-start Nelder–Mead finds the exact global optimum on 6 of 8 authentic
+  sequences and misses by ≤0.16% on the other two. Do not "fix" the search; the constraint is what
+  matters. A fit pinned *at* the 0.35 bound is the honest signal that there is no interior optimum.
+- Two seeding details that cost real work before: seed `k` and seed `k+4` used to be
+  `(s, s+L/2)` and `(s+L/2, s)` — the same **unordered** pair, and the objective is symmetric under
+  swap, so four of nine starts returned bit-identical results. And scipy perturbs an exactly-zero
+  coordinate by an absolute `0.00025` instead of a relative 5%, which froze `x_ori` to a total
+  excursion of 0.002 windows on two sequences — a 1-D search in disguise. Seeds are now offset by
+  half a step so no coordinate is ever 0. The old masked argmax/argmin seed is gone: it converged to
+  a strictly worse minimum on five of eight sequences and never uniquely won.
+- The old gate was **separation plus a vacuous `bias_threshold`**: the label swap guarantees
+  `y_ori >= y_ter`, so `ratio > 1.0` reduced to `y_ter > 0` and nothing ever tested the tent against
+  a null. It is now separation **and** a circular block bootstrap at p ≤ 0.01, on a series decimated
+  to ≤ `OTR_SCORE_CELLS` cells so cost is independent of genome size and of `-w`/`-s`.
+- **Block length here governs validity, not just power** — the opposite of the GC-skew gate, where
+  `test_verdict_is_insensitive_to_block_length` pins insensitivity as a virtue. Measured
+  false-positive rate at a nominal 1%: 0.00 at block ≈ 5τ, but 0.10–0.33 at block ≈ τ. Hence the
+  floor at `5 * tau` alongside the block-count target. **τ must be measured on the residual of the
+  best tent**, never the raw series: the ramp is itself long-range structure, and measuring it raw
+  pushed `p5_75k_exp` from p = 0.001 to 0.034 — the test destroying its own detection.
+- **One bootstrap function covers both arms, and the shape of `phases` is the whole difference.**
+  `R > 1` is the free fit, whose breakpoints were data-chosen, so the null re-runs that selection on
+  every surrogate. `R == 1` is the GC-skew fit, whose breakpoints came from `ref_base` — the coverage
+  resampling never touches it, so no selection occurred and taking a max would be a *conservative
+  error*, not a safe default. That is why the skew arm is the more powerful of the two: on CWBI's
+  chromosome it scores a smaller statistic (0.0152 vs 0.0255) and returns a smaller p (0.213 vs 0.278).
+- **An orientation contradiction rejects the skew candidate; it never relabels it.** `otr_fit` swaps
+  its own breakpoints when they come back inverted, which is legitimate because they are unlabelled
+  and the antipodal seeds are blind. The skew's labels *are* the imported prior. Measured, 1 of 8
+  sequences contradicts (`ltee_ara_m3_32k_2rg`, ratio 0.907) and its skew tent explains r² = 0.007,
+  so what is rejected there is the sign of noise — on flat synthetic coverage the sign is a coin
+  flip (49.3% over 300 trials).
+- **When both arms are live, a bootstrap likelihood ratio decides — but only whether the coverage may
+  REFINE the skew, never whether it may replace it.** The alternative to a credible skew tent is the
+  skew's own origin with the terminus free to move by up to `OTR_TER_SHIFT_MAX = 0.10` of the
+  sequence (`_otr_terminus_grid`, `OTR_TER_SHIFT_STEPS = 41`, the skew's own terminus an exact row so
+  the models nest). That is ONE extra parameter: `Λ = m·ln(RSS_skew/RSS_ter)`. A win is refined on
+  the full-resolution objective (`_otr_refine_terminus`) and reported as `"Breakpoint source": "GC
+  skew, terminus refined by coverage"` with `"Terminus shift from GC skew (fraction)"`. The free
+  two-breakpoint tent is reached **only when there is no credible skew** (absent, unconfident, or
+  orientation-rejected).
+  - **Why.** Rejecting the skew tent says it does not explain everything — not that the free tent's
+    *locations* are right, and on real coverage the free tent chases whatever genome-scale structure is
+    left anywhere in the band. Measured on four ADP1 samples with a correct skew (oriC 3,592,701;
+    every 100-kb coverage profile bottoms out at ~1.8 Mb): the old arbitration handed three of four
+    to the free fit, putting the origin 250–517 kb off and, on IG0647, the terminus at 798,001 —
+    **1.04 Mb (29%)** from the skew's 1,838,501. The origin is held because oriC is a sequence
+    feature and the tent's peak is its least identifiable part; the terminus may move because
+    replichore imbalance and a terminus region genuinely move where forks meet.
+  - **An optimum ON the ±10% bound is declined** and the skew's terminus kept — the same reading as a
+    free fit pinned at `OTR_SEP_LO`: no interior minimum, the parameter is absorbing a trend. IG0647
+    ran straight to −10% with a residual structure score of 4.25.
+  - On the corpus only `ltee_ara_p1_50k_shift` refines (−9.2%); its tent lands 12 kb from the old
+    free fit's terminus with the origin snapped 22 kb onto the skew's, and its structure score falls
+    from 2.5 to 1.44.
+  - Run the LRT only *after* both arms have been gated, never in place of the gates. (Its history:
+    `RSS_free` over the band grid, not a fresh Nelder–Mead fit, because adp1's degenerate
+    1.1%-separation spike otherwise won at p = 0.001.)
+- **Λ's null is not χ² — now χ²(1) for the terminus-refinement test, formerly χ²(2) for the
+  two-breakpoint one — and the reason is autocorrelation alone.** With *iid* residuals the null
+  of Λ is χ²(2) to Monte-Carlo error on all eight sequences (q99 8.3–9.3 against 9.21), and stays so
+  even with the separation band removed — neighbouring tents are near-collinear, so the max over
+  change-point breakpoints costs essentially nothing. What breaks it is that real residuals stay
+  spatially autocorrelated, inflating Λ's 99th percentile by 2.8×–128× (24×–51× on the *E. coli*
+  chromosomes). χ²(2) would report p < 0.001 for **every** sequence, including `p5_75k_exp` where the
+  two tents agree to 1.8% of the genome and the skew lands on REL606's *oriC* — bootstrap p is 0.80.
+  `test_chi_square_would_reject_where_the_bootstrap_does_not` pins this (now with χ²(1), at a 2.5%
+  terminus displacement where χ²(1) rejects at p ≈ 3e-6 and the bootstrap reads 0.09).
+- **The LRT resamples residuals; the detection gate resamples the raw series.** They disagree on
+  purpose. A bootstrap for a composite null must simulate *from* the null model, and the LRT's null
+  ("the skew tent is the truth") is fully specified. The detection gate's null has no fitted signal
+  to hold fixed, so residual resampling there would bake the alternative into it.
+- `OTR_LR_ALPHA = 0.05`, deliberately **not** the 0.01 the two detection gates share: those decide
+  whether to correct at all, this only picks which of two credible ramps supplies the breakpoints.
+  At 0.01 the synthetic true-null rejection rate is 0/30 and power halves (33% vs 70% at a
+  5%-of-genome displacement). On the corpus every verdict is identical for any α in 0.01–0.10.
+- **`OTR_SKEW_MAX_P = None` means the skew arm needs no coverage evidence of its own**, and the cost
+  was explicit: on `ltee_ara_m3_38k` and `adp1_mgd06_lb` the applied ramps (1.069, 1.067) sat inside
+  the flat-noise band and their own fixed-breakpoint p-values were 0.243 and 0.615. Both numbers were
+  inflated by amplifications the skew arm's anchors failed to censor (see "The skew arm's anchors now
+  honour the censor"): honestly censored, m3_38k contradicts the orientation and is not corrected, and
+  adp1 reads 1.154.
+  What bounds the damage is that the skew supplies only *where* — the amplitude is still solved by
+  OLS against the observed coverage, so a flat sample yields a flat tent (300 synthetic flat series:
+  ratio median 0.999, 95th pct 1.051, max 1.089). Setting it to 0.01 instead would rescue **zero**
+  sequences; the fixed-breakpoint p-values run 0.001, 0.001, 0.213, 0.243, 0.328, 0.343, 0.615, 0.841
+  with a clean gap, so nothing between 0.01 and 0.2 behaves differently.
+- **`"Residual structure score"` is reported, never gating.** r² says how much of the variance the
+  tent explained; this says whether what it *failed* to explain is structured — a tent can score a
+  respectable r² and still be systematically wrong over a long stretch. It is the weighted circular
+  CUSUM range (Kuiper's V) of the applied tent's residual, expressed as a z against a circular
+  block-bootstrap null. Read it as **< 1 unstructured, 1–2 mild, > 2 structured, > 3 strongly so**.
+  Measured on the corpus: `p1_50k_shift` 2.62, and `m3_38k` 1.03, `adp1` 1.03, `p5_75k_exp` −0.27,
+  `cwbi:chromosome` −0.78. The one that fires is the case the terminus-region bullet below already
+  documents, and it fires nowhere else.
+- **Why none of the obvious statistics is used for it.** Coverage residuals are nowhere near white
+  even under a perfect fit — measured decorrelation lengths are 2–50 cells (2–45 kb) on *good* fits.
+  So lag-1 ρ / Durbin–Watson, τ, Ljung–Box and a runs test all rank `adp1`'s merely *weak* fit above
+  `p1`'s genuinely *biased* one (ρ₁ 0.897 vs 0.736; Q 41,821 vs 24,671), and the runs test even gets
+  the sign of the difference backwards. Bootstrap-normalising them is *identically* uninformative
+  (z ≈ 0.6) because block resampling preserves exactly the short-range correlation they measure —
+  **τ is the floor, not the signal**, which is why it is published beside the score rather than as
+  it. The variance ratio V(b) reads z = 5–6 on the CWBI chromosome (r² = 0.005), and a
+  fixed-bandwidth Bartlett correction reads 2.3–2.8 on the two plasmids and cannot separate a 2×
+  amplification over 15% of the genome from a 10% terminus displacement.
+- **The `_replichore_t` overlap-deflation precedent does NOT transfer here.** On the decimated
+  lattice, cells are 719–1157 bp apart against 1000 bp windows, so adjacent cells share *zero* bases
+  — the analytic `win/step` factor is exactly 1.00 on four of eight sequences and 1.20–1.32 on the
+  rest, while the measured long-run-variance inflation of the same residuals is 2.5–46×. Overlap
+  explains 0–13% of what it would have to. Only the block bootstrap reproduces the intrinsic floor.
+- **The score is a detector, not a ruler.** Measured mean over 6 seeds at 0 / 2.5 / 5 / 10 / 20 / 30%
+  breakpoint displacement: −0.02, 2.06, 3.67, 2.79, 2.67, 2.52. It climbs steeply, peaks near 5% and
+  plateaus — because a worse fit leaves a longer-correlated residual (τ 7 → 171 cells across that
+  range), which lengthens the bootstrap block, which raises the null with it. The same feedback is
+  what keeps a real copy-number event from reading as misfit: a 2× amplification over 5% of the
+  genome scores below a 5% displacement. The honest limit is that at 15% of the genome a 2×
+  amplification does reach displacement-like values. The null itself is correctly centred (mean
+  −0.02, sd 0.94), which is why the synthetic tests average over seeds rather than assert on one.
+- The score's raw statistic grows as √m (4.21 → 9.84 as `OTR_SCORE_CELLS` goes 1000 → 8000) and is
+  **unpublishable**; the calibrated z is flat to ±0.06 across the same range. And it must be
+  **weighted**: unweighted, `plasmid_1` scores 3.37 — louder than the one real misfit — because 45%
+  of its cells carry the constant fill value and a run of identical values is a maximal CUSUM
+  excursion. Both plasmids fall below `OTR_MIN_CELLS` and report `null` instead, which is the
+  honest answer for a series that is mostly fill.
+- **Copy-number events contaminate the tent, and censoring them back out is harder than it looks.**
+  Measured: `adp1_mgd06_lb`'s free-fit origin lands *inside* its own CN-3 amplification and
+  `cwbi_ssym_ht04`'s chromosome inside its CN-34 one, and excising the amplification takes CWBI's
+  applied ratio from 1.169 to 1.075 — roughly 40% of the ramp being divided out of that chromosome
+  is copy number, not replication. The GC-skew arm can supply good *coordinates* in that situation;
+  the amplitude is now solved on the pass-2-censored windows (the pass-1 HMM's CN ≠ 1 calls), which
+  takes CWBI to 1.078. A further fix must not be an iterative
+  fit-censor-refit loop: one was prototyped and measured, and on ramp-free real sequences — each
+  authentic sequence with its own best-fit tent divided out, so there is no ramp by construction —
+  it took the OTR false-positive rate from **0/8 to 4/8** at a nominal 1%, inventing a ratio of
+  **1.26** on `ltee_ara_m3_32k_2rg` from a starting p of 0.918. The mechanism: excising 1–2% of the
+  *windows* removes **87–98% of the variance** the bootstrap was calibrated against, and a null
+  whose surrogates come from the censored series cannot defend itself. A cap does not help — three
+  of those four appeared after **one** round. Whatever replaces this, the detection decision must
+  stay frozen on the uncensored series.
+- **Inversions are deliberately not detected.** They are visible in coverage only *through* the
+  replication ramp, which they mirror, and their mean residual is exactly zero — so the HMM calls
+  CN = 1 straight through and only a slope-shaped statistic could see them. Detecting them was
+  prototyped and dropped: the shape label was unreliable below the scan resolution, and on the
+  authentic corpus it changed no result. Two structural blind spots would remain regardless, both
+  physics rather than tuning: an
+  **ori-symmetric** inversion produces a 3e-4 residual because replication timing is symmetric about
+  the axis, and a **terminus-spanning** one is largely reparametrisable as a shifted terminus.
+- **A single-kink tent cannot represent a terminus *region*.** Forks meet across the ter macrodomain,
+  not at a point, so a symmetric V must choose between matching the descent and matching the trough.
+  On `ltee_ara_p1_50k_shift` the observed trough is at 3.571 Mb while the old free coverage fit put
+  its terminus 221 kb early and the skew 270 kb late — the truth is between them. The LRT rejected
+  the skew tent there (p = 0.004), and 87% of that fit's advantage comes from *outside* the disputed
+  stretch: the tent is a global two-line fit, so moving the terminus by 10.6% of the genome re-slopes
+  both limbs everywhere. Note the skew is nonetheless the better *landmark* estimate on that sample
+  (terminus 1.526 Mb against *dif* at ~1.55 Mb; the coverage fit is ~490 kb off). `otr_fit` optimises
+  the coverage trend, not the annotation, and the skew's landmarks stay published in `GC_skew/`.
+- The GC-skew coordinates are now consumed, so **`predict_ori_ter_from_skew` must run before
+  `fit_otr_bias`** — it does in `get_CNV.main` and in `tests/test_authentic.py::_run_pipeline`.
+  Computing it afterwards silently reverts to the coverage-only arm. `otr_fit` also refuses a
+  prediction whose `"Windows"` disagrees with the frame, because the skew's indices are positional
+  and `otr_fit` works in `df.index`; those agree only because `process_multi_genome` resets the index.
 
 ## Testing conventions
 
@@ -272,6 +1267,12 @@ Synthetic tests construct windowed DataFrames staged to match the column
 contract at each pipeline point — reuse the `tests/conftest.py` fixtures (`windowed_flat`,
 `windowed_with_deletion`, `windowed_with_amplification`, `gc_corrected_flat`, `otr_corrected_flat`)
 rather than hand-rolling frames, so a change to the contract surfaces in one place.
+Note the conftest frames are **n = 80**, below `run_HMM`'s `min_called_windows = 100`, and far too
+short to exercise polymorphism mode: at the default rates a 1.05 call needs ~550 windows of evidence
+before it is worth its own entry and exit. Those tests build their own longer frames via
+`_poly_frame` in `tests/test_hmm.py`, following `_flat_frame_with_repeat_spike`'s precedent — adding
+a 2,000-window fixture to `conftest.py` would slow every unrelated test that touches these.
+
 These fixtures deliberately carry **no** `pct_redundant` / `is_redundant` column, so they exercise
 the uncensored path; `run_HMM` falls back to using every window when the column is absent or when
 censoring would leave fewer than `min_called_windows`. Add the column explicitly when a test is
@@ -314,12 +1315,19 @@ spread is real regression coverage for the prefix-based footer stripping that re
 
 Three of them carry the load for a specific area:
 
-- `ltee_ara_p5_75k_exp` — **the only sample where OTR correction fires strongly**, an
-  exponential-phase culture whose replication gradient is real (1.95x peak to trough, origin
-  ~3.80 Mb and terminus ~1.56 Mb, matching REL606's known ones). It is the regression test for the
-  ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging the two breakpoints, so
-  a mirrored fit divides by an inverted ramp and *spreads* coverage out —
+- `ltee_ara_p5_75k_exp` — **the only sample whose coverage carries a strong replication gradient**,
+  an exponential-phase culture where it is real (1.95x peak to trough, terminus ~1.53 Mb, matching
+  REL606's known ones). Since the GC-skew arm landed, four of the six chromosomes correct, but this
+  is the only one where the *coverage fit* clears significance on its own strength — and even here
+  the likelihood ratio cannot separate the two estimates (p = 0.80) and defers to the skew, whose
+  origin lands on REL606's *oriC* at ~3.886 Mb where the coverage fit was 82 kb short. It is also the
+  regression test for the ori/ter label swap: `_otr_concentrated_rss` is symmetric under exchanging
+  the two breakpoints, so a mirrored fit divides by an inverted ramp and *spreads* coverage out —
   `TestOriginTerminus::test_correction_tightens_coverage` catches exactly that.
+- `ltee_ara_p1_50k_shift` — **the only sequence where the coverage fit beats the GC skew**
+  (likelihood ratio p = 0.004), and so the only live exercise of the arbitration's other branch.
+  Also the case that shows the tent model's limit: neither estimate sits at the observed coverage
+  trough. See the terminus-region bullet above.
 - `cwbi_ssym_ht04` — **the only multi-sequence dataset and the only CSV one**. A chromosome plus
   two plasmids, so it is the only cover for `process_multi_genome`'s pooled GC fit and its shared
   global median. Note what it shows: the pooled median keeps the plasmids above the chromosome, but
@@ -327,7 +1335,12 @@ Three of them carry the load for a specific area:
   100.9 / 300.0 / 194.6), so **`prob_copy_number` is 1 for both plasmids** — that follows from "CN
   calling is per-reference". The multiple is not lost, though: it is published as
   **`"Relative copy number"`** in each sequence's `_otr_results.json`, at 2.953 and 1.898 against a
-  chromosome pinned to exactly 1.0.
+  chromosome pinned to exactly 1.0. Its chromosome is also the case that motivated the significance
+  gate: the coverage fit there is a marginal 1.217 that fails at p = 0.28 and used to be applied
+  anyway, moving windows within 20% of single-copy from 91.8% to 91.5%. It is now corrected on the
+  skew's coordinates instead, at ratio 1.169, and finally helps (91.8% → 92.5%). Both plasmids are
+  the negative control for the skew arm — neither clears the skew's own gate, which is the expected
+  answer for a replicon with no bidirectional origin.
 - `adp1_mgd06_lb` — the first non-REL606 genome, which is why sequence length and window count are
   per-`Sequence` rather than the module constants they used to be.
 

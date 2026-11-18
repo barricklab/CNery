@@ -5,12 +5,15 @@ wrapper over a fixed pair of BAM/FASTA paths. Inputs are now the whole interface
 files get picked up, what they are called, and what a bad invocation leaves behind.
 """
 
+import json
 import os
 import sys
 
+import numpy as np
+import pandas as pd
 import pytest
 
-from CNery.get_CNV import main
+from CNery.get_CNV import _installed_version, main
 
 COLUMNS = [
     "position", "ref_base",
@@ -70,8 +73,16 @@ class TestPositionalInputs:
         names = _csv_names(out)
         assert any("chrA" in n for n in names)
         assert any("chrB" in n for n in names)
-        # One pooled GC fit across both, not one per reference.
-        assert len(os.listdir(os.path.join(out, "GC_bias"))) == 1
+        # Both GC files are POOLED across the two references, not one per
+        # reference -- that is what this counts. Two files, not one, because the
+        # correction has two passes: the fit on raw coverage, and the refit after
+        # OTR that removes the GC trend the position-dependent tent puts back.
+        # Both are fitted once across every table in the run.
+        # The giveaway that they are pooled: TWO files for two references, not
+        # four. They are named generically for the same reason -- one of each per
+        # run, in a per-run directory, so the name identifies nothing.
+        gc_files = sorted(os.listdir(os.path.join(out, "GC_bias")))
+        assert gc_files == ["GC_passes.pdf", "GC_vs_NormRds.pdf"], gc_files
 
     def test_directory_is_expanded(self, tmp_path, monkeypatch):
         cov = tmp_path / "coverage"
@@ -200,6 +211,198 @@ class TestFileEndingFlag:
         assert any("chrA" in n for n in _csv_names(out))
 
 
+class TestGroupTableSuppliesTheInputs:
+    """--group-table with no INPUT: the table names the coverage tables to read.
+
+    This is the shape breseq will use. Its command line carried 137 absolute
+    paths, which is what the table already holds.
+    """
+
+    def _two(self, tmp_path):
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "chrA.coverage.tsv")
+        _write_table(cov / "chrB.coverage.tsv")
+        return cov
+
+    def test_the_run_reads_what_the_table_names(self, tmp_path, monkeypatch):
+        cov = self._two(tmp_path)
+        groups = cov / "groups.tsv"
+        groups.write_text(
+            "file\tgroup\nchrA.coverage.tsv\tasm\nchrB.coverage.tsv\tasm\n"
+        )
+        out = str(tmp_path / "out")
+        _run(monkeypatch, ["--group-table", str(groups), "-o", out,
+                           "-w", "100", "-s", "50"])
+
+        names = _csv_names(out)
+        assert any("chrA" in n for n in names)
+        assert any("chrB" in n for n in names)
+
+    def test_a_table_naming_a_missing_file_creates_no_output(
+            self, tmp_path, monkeypatch):
+        cov = self._two(tmp_path)
+        groups = cov / "groups.tsv"
+        groups.write_text("file\tgroup\nghost.coverage.tsv\t\n")
+        out = tmp_path / "out"
+        with pytest.raises(FileNotFoundError) as excinfo:
+            _run(monkeypatch, ["--group-table", str(groups), "-o", str(out)])
+        assert "ghost.coverage.tsv" in str(excinfo.value)
+        assert not out.exists()
+
+
+class TestReferenceGroups:
+    """Contigs of one draft assembly, called against one baseline."""
+
+    @staticmethod
+    def _pair(tmp_path, amp_cov=75):
+        """A long baseline contig at 25x and a shorter one at `amp_cov`."""
+        cov = tmp_path / "coverage"
+        cov.mkdir()
+        _write_table(cov / "contig_1.coverage.tsv", seq=SEQ * 2, cov=25)
+        _write_table(cov / "contig_2.coverage.tsv", seq=SEQ, cov=amp_cov)
+        return cov
+
+    @staticmethod
+    def _groups(cov, label="asm"):
+        path = cov / "groups.tsv"
+        path.write_text(
+            "file\tgroup\n"
+            f"contig_1.coverage.tsv\t{label}\n"
+            f"contig_2.coverage.tsv\t{label}\n"
+        )
+        return path
+
+    @staticmethod
+    def _states(out, seq_id):
+        breaks = pd.read_csv(os.path.join(
+            out, "CNV_csv", f"{os.path.basename(out)}{seq_id}_break_pts.csv"))
+        return breaks
+
+    def test_ungrouped_the_amplified_contig_reads_single_copy(
+            self, tmp_path, monkeypatch):
+        # The bug: each contig refits its own baseline, so 75x reads as CN 1.
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "-o", out, "-w", "100", "-s", "50"])
+        assert set(self._states(out, "contig_2")["State"]) == {1}
+
+    @pytest.mark.parametrize("amp_cov,expected", [(75, 3), (50, 2)])
+    def test_grouped_it_reads_its_real_copy_number(
+            self, tmp_path, monkeypatch, amp_cov, expected):
+        cov = self._pair(tmp_path, amp_cov=amp_cov)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        assert set(self._states(out, "contig_1")["State"]) == {1}
+        amplified = self._states(out, "contig_2")
+        assert set(amplified["State"]) == {expected}
+        # The file breseq parses: three columns, and State an integer.
+        assert list(amplified.columns) == ["Startpos", "State", "Segment_Size"]
+        assert amplified["State"].dtype == "int64"
+
+    def test_otr_is_declined_and_says_which_group(self, tmp_path, monkeypatch):
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        for seq_id in ("contig_1", "contig_2"):
+            record = _otr_json(out, seq_id)          # strict JSON or it raises
+            assert record["Reference group"] == "asm"
+            assert "asm" in record["Correction type"]
+            assert record["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+            # breseq does not type-check these, so a null costs it the file.
+            assert isinstance(record["Origin window"], int)
+            assert isinstance(record["Terminus window"], int)
+
+    def test_gc_skew_is_not_measured_but_is_still_reported(
+            self, tmp_path, monkeypatch):
+        cov = self._pair(tmp_path)
+        out = str(tmp_path / "out")
+        _run(monkeypatch, [str(cov), "--group-table", str(self._groups(cov)),
+                           "-o", out, "-w", "100", "-s", "50"])
+        prefix = os.path.basename(out)
+        for seq_id in ("contig_1", "contig_2"):
+            path = os.path.join(
+                out, "GC_skew", f"{prefix}{seq_id}_gc_skew_results.json")
+            with open(path) as fh:
+                record = json.loads(fh.read(), parse_constant=_reject)
+            assert record["Prediction confident"] is False
+            assert "asm" in record["No prediction reason"]
+            # The curve's figure is not drawn -- there is no coordinate to draw
+            # it along -- following --bias gc, which writes its declined OTR
+            # record and no figure either.
+            assert not os.path.exists(
+                os.path.join(out, "GC_skew", f"{prefix}{seq_id}_GC_skew.pdf"))
+
+    def test_an_all_singleton_table_is_byte_identical_to_no_table(
+            self, tmp_path, monkeypatch):
+        """The invariant the whole feature rests on.
+
+        Passing --group-table with nothing grouped has to be indistinguishable
+        from not passing it -- that is what lets breseq write the table and pass
+        the flag unconditionally, instead of deciding per run whether any
+        reference is a draft assembly.
+        """
+        cov = self._pair(tmp_path)
+        groups = cov / "singletons.tsv"
+        groups.write_text(
+            "file\tgroup\n"
+            "contig_1.coverage.tsv\t\n"
+            "contig_2.coverage.tsv\t\n"
+        )
+        bare = str(tmp_path / "bare")
+        with_table = str(tmp_path / "with_table")
+        _run(monkeypatch, [str(cov), "-o", bare, "-w", "100", "-s", "50"])
+        _run(monkeypatch, [str(cov), "--group-table", str(groups),
+                           "-o", with_table, "-w", "100", "-s", "50"])
+
+        def tree(root):
+            return sorted(
+                os.path.relpath(os.path.join(dirpath, name), root)
+                for dirpath, _dirs, names in os.walk(root) for name in names
+            )
+
+        # The output prefix is the directory name, so every file is named for
+        # its own run; compare the trees by that relative path.
+        assert tree(bare) == [n.replace("with_table", "bare") for n in tree(with_table)]
+        for name in tree(bare):
+            other = name.replace("bare", "with_table")
+            a = os.path.join(bare, name)
+            b = os.path.join(with_table, other)
+            if name.endswith(".pdf"):
+                # matplotlib stamps a CreationDate into every PDF, so two runs
+                # never match byte for byte. Existence and name are the claim
+                # here; the numbers live in the CSVs and JSONs below. Do not
+                # "fix" this by comparing the bytes.
+                continue
+            assert open(a, "rb").read() == open(b, "rb").read(), name
+
+
+class TestVersion:
+    # breseq parses the "CNery <version>" line to report which CNery it found.
+    def test_prints_the_version_and_exits(self, capsys, monkeypatch):
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, ["--version"])
+        assert exit_info.value.code == 0
+        assert capsys.readouterr().out == f"CNery {_installed_version()}\n"
+
+    def test_reports_the_package_metadata_version(self, monkeypatch):
+        import importlib.metadata
+
+        monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.8.7")
+        assert _installed_version() == "9.8.7"
+
+    def test_an_uninstalled_source_tree_is_unknown(self, monkeypatch):
+        import importlib.metadata
+
+        def not_installed(name):
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", not_installed)
+        assert _installed_version() == "unknown"
+
+
 class TestBadInvocations:
     def test_missing_path_creates_no_output(self, tmp_path, monkeypatch):
         out = tmp_path / "out"
@@ -213,6 +416,28 @@ class TestBadInvocations:
         out = tmp_path / "out"
         with pytest.raises(FileNotFoundError):
             _run(monkeypatch, [str(empty), "-o", str(out)])
+        assert not out.exists()
+
+    def test_missing_group_table_creates_no_output(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = tmp_path / "out"
+        with pytest.raises(FileNotFoundError):
+            _run(monkeypatch, [str(table), "--group-table",
+                               str(tmp_path / "nope.tsv"), "-o", str(out)])
+        assert not out.exists()
+
+    def test_group_table_disagreeing_with_the_inputs_creates_no_output(
+            self, tmp_path, monkeypatch):
+        # The table has to name exactly the files the run reads. A drifted table
+        # would otherwise produce an ungrouped run that looks perfectly healthy.
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        groups = tmp_path / "groups.tsv"
+        groups.write_text("file\tgroup\nchrB.coverage.tsv\tasm\n")
+        out = tmp_path / "out"
+        with pytest.raises(ValueError) as excinfo:
+            _run(monkeypatch, [str(table), "--group-table", str(groups),
+                               "-o", str(out)])
+        assert "chrA.coverage.tsv" in str(excinfo.value)
         assert not out.exists()
 
     def test_duplicate_ids_create_no_output(self, tmp_path, monkeypatch):
@@ -242,28 +467,71 @@ class TestFlagSpellings:
     that, because nothing exercised the flags.
     """
 
+    def test_help_renders(self, monkeypatch, capsys):
+        """`-h` is a code path, and argparse makes it a fragile one.
+
+        argparse runs `help % params` over every help string, so one literal
+        percent that is not doubled raises at -h -- for every user, on a flag
+        whose only sin is mentioning a percentage. Building a help string with
+        %-formatting halves the doubled ones before argparse ever sees them,
+        which is exactly how --fold-change-penalty shipped broken.
+        """
+        monkeypatch.setattr(sys, "argv", ["CNery", "-h"])
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+        assert exit_info.value.code == 0
+        rendered = capsys.readouterr().out
+        for flag in ("--change-rate", "--interior-change-rate",
+                     "--fold-change-penalty", "--max-copy-number",
+                     "--polymorphism-mode", "--copy-number-resolution",
+                     "--group-table"):
+            assert flag in rendered
+
     @pytest.mark.parametrize("flag", [
         "--file-ending", "--region", "-o", "--output", "-w", "--window",
         "-s", "--step-size", "-f", "--frag-size",
         "-z", "--deletion-coverage-fraction", "--bias",
+        "--interior-change-rate", "--fold-change-penalty", "--max-copy-number",
+        "-p", "--polymorphism-mode", "--copy-number-resolution",
+        "--group-table",
     ])
     def test_flag_is_accepted(self, flag, tmp_path, monkeypatch):
         parser_args = {
             "--file-ending": "coverage.tsv", "--region": "100-2000",
             "--bias": "none",
+            "--interior-change-rate": "1e-8", "--fold-change-penalty": "2",
+            "--max-copy-number": "50",
             # A fraction of baseline now, so the generic "100" would ask the
             # zero state to expect 100x the single-copy level.
             "-z": "0.05", "--deletion-coverage-fraction": "0.05",
+            # Under -p the grid must have single copy on it, and -z has to stay
+            # below the first level, so the generic "100" is doubly wrong here.
+            "--copy-number-resolution": "0.05",
         }
-        value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)
-        if value is None:
-            value = {"-o": str(tmp_path / "out"), "--output": str(tmp_path / "out")}.get(
-                flag, "100"
-            )
+        # -p is a store_true and takes NO value. Appending one anyway would make
+        # it be read as a positional input path, so the flag would "parse" while
+        # testing something else entirely -- and the run would then fail looking
+        # for a coverage table called "100".
+        takes_no_value = {"-p", "--polymorphism-mode"}
         table = _write_table(tmp_path / "chrA.coverage.tsv")
         out = str(tmp_path / "out")
+        # --group-table needs a table naming exactly the one input written here;
+        # a generic value would be a path that does not exist.
+        if flag == "--group-table":
+            groups = tmp_path / "groups.tsv"
+            groups.write_text("file\tgroup\nchrA.coverage.tsv\t\n")
+            parser_args["--group-table"] = str(groups)
+        argv = [str(table), flag]
+        if flag not in takes_no_value:
+            value = parser_args.get(flag, "1000" if flag in ("-w", "--window") else None)
+            if value is None:
+                value = {"-o": str(tmp_path / "out"),
+                         "--output": str(tmp_path / "out")}.get(flag, "100")
+            argv.append(value)
+        if flag == "--copy-number-resolution":
+            argv.append("-p")          # the flag is rejected without it, by design
         # Only asserting the parser accepts it; a run is the cheapest way to be sure.
-        _run(monkeypatch, [str(table), flag, value, "-o", out, "-w", "100", "-s", "50"])
+        _run(monkeypatch, argv + ["-o", out, "-w", "100", "-s", "50"])
 
 
 class TestRegion:
@@ -403,3 +671,197 @@ class TestRegionWithSeveralSequences:
         _run(monkeypatch, [str(cov), "--region", "tinyPlasmid:900000-999000",
                            "-o", out, "-w", "100", "-s", "50"])
         assert any("tinyPlasmid" in n for n in os.listdir(os.path.join(out, "CNV_plt")))
+
+
+def _reject(value):
+    raise AssertionError(f"not strict JSON: {value}")
+
+
+def _otr_json(out, seq_id):
+    """The OTR record breseq reads for one sequence, parsed strictly.
+
+    parse_constant refuses NaN/Infinity: breseq reads this with nlohmann, which
+    is strict RFC JSON, and a single bare NaN costs it the whole file.
+    """
+    path = os.path.join(out, "OTR_corr",
+                        f"{os.path.basename(out)}{seq_id}_otr_results.json")
+    with open(path) as fh:
+        return json.loads(fh.read(), parse_constant=_reject)
+
+
+class TestDegenerateCoverage:
+    """A reference with nothing to measure is a RESULT, not a crash.
+
+    Each of these took the whole run down before, with a bare library exception
+    naming no file: a header-only table raised IndexError from preprocess, an
+    all-zero one ValueError from np.interp inside fit_gc_bias, and a healthy
+    chromosome beside a zero-coverage plasmid ZeroDivisionError from solve_pr --
+    the realistic one, since a plasmid that got no reads is an ordinary event.
+
+    What every case must produce is the OTR results JSON. breseq reads it by
+    name, and a missing file costs it exactly what an unparseable one does.
+    """
+
+    def _run_ok(self, monkeypatch, table_dir, out):
+        _run(monkeypatch, [str(table_dir), "-o", out, "-w", "100", "-s", "100"])
+
+    def test_header_only_table(self, tmp_path, monkeypatch):
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "empty.coverage.tsv", seq="")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        data = _otr_json(out, "empty")
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+        # breseq does not type-check these two, so a null is as damaging as a
+        # missing file. There is no coordinate to report, but there is an int.
+        assert isinstance(data["Origin window"], int)
+        assert isinstance(data["Terminus window"], int)
+        assert data["No usable coverage reason"] == "the coverage table has no position rows"
+
+    def test_all_zero_coverage(self, tmp_path, monkeypatch):
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "flat.coverage.tsv", cov=0)
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        data = _otr_json(out, "flat")
+        assert data["Origin-to-Terminus/Bias Ratio"] == "Not detected"
+        assert data["No usable coverage reason"] == "every window has zero coverage"
+
+    def test_every_window_is_a_repeat(self, tmp_path, monkeypatch):
+        # NOT degenerate: an all-repeat replicon has real coverage and gets real
+        # calls. Only fit_gc_bias could not survive it, and it now declines to an
+        # identity curve instead of raising.
+        d = tmp_path / "in"
+        d.mkdir()
+        rows = [(i + 1, b, 0, 0, 12, 12) for i, b in enumerate(SEQ)]
+        (d / "rep.coverage.tsv").write_text(_render(COLUMNS, rows, len(SEQ), "\t"))
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        assert _otr_json(out, "rep")["No usable coverage reason"] is None
+        assert any("rep" in n for n in _csv_names(out))
+
+    def test_zero_plasmid_does_not_take_down_the_chromosome(self, tmp_path, monkeypatch):
+        """The case that will actually happen: a plasmid that got no reads."""
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "chrom.coverage.tsv")
+        _write_table(d / "plasmid.coverage.tsv", cov=0)
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        # Both sequences get a file, and the healthy one is unaffected.
+        assert _otr_json(out, "plasmid")["No usable coverage reason"] is not None
+        assert _otr_json(out, "chrom")["No usable coverage reason"] is None
+        assert any("chrom" in n and n.endswith("_CNV.csv") for n in _csv_names(out))
+        assert any("plasmid" in n and n.endswith("_CNV.csv") for n in _csv_names(out))
+
+    def test_a_dead_plasmid_does_not_null_the_chromosomes_copy_number(
+            self, tmp_path, monkeypatch):
+        # relative_copy_numbers ranks by win_end.max(); a zero-window frame gives
+        # NaN, and max() with a NaN key returns the FIRST key rather than raising
+        # -- so an empty table sorting first used to anchor the run on a NaN and
+        # write "Relative copy number": null into every healthy sequence too.
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "aaa_dead.coverage.tsv", seq="")   # sorts first
+        _write_table(d / "zzz_live.coverage.tsv")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        assert _otr_json(out, "zzz_live")["Relative copy number"] == pytest.approx(1.0)
+
+    def test_break_points_csv_keeps_its_three_columns(self, tmp_path, monkeypatch):
+        # breseq asserts exactly three columns and the assert is fatal, so an
+        # empty file is not an acceptable stand-in for no segments.
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "empty.coverage.tsv", seq="")
+        out = str(tmp_path / "out")
+
+        self._run_ok(monkeypatch, d, out)
+
+        path = os.path.join(out, "CNV_csv",
+                            f"{os.path.basename(out)}empty_break_pts.csv")
+        with open(path) as fh:
+            header = fh.readline().strip().split(",")
+        assert header == ["Startpos", "State", "Segment_Size"]
+
+    @pytest.mark.parametrize("bias", ["all", "gc", "otr", "none"])
+    def test_every_bias_mode_writes_the_json(self, bias, tmp_path, monkeypatch):
+        """--bias gc and --bias none used to write NO OTR record at all.
+
+        Both return from correct_one() before any OTR stage runs, so two of the
+        four modes gave breseq nothing on a completely healthy table.
+        """
+        d = tmp_path / "in"
+        d.mkdir()
+        _write_table(d / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+
+        _run(monkeypatch, [str(d), "-o", out, "-w", "100", "-s", "100",
+                           "--bias", bias])
+
+        data = _otr_json(out, "chrA")
+        assert isinstance(data["Origin window"], int)
+        assert isinstance(data["Terminus window"], int)
+        assert "Origin-to-Terminus/Bias Ratio" in data
+
+
+class TestPolymorphismMode:
+    """-p changes the calls; it must not change the shape of the output.
+
+    The file contract is what breseq depends on, and it is unconditional: three
+    columns in break_pts.csv whatever mode produced them, because breseq asserts
+    the column count and that assert is fatal.
+    """
+
+    def _run_both(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        cons, poly = str(tmp_path / "cons"), str(tmp_path / "poly")
+        _run(monkeypatch, [str(table), "-o", cons, "-w", "100", "-s", "50"])
+        _run(monkeypatch, [str(table), "-p", "-o", poly, "-w", "100", "-s", "50"])
+        return cons, poly
+
+    def _breaks(self, out):
+        name = [f for f in os.listdir(os.path.join(out, "CNV_csv"))
+                if f.endswith("_break_pts.csv")][0]
+        return pd.read_csv(os.path.join(out, "CNV_csv", name))
+
+    def test_break_points_keep_their_three_columns(self, tmp_path, monkeypatch):
+        _cons, poly = self._run_both(tmp_path, monkeypatch)
+        assert list(self._breaks(poly).columns) == [
+            "Startpos", "State", "Segment_Size"]
+
+    def test_consensus_mode_still_calls_integers(self, tmp_path, monkeypatch):
+        cons, _poly = self._run_both(tmp_path, monkeypatch)
+        state = self._breaks(cons)["State"].to_numpy()
+        assert np.array_equal(state, np.rint(state))
+
+    def test_resolution_without_the_mode_is_rejected(self, tmp_path, monkeypatch):
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, [str(table), "--copy-number-resolution", "0.05",
+                               "-o", out, "-w", "100", "-s", "50"])
+        assert exit_info.value.code != 0
+
+    def test_a_deletion_fraction_above_the_resolution_is_rejected(
+            self, tmp_path, monkeypatch):
+        """-z at or above the first grid level collides with the CN-0 state."""
+        table = _write_table(tmp_path / "chrA.coverage.tsv")
+        out = str(tmp_path / "out")
+        with pytest.raises(SystemExit) as exit_info:
+            _run(monkeypatch, [str(table), "-p", "-z", "0.2",
+                               "--copy-number-resolution", "0.1",
+                               "-o", out, "-w", "100", "-s", "50"])
+        assert exit_info.value.code != 0

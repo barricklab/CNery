@@ -74,6 +74,30 @@ def lambda_dataset():
     return _dataset_or_skip("lambda")
 
 
+STRAND_SPLIT_HEADER = [
+    "position", "ref_base",
+    "unique_top_cov", "unique_bot_cov",
+    "redundant_top_cov", "redundant_bot_cov",
+]
+
+
+def write_coverage_table(path, seq, cov=25, delimiter="\t"):
+    """Write a minimal strand-split bam2cov table over `seq`, footer included.
+
+    The windowed fixtures below carry no sequence at all, so anything testing
+    behaviour that depends on the reference bases -- GC content, GC skew -- has
+    to start from a real table. Mirrors the shape tests/test_cli.py builds.
+    """
+    lines = [delimiter.join(STRAND_SPLIT_HEADER)]
+    lines += [
+        delimiter.join(str(v) for v in (i + 1, base, cov, cov, 0, 0))
+        for i, base in enumerate(seq)
+    ]
+    lines.append(delimiter.join(("#", "number_of_positions", str(len(seq)))))
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 def _make_windowed_df(n=80, del_start=None, del_end=None,
                       amp_start=None, amp_end=None, median_cov=100.0):
     rng = np.random.default_rng(7)

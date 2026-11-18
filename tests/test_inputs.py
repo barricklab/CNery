@@ -300,15 +300,18 @@ class TestProcessFromCoverageTables:
 
     def test_pooled_gc_fit_covers_every_input(self, two_reference_run):
         info = two_reference_run
-        process_multi_genome(
+        result = process_multi_genome(
             resolve_coverage_inputs([info["cov_dir"]]),
             output_prefix=info["out"],
             win=100, step=50, frag=150,
         )
-        # One pooled diagnostic plot, named for both references.
-        produced = os.listdir(os.path.join(info["out"], "GC_bias"))
-        assert len(produced) == 1
-        assert "REL606" in produced[0] and "pPlasmid" in produced[0]
+        assert sorted(result) == ["REL606", "pPlasmid"]
+        # ONE pooled diagnostic plot for the two references, not one each. It is
+        # named generically -- there is only ever one per output directory, so the
+        # name has nothing to distinguish.
+        assert os.listdir(os.path.join(info["out"], "GC_bias")) == [
+            "GC_vs_NormRds.pdf"
+        ]
 
     def test_bad_schema_is_reported_before_any_work(self, tmp_path):
         cov = tmp_path / "coverage"
