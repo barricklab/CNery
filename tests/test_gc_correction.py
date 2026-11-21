@@ -489,7 +489,13 @@ class TestPooledFiguresAreNamedGenerically:
     naming one. They are one-per-run files in a per-run directory, so the name
     does not have to identify anything."""
 
-    POOLED = ["GC_passes.pdf", "GC_vs_NormRds.pdf"]
+    # GC_vs_NormRds.pdf stays in GC_bias/; GC_passes.pdf lives in corr_plots/
+    # beside the per-sequence correction-stages figures.
+    POOLED = {"GC_bias": ["GC_vs_NormRds.pdf"], "corr_plots": ["GC_passes.pdf"]}
+
+    def _assert_pooled(self, out):
+        for sub, names in self.POOLED.items():
+            assert sorted(os.listdir(os.path.join(out, sub))) == names
 
     @staticmethod
     def _pooled(genome_ids, n_per=6):
@@ -519,7 +525,7 @@ class TestPooledFiguresAreNamedGenerically:
         gc_cor_plots(pd.concat(frames.values(), ignore_index=True), out)
         assert plot_gc_passes(frames, out).endswith("/GC_passes.pdf")
 
-        assert sorted(os.listdir(os.path.join(out, "GC_bias"))) == self.POOLED
+        self._assert_pooled(out)
 
     def test_the_name_does_not_depend_on_how_o_was_spelled(self, tmp_path):
         # Every per-sequence writer prefixes sample_prefix(output) for this
@@ -530,4 +536,4 @@ class TestPooledFiguresAreNamedGenerically:
         for spelling in (str(tmp_path / "CNV_out"), str(tmp_path / "CNV_out") + "/"):
             gc_cor_plots(pooled, spelling)
             plot_gc_passes(frames, spelling)
-        assert sorted(os.listdir(str(tmp_path / "CNV_out" / "GC_bias"))) == self.POOLED
+        self._assert_pooled(str(tmp_path / "CNV_out"))

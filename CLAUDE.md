@@ -248,7 +248,7 @@ stage — note `raw/G` is an intermediate, not a result:
   functions of GC alone, so `G = g1·g2` is a single curve. `gc_corr_fact` holds
   `G`, which is what `bias_offsets` feeds the HMM; the components stay on the
   frame as `gc_corr_fact_pass1` / `_pass2`, and all three are drawn in
-  `GC_bias/*_GC_passes.pdf`. The two **oppose** each other at the extremes, so the
+  `corr_plots/GC_passes.pdf`. The two **oppose** each other at the extremes, so the
   second pass is mostly *removing* correction the first over-applied to the
   replication ramp.
 - **The GC refit is pooled and applied to EVERY sequence**, including ones where
@@ -1005,7 +1005,7 @@ already, and this is where they would drift next.
   the sample prefix. The name must not depend on how the caller spelled `-o`. **This renamed both
   JSONs under the default `-o`**, so breseq may need updating if it globs for the old spelling.
 - **The two pooled GC figures are named `GC_bias/GC_vs_NormRds.pdf` and
-  `GC_bias/GC_passes.pdf` — no sample prefix, no sequence IDs.** They are the only outputs pooled
+  `corr_plots/GC_passes.pdf` — no sample prefix, no sequence IDs.** They are the only outputs pooled
   across the whole run, so exactly one of each lands in a given output directory and that directory
   is already the discriminator; everything else is per-sequence and needs `<sample><seq_id>` to tell
   the files apart. They used to join *every* genome ID into the name, which grows without bound: a

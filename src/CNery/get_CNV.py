@@ -905,7 +905,7 @@ def main():
         gc_passes_path = plot_gc_passes(frames, out_dir)
         print(f"{smpl}: GC bias refitted across {len(frames)} sequence(s) on "
               f"CN=1 windows; total GC curve in "
-              f"{os.path.basename(gc_passes_path)}.")
+              f"corr_plots/{os.path.basename(gc_passes_path)}.")
         # gc_corr_norm_cov now means raw/G rather than raw/g1, and this reads it.
         relative_cn = relative_copy_numbers(
             {g: st["df"] for g, st in staged.items()}, groups)

@@ -73,16 +73,19 @@ class TestPositionalInputs:
         names = _csv_names(out)
         assert any("chrA" in n for n in names)
         assert any("chrB" in n for n in names)
-        # Both GC files are POOLED across the two references, not one per
-        # reference -- that is what this counts. Two files, not one, because the
-        # correction has two passes: the fit on raw coverage, and the refit after
-        # OTR that removes the GC trend the position-dependent tent puts back.
-        # Both are fitted once across every table in the run.
-        # The giveaway that they are pooled: TWO files for two references, not
-        # four. They are named generically for the same reason -- one of each per
-        # run, in a per-run directory, so the name identifies nothing.
+        # Both GC figures are POOLED across the two references, not one per
+        # reference -- that is what this counts. Two figures, because the
+        # correction has two passes: the fit on raw coverage (GC_bias/), and the
+        # refit after OTR that removes the GC trend the position-dependent tent
+        # puts back (corr_plots/GC_passes.pdf). Both are fitted once across every
+        # table in the run, so ONE of each for two references, not two. They are
+        # named generically for the same reason -- one per run, in a per-run
+        # directory, so the name identifies nothing.
         gc_files = sorted(os.listdir(os.path.join(out, "GC_bias")))
-        assert gc_files == ["GC_passes.pdf", "GC_vs_NormRds.pdf"], gc_files
+        assert gc_files == ["GC_vs_NormRds.pdf"], gc_files
+        passes = [n for n in os.listdir(os.path.join(out, "corr_plots"))
+                  if "GC_passes" in n]
+        assert passes == ["GC_passes.pdf"], passes
 
     def test_directory_is_expanded(self, tmp_path, monkeypatch):
         cov = tmp_path / "coverage"
